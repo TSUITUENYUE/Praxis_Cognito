@@ -1,0 +1,79 @@
+agent:
+  name: "go2"
+  urdf: "./Pretrain/urdfs/go2_description/urdf/go2_description.urdf"
+  n_dofs: 12
+  object_dim: 3
+  joint_name:
+    - "FR_hip_joint"
+    - "FR_thigh_joint"
+    - "FR_calf_joint"
+    - "FL_hip_joint"
+    - "FL_thigh_joint"
+    - "FL_calf_joint"
+    - "RR_hip_joint"
+    - "RR_thigh_joint"
+    - "RR_calf_joint"
+    - "RL_hip_joint"
+    - "RL_thigh_joint"
+    - "RL_calf_joint"
+  init_angles:
+    - 0.0   # FR_hip_joint
+    - 0.8   # FR_thigh_joint
+    - -1.5  # FR_calf_joint
+    - 0.0   # FL_hip_joint
+    - 0.8   # FL_thigh_joint
+    - -1.5  # FL_calf_joint
+    - 0.0   # RR_hip_joint
+    - 1.0   # RR_thigh_joint
+    - -1.5  # RR_calf_joint
+    - 0.0   # RL_hip_joint
+    - 1.0   # RL_thigh_joint
+    - -1.5  # RL_calf_joint
+  end_effector: [3,6,9,12]
+
+dataset:
+  num_envs: 8192
+  episodes: 100000
+  max_episode_seconds: 5
+  frame_rate: 30
+  stratification_bins: 10
+
+  agent_pos: [ 0.0, 0.0, 0.42]
+  obj_pos_low: [ -0.5, -0.5, 0.0 ]
+  obj_pos_high: [ 0.5, 0.5, 1.0 ]
+  obj_vel_low: [ -1.5, -1.5, -1.5 ]
+  obj_vel_high: [ 1.5, 1.5, 1.5 ]
+
+model:
+  vae:
+    prior: "Gaussian"
+    node_features: 3
+    hidden_features: 128
+    num_layers: 2
+    rnn_hidden: 128
+    latent_dim: 32
+    seq_len: ${mul:${dataset.max_episode_seconds},${dataset.frame_rate}}
+    hidden_dim: 128
+  res_rl: {}
+
+
+trainer:
+  load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
+  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
+  batch_size: 256
+  device: 'cuda'
+  num_epochs: 4
+  optimizer:
+    lr: 0.001
+  beta_anneal:
+    strategy: "warmup"
+    warm_up: 500
+    max_beta: 0
+  save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
+
+imitator:
+  batch_size: 256
+
+codebook:
+  delta_init: 5
+  update_rule: "sphere"

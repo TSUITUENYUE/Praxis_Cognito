@@ -1,0 +1,55 @@
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from Model.vae import IntentionVAE
+from Online_func.imitation import ImitationModule
+from Pretrain.train import *
+from Model.agent import *
+from codebook import Codebook
+from Pretrain.generate_dataset import generate
+import argparse
+import os
+
+class Runner:
+    def __init__(self, mode, config: DictConfig):
+        self.mode = mode
+        self.config = config
+
+        self.agent = Agent(**config.agent)
+        if self.mode != "generate":
+            self.model = IntentionVAE(agent=self.agent, **config.model.vae)
+            if self.mode == "train":
+                self.trainer = Trainer(self.model, config.trainer)
+            if self.mode != "train":
+                self.codebook = Codebook(**config.codebook)
+                checkpoint_path = self.config.trainer.save_path + f"vae_checkpoint_epoch_{self.config.trainer.num_epochs}.pth"
+                state_dict = torch.load(checkpoint_path, map_location=self.config.trainer.device)
+                self.model.load_state_dict(state_dict)
+                self.imitator = ImitationModule(model=self.model, **config.imitator)
+
+    def run(self, demo=None):
+        if self.mode == "generate":
+            generate(self.config)
+        elif self.mode == "train":
+            self.trainer.train()
+        elif self.mode == "imitate":
+            self.imitator.imitate(demo, self.codebook)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="train")
+    parser.add_argument("--config", default="./conf/g1.yaml")
+    parser.add_argument("--demo", default=None)
+    args, unknown_args = parser.parse_known_args()
+
+    if args.mode == "imitate" and args.demo is None:
+        parser.error("demo is required for imitate mode")
+
+    config_dir = os.path.dirname(args.config) or "."
+    config_name = os.path.basename(args.config).rstrip('.yaml')
+
+    hydra.initialize(version_base=None, config_path=config_dir)
+    cfg = hydra.compose(config_name=config_name, overrides=unknown_args)
+    OmegaConf.register_new_resolver("mul", lambda x, y: x * y)
+
+    runner = Runner(args.mode, cfg)
+    runner.run(demo=args.demo)

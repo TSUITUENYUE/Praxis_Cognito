@@ -1,0 +1,107 @@
+agent:
+  name: "g1"
+  urdf: "./Pretrain/urdfs/g1_description/g1_29dof_rev_1_0_with_xhand.urdf"
+  n_dofs: 53
+  object_dim: 3
+  joint_name:
+    - "left_hip_pitch_joint"
+    - "left_hip_roll_joint"
+    - "left_hip_yaw_joint"
+    - "left_knee_joint"
+    - "left_ankle_pitch_joint"
+    - "left_ankle_roll_joint"
+    - "right_hip_pitch_joint"
+    - "right_hip_roll_joint"
+    - "right_hip_yaw_joint"
+    - "right_knee_joint"
+    - "right_ankle_pitch_joint"
+    - "right_ankle_roll_joint"
+    - "waist_yaw_joint"
+    - "waist_roll_joint"
+    - "waist_pitch_joint"
+    - "left_shoulder_pitch_joint"
+    - "left_shoulder_roll_joint"
+    - "left_shoulder_yaw_joint"
+    - "left_elbow_joint"
+    - "left_wrist_roll_joint"
+    - "left_wrist_pitch_joint"
+    - "left_wrist_yaw_joint"
+    - "right_shoulder_pitch_joint"
+    - "right_shoulder_roll_joint"
+    - "right_shoulder_yaw_joint"
+    - "right_elbow_joint"
+    - "right_wrist_roll_joint"
+    - "right_wrist_pitch_joint"
+    - "right_wrist_yaw_joint"
+    - "left_hand_thumb_bend_joint"
+    - "left_hand_thumb_rota_joint1"
+    - "left_hand_thumb_rota_joint2"
+    - "left_hand_index_bend_joint"
+    - "left_hand_index_joint1"
+    - "left_hand_index_joint2"
+    - "left_hand_mid_joint1"
+    - "left_hand_mid_joint2"
+    - "left_hand_ring_joint1"
+    - "left_hand_ring_joint2"
+    - "left_hand_pinky_joint1"
+    - "left_hand_pinky_joint2"
+    - "right_hand_thumb_bend_joint"
+    - "right_hand_thumb_rota_joint1"
+    - "right_hand_thumb_rota_joint2"
+    - "right_hand_index_bend_joint"
+    - "right_hand_index_joint1"
+    - "right_hand_index_joint2"
+    - "right_hand_mid_joint1"
+    - "right_hand_mid_joint2"
+    - "right_hand_ring_joint1"
+    - "right_hand_ring_joint2"
+    - "right_hand_pinky_joint1"
+    - "right_hand_pinky_joint2"
+
+  end_effector: [7, 13, 18, 37, 41, 45, 48, 51, 54, 55, 59, 63, 66, 69, 72]
+
+dataset:
+  num_envs: 2048
+  episodes: 500000
+  max_episode_seconds: 2
+  frame_rate: 30
+  stratification_bins: 10
+
+  agent_pos: [0.0, 0.0, 0.792]
+  obj_pos_low: [ -1.0, -1.0, 0.0 ]
+  obj_pos_high: [ 1.0, 1.0, 2.0 ]
+  obj_vel_low: [ -2.5, -2.5, -2.5 ]
+  obj_vel_high: [ 2.5, 2.5, 2.5 ]
+
+model:
+  vae:
+    prior: "GMM"
+    node_features: 3
+    hidden_features: 128
+    num_layers: 2
+    rnn_hidden: 128
+    latent_dim: 32
+    seq_len: ${mul:${dataset.max_episode_seconds},${dataset.frame_rate}}
+    hidden_dim: 128
+  res_rl: {}
+
+
+trainer:
+  load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
+  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
+  batch_size: 512
+  device: 'cuda'
+  num_epochs: 4
+  optimizer:
+    lr: 0.001
+  beta_anneal:
+    strategy: "warmup"
+    warm_up: 500
+    max_beta: 1
+  save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
+
+imitator:
+  batch_size: 512
+codebook:
+  delta_init: 5
+  update_rule: "sphere"
