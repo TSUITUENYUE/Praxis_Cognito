@@ -62,7 +62,7 @@ class FKModel(nn.Module):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # Precompute topological computation order (list of (parent, child, joint_name))
         self.computation_order = []
-        stack = ['pelvis']
+        stack = ['base']
         visited = set()
         while stack:
             link = stack.pop()
@@ -119,7 +119,7 @@ class FKModel(nn.Module):
         if joint_angles.dim() == 1:
             joint_angles = joint_angles.unsqueeze(0)
         bs = joint_angles.shape[0]
-        transforms = {'pelvis': self.eye_4.unsqueeze(0).repeat(bs, 1, 1)}
+        transforms = {'base': self.eye_4.unsqueeze(0).repeat(bs, 1, 1)}
         for parent, child, joint_name in self.computation_order:
             joint = self.joint_map[joint_name]
             T_origin = joint['T_origin'].unsqueeze(0).repeat(bs, 1, 1)

@@ -47,11 +47,10 @@ class Visualizer:
             indices = np.random.choice(len(dataset), int(len(dataset) * subset_fraction), replace=False)
             sampler = SubsetRandomSampler(indices)
             dataloader = DataLoader(dataset, batch_size=self.config.trainer.batch_size * batch_size_multiplier,
-                                    sampler=sampler, num_workers=8,
-                                    pin_memory=True)  # Increased workers, pin_memory for GPU
+                                    sampler=sampler, num_workers=8,)  # Increased workers, pin_memory for GPU
         else:
             dataloader = DataLoader(dataset, batch_size=self.config.trainer.batch_size * batch_size_multiplier,
-                                    shuffle=False, num_workers=8, pin_memory=True)
+                                    shuffle=False, num_workers=8,)
 
         latents = []
         originals_x = []  # Collect flattened x
@@ -113,9 +112,11 @@ class Visualizer:
             explained_variance_2d = pca2d.explained_variance_ratio_.sum()
             print(f"PCA explained variance ratio for 2 components: {explained_variance_2d:.2f}")
 
+            # Use hexbin for density visualization in 2D
             plt.figure(figsize=(10, 6))
-            plt.scatter(latents_2d[:, 0], latents_2d[:, 1], alpha=0.5)
-            plt.title(f"PCA Projection of Latent Space to 2D (Prior: {self.prior})")
+            plt.hexbin(latents_2d[:, 0], latents_2d[:, 1], gridsize=50, cmap='viridis', mincnt=1)
+            plt.colorbar(label='Density')
+            plt.title(f"Hexbin Density Plot of Latent Space in 2D PCA (Prior: {self.prior})")
             plt.xlabel("PC1")
             plt.ylabel("PC2")
             plt.show()
@@ -128,9 +129,10 @@ class Visualizer:
 
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111, projection='3d')
-            ax.scatter(latents_3d[:, 0], latents_3d[:, 1], latents_3d[:, 2], alpha=0.3,
-                       s=20)  # Smaller s, lower alpha for density
-            ax.set_title(f"3D Projection of Latent Space (Prior: {self.prior})")
+            # Color by density: approximate by binning or use PC3 as proxy for depth/density
+            scatter = ax.scatter(latents_3d[:, 0], latents_3d[:, 1], latents_3d[:, 2], c=latents_3d[:, 2], cmap='viridis', alpha=0.3, s=20)
+            fig.colorbar(scatter, ax=ax, label='PC3 Value (Proxy for Density)')
+            ax.set_title(f"3D Scatter of Latent Space with Color by PC3 (Prior: {self.prior})")
             ax.set_xlabel("PC1")
             ax.set_ylabel("PC2")
             ax.set_zlabel("PC3")
@@ -167,9 +169,11 @@ class Visualizer:
             explained_variance_2d = pca2d.explained_variance_ratio_.sum()
             print(f"PCA explained variance for 2 components: {explained_variance_2d:.2f}")
 
+            # Use hexbin for density in 2D
             plt.figure(figsize=(10, 6))
-            plt.scatter(data_2d[:, 0], data_2d[:, 1], alpha=0.5)
-            plt.title(f"PCA Projection to 2D for {name}")
+            plt.hexbin(data_2d[:, 0], data_2d[:, 1], gridsize=50, cmap='viridis', mincnt=1)
+            plt.colorbar(label='Density')
+            plt.title(f"Hexbin Density Plot in 2D PCA for {name}")
             plt.xlabel("PC1")
             plt.ylabel("PC2")
             plt.show()
@@ -182,16 +186,19 @@ class Visualizer:
 
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111, projection='3d')
-            ax.scatter(data_3d[:, 0], data_3d[:, 1], data_3d[:, 2], alpha=0.3, s=20)
-            ax.set_title(f"3D Projection of {name}")
+            # Color by PC3 as proxy for density
+            scatter = ax.scatter(data_3d[:, 0], data_3d[:, 1], data_3d[:, 2], c=data_3d[:, 2], cmap='viridis', alpha=0.3, s=20)
+            fig.colorbar(scatter, ax=ax, label='PC3 Value (Proxy for Density)')
+            ax.set_title(f"3D Scatter with Color by PC3 for {name}")
             ax.set_xlabel("PC1")
             ax.set_ylabel("PC2")
             ax.set_zlabel("PC3")
             plt.show()
 
             # Marginal histograms (first 5 dims of flattened)
-            fig, axs = plt.subplots(1, 1, figsize=(15, 3))
-            for i in range(min(5, data.shape[1])):
+            num_hist = min(5, data.shape[1])
+            fig, axs = plt.subplots(1, num_hist, figsize=(15, 3))
+            for i in range(num_hist):
                 axs[i].hist(data[:, i], bins=50, density=True)
                 axs[i].set_title(f"Dim {i + 1}")
             plt.suptitle(f"Marginal Histograms for {name}")
@@ -200,7 +207,7 @@ class Visualizer:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="./conf/go2v.yaml")
+    parser.add_argument("--config", default="./conf/go2.yaml")
     args, unknown_args = parser.parse_known_args()
 
     config_dir = os.path.dirname(args.config) or "."
@@ -211,4 +218,4 @@ if __name__ == '__main__':
     OmegaConf.register_new_resolver("mul", lambda x, y: x * y)
 
     visualizer = Visualizer(cfg)
-    visualizer.visualize_latent_space(subset_fraction=0.2)  # Example: use 20% for speed; set to 1.0 for full
+    visualizer.visualize_latent_space(subset_fraction=0.05)

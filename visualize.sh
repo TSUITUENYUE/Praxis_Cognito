@@ -1,0 +1,1 @@
+python visualizer.py --config ./conf/go2.yaml

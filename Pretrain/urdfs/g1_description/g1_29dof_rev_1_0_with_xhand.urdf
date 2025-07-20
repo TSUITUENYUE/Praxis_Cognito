@@ -13,7 +13,7 @@
   
   
 
-  <link name="pelvis">
+  <link name="base">
     <inertial>
       <origin xyz="0 0 -0.07605" rpy="0 0 0" />
       <mass value="3.813" />

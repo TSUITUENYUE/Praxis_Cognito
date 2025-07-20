@@ -1,0 +1,1 @@
+python main.py --mode train --config ./conf/go2.yaml

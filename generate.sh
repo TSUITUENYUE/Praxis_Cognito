@@ -1,0 +1,1 @@
+python main.py --mode generate --config ./conf/go2.yaml

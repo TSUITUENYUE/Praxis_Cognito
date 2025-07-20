@@ -7,7 +7,7 @@ from Pretrain.utils import *
 from torch.utils.data import DataLoader
 import genesis as gs
 import numpy as np
-
+from matplotlib import pyplot as plt
 
 class ImitationModule:
     def __init__(self, model, cfg: DictConfig):
@@ -57,9 +57,18 @@ class ImitationModule:
         with torch.no_grad():
             recon_traj, joint_cmd, z, *_ = self.vae(graph_x, edge_index)
 
+
         recon_traj = recon_traj.squeeze(0).cpu().numpy()
         joint_cmd = joint_cmd.squeeze(0).cpu().numpy()
         orig_traj = orig_traj
+        print(orig_traj.shape)
+        print("loss:", abs(recon_traj - orig_traj).mean())
+        plt.figure(figsize=(10, 6))
+        plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
+        plt.title(f"loss")
+        plt.xlabel("Dimension 1")
+        plt.ylabel("Dimension 2")
+        plt.show()
 
         # Dimensions: object_dim=3, agent EE positions=12 (4 legs * 3D)
         agent_dim = 12
@@ -69,7 +78,7 @@ class ImitationModule:
         seq_len = orig_traj.shape[0]
 
         # URDF path from config
-        urdf_path = self.agent.urdf  # From config: agent.urdf
+        urdf_path = self.agent.urdf
 
         # End-effector links: indices [3,6,9,12] correspond to calf joints/links
         # Assuming genesis RigidEntity has .links list indexed accordingly
@@ -136,7 +145,8 @@ class ImitationModule:
                 poss=leg_poses,
                 quats=[fixed_quat] * num_legs
             )
-            demo_joints.append(q.cpu().numpy())
+            demo_joints.append(q[7:].cpu().numpy())
+
 
         demo_joints = np.array(demo_joints)  # [seq_len, 12]
 
