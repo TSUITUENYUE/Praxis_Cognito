@@ -101,7 +101,9 @@ trainer:
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
 
 imitator:
+  processed_path: './Pretrain/data/${agent.name}/demo/preprocess.h5'
   batch_size: 512
+
 codebook:
   delta_init: 5
   update_rule: "sphere"

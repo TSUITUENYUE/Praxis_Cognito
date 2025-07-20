@@ -46,7 +46,7 @@ dataset:
 
 model:
   vae:
-    prior: "GMM"
+    prior: "Gaussian"
     node_features: 3
     hidden_features: 128
     num_layers: 2
@@ -67,11 +67,12 @@ trainer:
     lr: 0.001
   beta_anneal:
     strategy: "warmup"
-    warm_up: 500
-    max_beta: 0
+    warm_up: 30
+    max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
 
 imitator:
+  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
   batch_size: 256
 
 codebook:

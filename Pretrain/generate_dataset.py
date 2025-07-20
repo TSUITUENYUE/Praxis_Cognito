@@ -44,7 +44,9 @@ def generate(cfg: DictConfig):
     )
 
     # --- Add Entities ---
-    plane = scene.add_entity(gs.morphs.Plane())
+    plane = scene.add_entity(
+        gs.morphs.Plane()
+    )
     agent = scene.add_entity(
         gs.morphs.URDF(file=cfg.agent.urdf, collision=True),
     )

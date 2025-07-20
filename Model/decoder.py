@@ -47,7 +47,7 @@ class Decoder(nn.Module):
             h, c = self.rnn(input_t, (h, c))
             object_out = self.mlp_object(h)
             joint_out = self.mlp_agent(h)
-            position_out = self.fk_model(joint_out)
+            position_out = self.fk_model(joint_out).view(batch_size, -1)
 
             object_traj.append(object_out)
             agent_traj.append(position_out)

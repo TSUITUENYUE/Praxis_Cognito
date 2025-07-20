@@ -33,7 +33,7 @@ agent:
 
 dataset:
   num_envs: 8192
-  episodes: 100000
+  episodes: 1000000
   max_episode_seconds: 5
   frame_rate: 30
   stratification_bins: 10
@@ -72,6 +72,7 @@ trainer:
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
 
 imitator:
+  processed_path: './Pretrain/data/${agent.name}/demo/preprocess.h5'
   batch_size: 256
 
 codebook:
