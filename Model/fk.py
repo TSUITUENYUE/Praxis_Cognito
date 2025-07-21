@@ -80,9 +80,10 @@ class FKModel(nn.Module):
             xyz = torch.tensor(joint['xyz'], device=self.device)
             rpy = torch.tensor(joint['rpy'], device=self.device)
             R = vectorized_euler_to_rot_matrix(rpy)
+            t = R @ xyz  # Apply rotation to translation for correct order
             T_origin = self.eye_4.clone()
             T_origin[:3, :3] = R
-            T_origin[:3, 3] = xyz
+            T_origin[:3, 3] = t
             joint['T_origin'] = T_origin
             if joint['type'] == 'revolute':
                 joint['axis_tensor'] = torch.tensor(joint['axis'], device=self.device)
@@ -138,3 +139,6 @@ class FKModel(nn.Module):
         if bs == 1:
             positions = positions.squeeze(0)
         return positions
+
+if __name__ == '__main__':
+    fk = FKModel("Pretrain/urdfs/go2_description/urdf/go2_description.urdf")

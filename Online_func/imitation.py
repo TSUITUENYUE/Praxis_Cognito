@@ -61,27 +61,24 @@ class ImitationModule:
         recon_traj = recon_traj.squeeze(0).cpu().numpy()
         joint_cmd = joint_cmd.squeeze(0).cpu().numpy()
         orig_traj = orig_traj
-        print(orig_traj.shape)
-        print("loss:", abs(recon_traj - orig_traj).mean())
+        #print(orig_traj.shape)
+        #print("loss:", abs(recon_traj - orig_traj).mean())
         plt.figure(figsize=(10, 6))
         plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
         plt.title(f"loss")
         plt.xlabel("Dimension 1")
         plt.ylabel("Dimension 2")
-        plt.show()
+        #plt.show()
 
         # Dimensions: object_dim=3, agent EE positions=12 (4 legs * 3D)
         agent_dim = 12
         orig_agent_pos = orig_traj[:, :agent_dim]
         orig_object_pos = orig_traj[:, agent_dim:]
-        recon_object_pos = recon_traj[:, agent_dim:]
+        recon_agent_pos = recon_traj[:, :agent_dim]
         seq_len = orig_traj.shape[0]
 
         # URDF path from config
         urdf_path = self.agent.urdf
-
-        # End-effector links: indices [3,6,9,12] correspond to calf joints/links
-        # Assuming genesis RigidEntity has .links list indexed accordingly
         num_legs = 4
         pos_per_leg = 3
         dofs_idx = np.arange(self.agent.n_dofs)  # 0 to 11 for 12 DOFs
@@ -115,14 +112,13 @@ class ImitationModule:
 
         plane = scene.add_entity(gs.morphs.Plane())
         # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path,collision=True))
+        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path,collision=True,))
         # Add demo robot (offset, red material for distinction if possible)
-        demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path,collision=True))
+        demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path,collision=True,))
 
         # Get end-effector links (calf links)
-        ee_indices = self.agent.end_effector  # [3,6,9,12]
+        ee_indices = self.agent.end_effector
         ee_links = [demo_robot.links[idx] for idx in ee_indices]  # List of RigidLink objects
-
         # Add objects as spheres
         imit_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
         demo_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
@@ -132,6 +128,13 @@ class ImitationModule:
         imit_robot.set_pos(np.array([0.0, 0.0, 0.42]))
         demo_robot.set_pos(np.array([0.0, 1.0, 0.42]))  # Offset to side
         demo_object.set_pos(np.array([1.0, 0.0, 0.0]))
+
+        joint_names = self.agent.joint_name
+        dof_indices = np.array([imit_robot.get_joint(name).dof_idx_local for name in joint_names])
+        n_dofs = len(dof_indices)
+
+        imit_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
+        demo_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
         # Precompute demo joints using multi-link IK
         demo_joints = []
         for t in range(seq_len):
@@ -147,12 +150,29 @@ class ImitationModule:
             )
             demo_joints.append(q[7:].cpu().numpy())
 
-
         demo_joints = np.array(demo_joints)  # [seq_len, 12]
-
+        #print(demo_joints.shape)
         # Imitation joints from model (12 DOFs)
-        imit_joints = joint_cmd  # [seq_len, 12]
 
+        '''
+        imit_joints = []
+        for t in range(seq_len):
+            # Split agent_pos into 4 leg positions (each 3D)
+            agent_pos_t = recon_agent_pos[t]
+            leg_poses = np.split(agent_pos_t, num_legs)  # List of [3] arrays
+
+            # IK: poses as list of pos, quats repeated
+            p = imit_robot.inverse_kinematics_multilink(
+                links=ee_links,
+                poss=leg_poses,
+                quats=[fixed_quat] * num_legs
+            )
+            imit_joints.append(p[7:].cpu().numpy())
+
+        imit_joints = np.array(imit_joints)
+        '''
+        imit_joints = joint_cmd  # [seq_len, 12]
+        #print(joint_cmd)
         # Simulation loop to animate both robots and objects
         i = 0
         while True:
