@@ -29,7 +29,7 @@ agent:
     - 0.0   # RL_hip_joint
     - 1.0   # RL_thigh_joint
     - -1.5  # RL_calf_joint
-  end_effector: [3,6,9,12]
+  end_effector: [10,19,28,37]
 
 dataset:
   num_envs: 1024
@@ -46,7 +46,7 @@ dataset:
 
 model:
   vae:
-    prior: "Gaussian"
+    prior: "GMM"
     node_features: 3
     hidden_features: 128
     num_layers: 2

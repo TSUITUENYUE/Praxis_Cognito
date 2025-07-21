@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE  # Added for t-SNE
 import torch_geometric  # Assuming you have torch-geometric installed in your environment
 from torch.utils.data import DataLoader, SubsetRandomSampler
 # Assuming your dataset class is defined in Pretrain.train or elsewhere; replace with actual import
@@ -36,7 +37,7 @@ class Visualizer:
         self.prior = self.config.model.vae.prior
         self.latent_dim = self.config.model.vae.latent_dim
 
-    def visualize_latent_space(self, subset_fraction=1.0, batch_size_multiplier=2):
+    def visualize_latent_space(self, subset_fraction=1.0, batch_size_multiplier=2, use_pca=True, use_tsne=True):
         # Load the dataset (assuming it's the test or validation set; adjust as needed)
         # Replace with your actual dataset loading logic, e.g., from generate_dataset or Pretrain.train
         dataset = TrajectoryDataset(processed_path=self.config.trainer.processed_path,
@@ -79,130 +80,79 @@ class Visualizer:
         print(f"Original x flattened shape: {originals_x.shape}")
         print(f"Original traj flattened shape: {originals_traj.shape}")
 
-        # Visualize latent space (original code, with added 3D PCA)
-        if self.latent_dim == 1:
-            # Histogram for 1D
+        # Visualize latent space and originals using refactored helper
+        self._visualize_data(latents, title_suffix=f"Latent Space (Prior: {self.prior})", use_pca=use_pca, use_tsne=use_tsne)
+        self._visualize_data(originals_x, title_suffix="Input Features (x)", use_pca=use_pca, use_tsne=use_tsne)
+        self._visualize_data(originals_traj, title_suffix="Trajectories (traj)", use_pca=use_pca, use_tsne=use_tsne)
+
+        # Interpretation tips
+        print("\nInterpretation Tips:")
+        print("- PCA: Look for explained variance >0.8 for good representation; linear clusters indicate correlated dims.")
+        print("- t-SNE: Focus on local clusters (e.g., intent groups); ignore global distances. If blob-like, Gaussian prior fits well.")
+        print("- Compare latents vs. originals: If latents are more clustered, VAE is compressing meaningfully.")
+
+    def _visualize_data(self, data: np.ndarray, title_suffix: str, use_pca: bool = True, use_tsne: bool = True):
+        """Helper for PCA/t-SNE vis in 2D/3D with density plots."""
+        if data.shape[1] <= 1:
+            # Histogram for 1D (no reduction needed)
             plt.figure(figsize=(10, 6))
-            plt.hist(latents.flatten(), bins=50, density=True)
-            plt.title(f"Histogram of Latent Space (Prior: {self.prior})")
-            plt.xlabel("Latent Value")
+            plt.hist(data.flatten(), bins=50, density=True)
+            plt.title(f"Histogram of {title_suffix}")
+            plt.xlabel("Value")
             plt.ylabel("Density")
             plt.show()
-        elif self.latent_dim == 2:
-            # Scatter plot for 2D
-            plt.figure(figsize=(10, 6))
-            plt.scatter(latents[:, 0], latents[:, 1], alpha=0.5)
-            plt.title(f"Scatter Plot of 2D (Prior: {self.prior})")
-            plt.xlabel("Dimension 1")
-            plt.ylabel("Dimension 2")
-            plt.show()
+            return
 
-            # Optional: 2D histogram for density
-            plt.figure(figsize=(10, 6))
-            plt.hist2d(latents[:, 0], latents[:, 1], bins=50, cmap='viridis')
-            plt.colorbar()
-            plt.title(f"2D Histogram of Latent Space (Prior: {self.prior})")
-            plt.xlabel("Dimension 1")
-            plt.ylabel("Dimension 2")
-            plt.show()
-        else:
-            # PCA to 2D for higher dimensions
+        # 2D Reduction (PCA and/or t-SNE)
+        if use_pca:
             pca2d = PCA(n_components=2)
-            latents_2d = pca2d.fit_transform(latents)
-            explained_variance_2d = pca2d.explained_variance_ratio_.sum()
-            print(f"PCA explained variance ratio for 2 components: {explained_variance_2d:.2f}")
+            reduced_2d = pca2d.fit_transform(data)
+            explained_var = pca2d.explained_variance_ratio_.sum()
+            print(f"PCA 2D explained variance for {title_suffix}: {explained_var:.2f}")
+            self._plot_2d_density(reduced_2d, title=f"PCA 2D Hexbin Density of {title_suffix}", xlabel="PC1", ylabel="PC2")
 
-            # Use hexbin for density visualization in 2D
-            plt.figure(figsize=(10, 6))
-            plt.hexbin(latents_2d[:, 0], latents_2d[:, 1], gridsize=50, cmap='viridis', mincnt=1)
-            plt.colorbar(label='Density')
-            plt.title(f"Hexbin Density Plot of Latent Space in 2D PCA (Prior: {self.prior})")
-            plt.xlabel("PC1")
-            plt.ylabel("PC2")
-            plt.show()
+        if use_tsne:
+            tsne2d = TSNE(n_components=2, perplexity=30, random_state=42, n_jobs=-1)
+            reduced_2d = tsne2d.fit_transform(data)
+            print(f"t-SNE 2D completed for {title_suffix} (KL divergence: {tsne2d.kl_divergence_:.4f})")
+            self._plot_2d_density(reduced_2d, title=f"t-SNE 2D Hexbin Density of {title_suffix}", xlabel="Dim 1", ylabel="Dim 2")
 
-            # Added: 3D PCA for better density sense
-            pca3d = PCA(n_components=3)
-            latents_3d = pca3d.fit_transform(latents)
-            explained_variance_3d = pca3d.explained_variance_ratio_.sum()
-            print(f"PCA explained variance ratio for 3 components: {explained_variance_3d:.2f}")
+        # 3D Reduction (if dim >2)
+        if data.shape[1] > 2:
+            if use_pca:
+                pca3d = PCA(n_components=3)
+                reduced_3d = pca3d.fit_transform(data)
+                explained_var = pca3d.explained_variance_ratio_.sum()
+                print(f"PCA 3D explained variance for {title_suffix}: {explained_var:.2f}")
+                self._plot_3d_scatter(reduced_3d, title=f"PCA 3D Scatter of {title_suffix}", xlabel="PC1", ylabel="PC2", zlabel="PC3")
 
-            fig = plt.figure(figsize=(10, 8))
-            ax = fig.add_subplot(111, projection='3d')
-            # Color by density: approximate by binning or use PC3 as proxy for depth/density
-            scatter = ax.scatter(latents_3d[:, 0], latents_3d[:, 1], latents_3d[:, 2], c=latents_3d[:, 2], cmap='viridis', alpha=0.3, s=20)
-            fig.colorbar(scatter, ax=ax, label='PC3 Value (Proxy for Density)')
-            ax.set_title(f"3D Scatter of Latent Space with Color by PC3 (Prior: {self.prior})")
-            ax.set_xlabel("PC1")
-            ax.set_ylabel("PC2")
-            ax.set_zlabel("PC3")
-            plt.show()
+            if use_tsne:
+                tsne3d = TSNE(n_components=3, perplexity=30, random_state=42, n_jobs=-1)
+                reduced_3d = tsne3d.fit_transform(data)
+                print(f"t-SNE 3D completed for {title_suffix} (KL divergence: {tsne3d.kl_divergence_:.4f})")
+                self._plot_3d_scatter(reduced_3d, title=f"t-SNE 3D Scatter of {title_suffix}", xlabel="Dim 1", ylabel="Dim 2", zlabel="Dim 3")
 
-            # Additional: Per-dimension histograms to check marginal distributions
-            fig, axs = plt.subplots(1, min(self.latent_dim, 32), figsize=(32, 5))  # Show up to 5 dimensions
-            if self.latent_dim == 1:
-                axs = [axs]
-            for i in range(min(self.latent_dim, 32)):
-                axs[i].hist(latents[:, i], bins=50, density=True)
-            axs[i].set_title(f"Dim {i + 1}")
-            plt.suptitle(f"Marginal Histograms (Prior: {self.prior})")
-            plt.show()
+    def _plot_2d_density(self, reduced_2d: np.ndarray, title: str, xlabel: str, ylabel: str):
+        """Hexbin density plot for 2D."""
+        plt.figure(figsize=(10, 6))
+        plt.hexbin(reduced_2d[:, 0], reduced_2d[:, 1], gridsize=50, cmap='viridis', mincnt=1)
+        plt.colorbar(label='Density')
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.show()
 
-            # Interpretation tip
-            print("To determine the likely distribution:")
-            print("- If points are clustered around (0,0) in a blob, it might resemble a Gaussian.")
-            print("- If multiple clusters appear, it could be a GMM or multimodal.")
-            print("- For Hyperbolic prior, points might be distributed in a disk-like manner if 2D.")
-            print("- Check histograms for normality (bell-shaped) or other shapes.")
-
-            # New: Visualize original data
-            self._visualize_original_data(originals_x, originals_traj)
-
-    def _visualize_original_data(self, originals_x_flat, originals_traj_flat):
-        # Helper method for original data vis
-        for name, data in [('Input Features (x)', originals_x_flat), ('Trajectories (traj)', originals_traj_flat)]:
-            print(f"\nVisualizing distribution for {name} (flattened dim: {data.shape[1]})")
-
-            # PCA to 2D
-            pca2d = PCA(n_components=2)
-            data_2d = pca2d.fit_transform(data)
-            explained_variance_2d = pca2d.explained_variance_ratio_.sum()
-            print(f"PCA explained variance for 2 components: {explained_variance_2d:.2f}")
-
-            # Use hexbin for density in 2D
-            plt.figure(figsize=(10, 6))
-            plt.hexbin(data_2d[:, 0], data_2d[:, 1], gridsize=50, cmap='viridis', mincnt=1)
-            plt.colorbar(label='Density')
-            plt.title(f"Hexbin Density Plot in 2D PCA for {name}")
-            plt.xlabel("PC1")
-            plt.ylabel("PC2")
-            plt.show()
-
-            # Added: 3D PCA
-            pca3d = PCA(n_components=3)
-            data_3d = pca3d.fit_transform(data)
-            explained_variance_3d = pca3d.explained_variance_ratio_.sum()
-            print(f"PCA explained variance for 3 components: {explained_variance_3d:.2f}")
-
-            fig = plt.figure(figsize=(10, 8))
-            ax = fig.add_subplot(111, projection='3d')
-            # Color by PC3 as proxy for density
-            scatter = ax.scatter(data_3d[:, 0], data_3d[:, 1], data_3d[:, 2], c=data_3d[:, 2], cmap='viridis', alpha=0.3, s=20)
-            fig.colorbar(scatter, ax=ax, label='PC3 Value (Proxy for Density)')
-            ax.set_title(f"3D Scatter with Color by PC3 for {name}")
-            ax.set_xlabel("PC1")
-            ax.set_ylabel("PC2")
-            ax.set_zlabel("PC3")
-            plt.show()
-
-            # Marginal histograms (first 5 dims of flattened)
-            num_hist = min(5, data.shape[1])
-            fig, axs = plt.subplots(1, num_hist, figsize=(15, 3))
-            for i in range(num_hist):
-                axs[i].hist(data[:, i], bins=50, density=True)
-                axs[i].set_title(f"Dim {i + 1}")
-            plt.suptitle(f"Marginal Histograms for {name}")
-            plt.show()
+    def _plot_3d_scatter(self, reduced_3d: np.ndarray, title: str, xlabel: str, ylabel: str, zlabel: str):
+        """3D scatter with color by third dim as density proxy."""
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        scatter = ax.scatter(reduced_3d[:, 0], reduced_3d[:, 1], reduced_3d[:, 2], c=reduced_3d[:, 2], cmap='viridis', alpha=0.3, s=20)
+        fig.colorbar(scatter, ax=ax, label='Third Dim (Density Proxy)')
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_zlabel(zlabel)
+        plt.show()
 
 
 if __name__ == '__main__':
@@ -218,4 +168,4 @@ if __name__ == '__main__':
     OmegaConf.register_new_resolver("mul", lambda x, y: x * y)
 
     visualizer = Visualizer(cfg)
-    visualizer.visualize_latent_space(subset_fraction=0.05)
+    visualizer.visualize_latent_space(subset_fraction=0.05)  # Toggle use_pca=False or use_tsne=False if needed
