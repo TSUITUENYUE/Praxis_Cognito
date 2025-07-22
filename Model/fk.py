@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from xml.etree import ElementTree as ET
 from collections import defaultdict
+import os
+import sys
 
 def vectorized_euler_to_rot_matrix(rpy):
     if rpy.dim() == 1:
@@ -80,7 +82,7 @@ class FKModel(nn.Module):
             xyz = torch.tensor(joint['xyz'], device=self.device)
             rpy = torch.tensor(joint['rpy'], device=self.device)
             R = vectorized_euler_to_rot_matrix(rpy)
-            t = R @ xyz  # Apply rotation to translation for correct order
+            t = xyz
             T_origin = self.eye_4.clone()
             T_origin[:3, :3] = R
             T_origin[:3, 3] = t
@@ -109,8 +111,9 @@ class FKModel(nn.Module):
             self.child_map[parent].append((child, name))
             self.parent_map[child] = parent
             origin = joint.find('origin')
-            xyz = list(map(float, (origin.get('xyz') or "0 0 0").split())) if origin else [0.0, 0.0, 0.0]
-            rpy = list(map(float, (origin.get('rpy') or "0 0 0").split())) if origin else [0.0, 0.0, 0.0]
+
+            xyz = list(map(float, (origin.get('xyz') or "0 0 0").split())) if origin is not None else [0.0, 0.0, 0.0]
+            rpy = list(map(float, (origin.get('rpy') or "0 0 0").split())) if origin is not None else [0.0, 0.0, 0.0]
             axis_elem = joint.find('axis')
             axis = list(map(float, (axis_elem.get('xyz') or "1 0 0").split())) if axis_elem else [1.0, 0.0, 0.0]
             self.joint_map[name] = {'type': jtype, 'parent': parent, 'child': child, 'xyz': xyz, 'rpy': rpy,
@@ -141,4 +144,8 @@ class FKModel(nn.Module):
         return positions
 
 if __name__ == '__main__':
-    fk = FKModel("Pretrain/urdfs/go2_description/urdf/go2_description.urdf")
+    fk = FKModel("../Pretrain/urdfs/go2_description/urdf/go2_description.urdf")
+    end_effector_names = ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
+    end_effector_indices = [fk.link_names.index(name) for name in end_effector_names]
+    print(len(fk.link_names))
+    print("End effector indices:", end_effector_indices)

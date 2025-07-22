@@ -34,7 +34,7 @@ class Runner:
             self.trainer.train()
         elif self.mode == "imitate":
             #self.imitator.imitate(demo, self.codebook)
-            self.imitator.visualize_in_sim(demo, 0)
+            self.imitator.visualize_in_sim(demo, 1)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

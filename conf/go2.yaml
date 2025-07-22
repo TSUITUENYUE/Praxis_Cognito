@@ -29,11 +29,11 @@ agent:
     - 0.0   # RL_hip_joint
     - 1.0   # RL_thigh_joint
     - -1.5  # RL_calf_joint
-  end_effector: [9,10,11,12]
+  end_effector: [11, 20, 29, 38]
 
 dataset:
   num_envs: 8192
-  episodes: 500000
+  episodes: 2000000
   max_episode_seconds: 5
   frame_rate: 30
   stratification_bins: 10
@@ -67,7 +67,7 @@ trainer:
     lr: 0.001
   beta_anneal:
     strategy: "warmup"
-    warm_up: 500
+    warm_up: 1000
     max_beta: 0.0000001
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"

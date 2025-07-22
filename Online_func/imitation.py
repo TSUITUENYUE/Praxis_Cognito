@@ -57,25 +57,36 @@ class ImitationModule:
         with torch.no_grad():
             recon_traj, joint_cmd, z, *_ = self.vae(graph_x, edge_index)
 
-
         recon_traj = recon_traj.squeeze(0).cpu().numpy()
         joint_cmd = joint_cmd.squeeze(0).cpu().numpy()
         orig_traj = orig_traj
-        #print(orig_traj.shape)
-        #print("loss:", abs(recon_traj - orig_traj).mean())
+        np.set_printoptions(threshold=np.inf)
+
+        print("loss:", abs(recon_traj - orig_traj).mean())
         plt.figure(figsize=(10, 6))
         plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
         plt.title(f"loss")
         plt.xlabel("Dimension 1")
         plt.ylabel("Dimension 2")
-        #plt.show()
+        # plt.show()
 
-        # Dimensions: object_dim=3, agent EE positions=12 (4 legs * 3D)
-        agent_dim = 12
-        orig_agent_pos = orig_traj[:, :agent_dim]
+        # Dimensions: object_dim=3, agent positions=126 (42 links * 3D)
+        agent_dim = 126
+        object_dim = 3
         orig_object_pos = orig_traj[:, agent_dim:]
-        recon_agent_pos = recon_traj[:, :agent_dim]
+        recon_object_pos = recon_traj[:, agent_dim:]
         seq_len = orig_traj.shape[0]
+
+        def extract_ee_positions(traj, ee_indices):
+            seq_len, _ = traj.shape
+            ee_pos = np.zeros((seq_len, len(ee_indices) * 3))
+            for j, idx in enumerate(ee_indices):
+                start = idx * 3
+                ee_pos[:, j * 3: (j * 3) + 3] = traj[:, start: start + 3]
+            return ee_pos
+
+        orig_agent_pos = extract_ee_positions(orig_traj[:, :agent_dim], self.agent.end_effector)
+        recon_agent_pos = extract_ee_positions(recon_traj[:, :agent_dim], self.agent.end_effector)
 
         # URDF path from config
         urdf_path = self.agent.urdf
@@ -112,9 +123,9 @@ class ImitationModule:
 
         plane = scene.add_entity(gs.morphs.Plane())
         # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path,collision=True,))
+        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
         # Add demo robot (offset, red material for distinction if possible)
-        demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path,collision=True,))
+        demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
 
         # Get end-effector links (calf links)
         ee_indices = self.agent.end_effector
@@ -123,69 +134,48 @@ class ImitationModule:
         imit_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
         demo_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
 
-
         scene.build()
         imit_robot.set_pos(np.array([0.0, 0.0, 0.42]))
-        demo_robot.set_pos(np.array([0.0, 1.0, 0.42]))  # Offset to side
-        demo_object.set_pos(np.array([1.0, 0.0, 0.0]))
+        demo_robot.set_pos(np.array([0.0, 5.0, 0.42]))  # Offset to side
 
         joint_names = self.agent.joint_name
         dof_indices = np.array([imit_robot.get_joint(name).dof_idx_local for name in joint_names])
         n_dofs = len(dof_indices)
-
+        # print(dof_indices)
         imit_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
         demo_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
         # Precompute demo joints using multi-link IK
         demo_joints = []
         for t in range(seq_len):
-            # Split agent_pos into 4 leg positions (each 3D)
             agent_pos_t = orig_agent_pos[t]
-            leg_poses = np.split(agent_pos_t, num_legs)  # List of [3] arrays
-
-            # IK: poses as list of pos, quats repeated
-            q = demo_robot.inverse_kinematics_multilink(
+            leg_poses = np.split(agent_pos_t, num_legs)
+            p = demo_robot.inverse_kinematics_multilink(
                 links=ee_links,
                 poss=leg_poses,
                 quats=[fixed_quat] * num_legs
             )
-            demo_joints.append(q[7:].cpu().numpy())
-
-        demo_joints = np.array(demo_joints)  # [seq_len, 12]
-        #print(demo_joints.shape)
+            demo_joints.append(p[7:].cpu().numpy())
+        demo_joints = np.array(demo_joints)
         # Imitation joints from model (12 DOFs)
-
-        '''
-        imit_joints = []
-        for t in range(seq_len):
-            # Split agent_pos into 4 leg positions (each 3D)
-            agent_pos_t = recon_agent_pos[t]
-            leg_poses = np.split(agent_pos_t, num_legs)  # List of [3] arrays
-
-            # IK: poses as list of pos, quats repeated
-            p = imit_robot.inverse_kinematics_multilink(
-                links=ee_links,
-                poss=leg_poses,
-                quats=[fixed_quat] * num_legs
-            )
-            imit_joints.append(p[7:].cpu().numpy())
-
-        imit_joints = np.array(imit_joints)
-        '''
         imit_joints = joint_cmd  # [seq_len, 12]
-        #print(joint_cmd)
+        print(joint_cmd)
         # Simulation loop to animate both robots and objects
         i = 0
+
+        # print(recon_agent_pos)
+        # print(orig_agent_pos)
+
         while True:
             t = i // 5  # Slow down: 5 sim steps per traj frame
             t = min(t, seq_len - 1)
 
             # Control imitation robot with joint_cmd and move object
             imit_robot.control_dofs_position(imit_joints[t], dofs_idx)
-            #imit_object.set_pos(recon_object_pos[t])
+            imit_object.set_pos(recon_object_pos[t])
 
             # Control demo robot with IK joints and move object (offset)
             demo_robot.control_dofs_position(demo_joints[t], dofs_idx)
-            #demo_object.set_pos(orig_object_pos[t] + np.array([1.0, 0.0, 0.0]))
+            demo_object.set_pos(orig_object_pos[t] + np.array([0.0, 5.0, 0.0]))
 
             scene.step()
             i += 1

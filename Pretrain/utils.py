@@ -7,7 +7,6 @@ def build_edge_index(fk_model, end_effector_indices, device):
     link_names = fk_model.link_names
     num_links = len(link_names)
     num_nodes = num_links + 1  # +1 for object
-
     # Build adjacency matrix
     adj = torch.zeros(num_nodes, num_nodes, device=device)
     for joint_name, joint in fk_model.joint_map.items():
@@ -24,3 +23,4 @@ def build_edge_index(fk_model, end_effector_indices, device):
 
     edge_index_maybe_float, _ = dense_to_sparse(adj)
     return edge_index_maybe_float.long()
+
