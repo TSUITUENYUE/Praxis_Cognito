@@ -68,12 +68,12 @@ trainer:
   beta_anneal:
     strategy: "warmup"
     warm_up: 1000
-    max_beta: 0.0000001
+    max_beta: 0.00001
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
 
 imitator:
-  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
+  processed_path: './Pretrain/data/${agent.name}/demo/preprocess.h5'
   batch_size: 256
 
 codebook:

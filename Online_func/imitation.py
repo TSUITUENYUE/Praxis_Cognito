@@ -105,7 +105,7 @@ class ImitationModule:
             show_viewer=True,
             viewer_options=gs.options.ViewerOptions(
                 res=(1280, 960),
-                camera_pos=(3.5, 0.0, 2.5),
+                camera_pos=(0.0, 3.5, 2.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=40,
                 max_FPS=60,
@@ -123,28 +123,39 @@ class ImitationModule:
 
         plane = scene.add_entity(gs.morphs.Plane())
         # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
+        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True, fixed=True))
         # Add demo robot (offset, red material for distinction if possible)
-        demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
+        #demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
 
         # Get end-effector links (calf links)
-        ee_indices = self.agent.end_effector
-        ee_links = [demo_robot.links[idx] for idx in ee_indices]  # List of RigidLink objects
+        #ee_indices = self.agent.end_effector
+        #print(demo_robot.links)
+        #ee_links = [demo_robot.links[idx] for idx in ee_indices]  # List of RigidLink objects
         # Add objects as spheres
-        imit_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
-        demo_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
+        #imit_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
+        #demo_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
+
+        cam = scene.add_camera(
+            res=(1280, 960),
+            pos=(0.0, 3.5, 2.5),
+            lookat=(0.0, 0.0, 0.5),
+            fov=40,
+            GUI=False,
+        )
 
         scene.build()
         imit_robot.set_pos(np.array([0.0, 0.0, 0.42]))
-        demo_robot.set_pos(np.array([0.0, 5.0, 0.42]))  # Offset to side
+        #demo_robot.set_pos(np.array([0.0, 5.0, 0.42]))  # Offset to side
 
         joint_names = self.agent.joint_name
         dof_indices = np.array([imit_robot.get_joint(name).dof_idx_local for name in joint_names])
+        print(dof_indices)
         n_dofs = len(dof_indices)
         # print(dof_indices)
-        imit_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
-        demo_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
+        #imit_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
+        #demo_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
         # Precompute demo joints using multi-link IK
+        '''
         demo_joints = []
         for t in range(seq_len):
             agent_pos_t = orig_agent_pos[t]
@@ -156,28 +167,31 @@ class ImitationModule:
             )
             demo_joints.append(p[7:].cpu().numpy())
         demo_joints = np.array(demo_joints)
+        '''
         # Imitation joints from model (12 DOFs)
         imit_joints = joint_cmd  # [seq_len, 12]
-        print(joint_cmd)
+        #print(joint_cmd)
         # Simulation loop to animate both robots and objects
-        i = 0
 
         # print(recon_agent_pos)
         # print(orig_agent_pos)
 
-        while True:
-            t = i // 5  # Slow down: 5 sim steps per traj frame
-            t = min(t, seq_len - 1)
+        cam.start_recording()
+
+        slow_factor = 1
+        repeat_times = 3  # Repeat the sequence 3 times
+        for ii in range(seq_len * slow_factor * repeat_times):
+            t = (ii // slow_factor) % seq_len
 
             # Control imitation robot with joint_cmd and move object
             imit_robot.control_dofs_position(imit_joints[t], dofs_idx)
-            imit_object.set_pos(recon_object_pos[t])
+            # imit_object.set_pos(recon_object_pos[t])
 
             # Control demo robot with IK joints and move object (offset)
-            demo_robot.control_dofs_position(demo_joints[t], dofs_idx)
-            demo_object.set_pos(orig_object_pos[t] + np.array([0.0, 5.0, 0.0]))
+            # demo_robot.control_dofs_position(demo_joints[t], dofs_idx)
+            # demo_object.set_pos(orig_object_pos[t] + np.array([0.0, 5.0, 0.0]))
 
             scene.step()
-            i += 1
-            if t == seq_len - 1 and i % 5 == 0:
-                i = 0  # Loop animation
+            cam.render()
+
+        cam.stop_recording(save_to_filename='animation.mp4', fps=30)

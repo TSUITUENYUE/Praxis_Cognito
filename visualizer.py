@@ -16,6 +16,7 @@ from Pretrain.utils import *
 
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.stats import gaussian_kde
+import umap
 
 
 class Visualizer:
@@ -34,7 +35,7 @@ class Visualizer:
         self.prior = self.config.model.vae.prior
         self.latent_dim = self.config.model.vae.latent_dim
 
-    def visualize_latent_space(self, subset_fraction=1.0, batch_size_multiplier=2, use_pca=True, use_tsne=True):
+    def visualize_latent_space(self, subset_fraction=1.0, batch_size_multiplier=2, use_pca=True, use_tsne=True, use_umap=True):
         dataset = TrajectoryDataset(processed_path=self.config.trainer.processed_path,
                                     agent=self.agent)
 
@@ -71,17 +72,18 @@ class Visualizer:
         print(f"Original traj flattened shape: {originals_traj.shape}")
 
         self._visualize_data(latents, title_suffix=f"Latent Space (Prior: {self.prior})", use_pca=use_pca,
-                             use_tsne=use_tsne)
-        self._visualize_data(originals_traj, title_suffix="Trajectories (traj)", use_pca=use_pca, use_tsne=use_tsne)
+                             use_tsne=use_tsne, use_umap=use_umap)
+        self._visualize_data(originals_traj, title_suffix="Trajectories (traj)", use_pca=use_pca, use_tsne=use_tsne, use_umap=use_umap)
 
         print("\nInterpretation Tips:")
         print(
             "- PCA: Look for explained variance >0.8 for good representation; linear clusters indicate correlated dims.")
         print(
             "- t-SNE: Focus on local clusters (e.g., intent groups); ignore global distances. If blob-like, Gaussian prior fits well.")
+        print("- UMAP: Balances local and global structure; look for clusters and topology preservation compared to t-SNE.")
         print("- Compare latents vs. originals: If latents are more clustered, VAE is compressing meaningfully.")
 
-    def _visualize_data(self, data: np.ndarray, title_suffix: str, use_pca: bool = True, use_tsne: bool = True):
+    def _visualize_data(self, data: np.ndarray, title_suffix: str, use_pca: bool = True, use_tsne: bool = True, use_umap: bool = True):
         if data.shape[1] <= 1:
             plt.figure(figsize=(10, 6))
             plt.hist(data.flatten(), bins=50, density=True, color='white')
@@ -106,6 +108,13 @@ class Visualizer:
             reduced_2d = tsne2d.fit_transform(data)
             print(f"t-SNE 2D completed for {title_suffix} (KL divergence: {tsne2d.kl_divergence_:.4f})")
             self._plot_2d_density(reduced_2d, title=f"t-SNE:Density of {title_suffix}", xlabel="Dim 1",
+                                  ylabel="Dim 2")
+
+        if use_umap:
+            umap2d = umap.UMAP(n_components=2, random_state=42)
+            reduced_2d = umap2d.fit_transform(data)
+            print(f"UMAP 2D completed for {title_suffix}")
+            self._plot_2d_density(reduced_2d, title=f"UMAP:Density of {title_suffix}", xlabel="Dim 1",
                                   ylabel="Dim 2")
 
     def _plot_2d_density(self, reduced_2d: np.ndarray, title: str, xlabel: str, ylabel: str):
@@ -135,7 +144,7 @@ class Visualizer:
         ax.tick_params(axis='both', colors='white')
 
         # Save the plot
-        plot_type = 'PCA' if 'PCA' in title else 'tSNE'
+        plot_type = 'PCA' if 'PCA' in title else 'tSNE' if 't-SNE' in title else 'UMAP'
         data_type = 'latent' if 'Latent Space' in title else 'traj'
         save_path = os.path.join(self.config.trainer.save_path, f"{plot_type}_{data_type}.png")
         plt.savefig(save_path, bbox_inches='tight', facecolor='black')
@@ -156,4 +165,4 @@ if __name__ == '__main__':
     OmegaConf.register_new_resolver("mul", lambda x, y: x * y)
 
     visualizer = Visualizer(cfg)
-    visualizer.visualize_latent_space(subset_fraction=0.05)
+    visualizer.visualize_latent_space(subset_fraction=0.005)
