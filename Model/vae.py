@@ -17,6 +17,8 @@ class IntentionVAE(nn.Module):
         self.object_dim = agent.object_dim
         self.joint_dim = agent.n_dofs
         self.urdf = agent.urdf
+        self.pos_mean = torch.zeros(3,device='cuda')
+        self.pos_std = torch.ones(3,device='cuda')
 
         # Initialize encoder based on prior
         if self.prior == "GMM":
@@ -39,7 +41,7 @@ class IntentionVAE(nn.Module):
         else:
             raise ValueError(f"Unsupported prior: {prior}. Choose from 'GMM', 'Hyperbolic', or 'Gaussian'.")
 
-        self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim, self.urdf, hidden_dim)
+        self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim, self.agent, hidden_dim, self.pos_mean, self.pos_std)
 
     def reparameterize_gmm(self, mu, logvar, pi_logits):
         # Get component probabilities

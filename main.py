@@ -8,6 +8,8 @@ from codebook import Codebook
 from Pretrain.generate_dataset import generate
 import argparse
 import os
+import torch._dynamo as dynamo
+dynamo.config.capture_scalar_outputs = True
 
 class Runner:
     def __init__(self, mode, config: DictConfig):

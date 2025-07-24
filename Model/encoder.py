@@ -41,7 +41,7 @@ class PoincareEncoder(nn.Module):
             xt = x[:, t].reshape(bs * num_nodes, -1)
             for gnn in self.gnns:
                 xt = F.relu(gnn(xt, batched_edge_index))
-            emb = global_add_pool(xt, batch_idx)
+            emb = global_add_pool(xt, batch_idx,size=bs)
             graph_embs.append(emb)
 
         graph_embs = torch.stack(graph_embs, dim=1)
@@ -98,7 +98,7 @@ class GMMEncoder(nn.Module):
                 xt = F.relu(gnn(xt, batched_edge_index))
 
             # Use global pooling
-            emb = global_add_pool(xt, batch_idx)
+            emb = global_add_pool(xt, batch_idx,size=bs)
             graph_embs.append(emb)
 
         graph_embs = torch.stack(graph_embs, dim=1)
@@ -157,7 +157,7 @@ class VanillaEncoder(nn.Module):
                 xt = F.relu(gnn(xt, batched_edge_index))
 
             # Use global pooling
-            emb = global_add_pool(xt, batch_idx)
+            emb = global_add_pool(xt, batch_idx,size=bs)
             graph_embs.append(emb)
 
         graph_embs = torch.stack(graph_embs, dim=1)

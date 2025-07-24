@@ -68,7 +68,7 @@ class Trainer:
         # FK and VAE setup
         self.vae = model.to(self.device)
         self.vae_prior = self.vae.prior
-        self.vae = torch.compile(self.vae).to(self.device)
+        self.vae = torch.compile(self.vae, dynamic=True).to(self.device)
 
         self.agent = self.vae.agent
         self.n_dofs = self.agent.n_dofs
@@ -93,9 +93,15 @@ class Trainer:
         num_total_steps = self.num_epochs * (self.episodes // self.batch_size)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_total_steps)
         self.dataset = TrajectoryDataset(processed_path=config.processed_path, source_path=self.load_path, agent=self.agent)
+        #self.pos_min = self.dataset.pos_min
+        #self.pos_max = self.dataset.pos_max
+
+        self.vae.pos_mean = self.dataset.pos_mean
+        self.vae.pos_std = self.dataset.pos_std
 
     def train(self):
         torch.set_float32_matmul_precision('high')
+        print(self.vae.pos_mean, self.vae.pos_std)
         self.vae.train()
         save_interval = max(1, self.num_epochs // 4)
         #scaler = GradScaler()
