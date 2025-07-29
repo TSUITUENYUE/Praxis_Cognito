@@ -3,8 +3,6 @@ from omegaconf import DictConfig
 import torch
 import torch.optim as optim
 from .dataset import TrajectoryDataset
-from Model.agent import Agent
-from Model.vae import IntentionVAE
 from .utils import *
 import sys
 import os
@@ -12,6 +10,8 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import geoopt
 import math
+# ✅ Import AMP tools
+from torch.cuda.amp import GradScaler, autocast
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,31 +28,32 @@ def get_beta(epoch, total_epochs, recon_loss=None, kl_loss=None, strategy='cycli
     elif strategy == 'cyclical':
         cycle_length = total_epochs // num_cycles
         if cycle_length == 0:
-            return max_beta  # Avoid division by zero for small total_epochs
+            return max_beta
         cycle_progress = (epoch % cycle_length) / cycle_length
-        # Use sigmoid for smoother ramp; alternatively, use linear: max_beta * cycle_progress
-        sigmoid_progress = 1 / (1 + math.exp(-10 * (cycle_progress - 0.5)))  # Centered sigmoid
+        sigmoid_progress = 1 / (1 + math.exp(-10 * (cycle_progress - 0.5)))
         return max_beta * sigmoid_progress
 
     elif strategy == 'adaptive':
         if recon_loss is None or kl_loss is None:
             raise ValueError("recon_loss and kl_loss are required for adaptive strategy.")
-        if kl_loss == 0:  # Avoid division by zero
+        if kl_loss == 0:
             return max_beta
         loss_ratio = recon_loss / kl_loss
         if loss_ratio > adaptive_threshold:
-            return max(0.0, max_beta * (loss_ratio / adaptive_threshold - 1))  # Decrease beta if recon >> KL
+            return max(0.0, max_beta * (loss_ratio / adaptive_threshold - 1))
         else:
-            return min(max_beta, max_beta * (adaptive_threshold / loss_ratio))  # Increase beta if KL dominates
+            return min(max_beta, max_beta * (adaptive_threshold / loss_ratio))
 
     else:
         raise ValueError(f"Invalid strategy: {strategy}. Choose from 'warmup', 'cyclical', or 'adaptive'.")
+
 
 class Trainer:
     def __init__(self, model, config: DictConfig):
         self.load_path = config.load_path
         self.save_path = config.save_path
         self.batch_size = config.batch_size
+        self.grad_clip_value = 1.0  # ✅ Added for stable training with AMP
 
         filename = os.path.basename(self.load_path)
         parts = filename.rstrip('.h5').strip().split()
@@ -68,13 +69,13 @@ class Trainer:
         # FK and VAE setup
         self.vae = model.to(self.device)
         self.vae_prior = self.vae.prior
-        self.vae = torch.compile(self.vae, dynamic=True).to(self.device)
+        # ✅ Optimized torch.compile mode for static shapes from drop_last=True
+        self.vae = torch.compile(self.vae, mode="reduce-overhead").to(self.device)
 
         self.agent = self.vae.agent
         self.n_dofs = self.agent.n_dofs
         self.urdf = self.agent.urdf
         self.fk_model = self.agent.fk_model.to(self.device)
-
 
         self.num_links = len(self.fk_model.link_names)
         self.num_nodes = self.num_links + 1
@@ -89,57 +90,84 @@ class Trainer:
 
         self.optimizer = optim.Adam(self.vae.parameters(), lr=config.optimizer.lr, fused=True)
         if self.vae_prior == "Hyperbolic":
-            self.optimizer = geoopt.optim.RiemannianAdam(self.vae.parameters(), lr=config.optimizer.lr, fused=True)
+            self.optimizer = geoopt.optim.RiemannianAdam(self.vae.parameters(),
+                                                         lr=config.optimizer.lr)  # Fused not available
+
         num_total_steps = self.num_epochs * (self.episodes // self.batch_size)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_total_steps)
-        self.dataset = TrajectoryDataset(processed_path=config.processed_path, source_path=self.load_path, agent=self.agent)
-        #self.pos_min = self.dataset.pos_min
-        #self.pos_max = self.dataset.pos_max
+        self.dataset = TrajectoryDataset(processed_path=config.processed_path, source_path=self.load_path,
+                                         agent=self.agent)
 
         self.vae.pos_mean = self.dataset.pos_mean
         self.vae.pos_std = self.dataset.pos_std
 
+        # ✅ Initialize GradScaler for AMP
+        self.scaler = GradScaler()
+
     def train(self):
         torch.set_float32_matmul_precision('high')
-        print(self.vae.pos_mean, self.vae.pos_std)
         self.vae.train()
         save_interval = max(1, self.num_epochs // 4)
-        #scaler = GradScaler()
         dataloader = DataLoader(self.dataset,
                                 batch_size=self.batch_size,
                                 num_workers=4,
                                 shuffle=True,
-                                drop_last=True,)
+                                drop_last=True)
+
+        # ✅ Calculate total steps for correct annealing schedule
+        total_steps = self.num_epochs * len(dataloader)
+        warmup_steps = int(self.warm_up * len(dataloader))  # Assuming warm_up is in epochs
 
         for epoch in range(self.num_epochs):
             for i, (graph_x, orig_traj) in enumerate(dataloader):
+                # ✅ Calculate a global step for the schedulers
+                global_step = epoch * len(dataloader) + i
+
                 graph_x = graph_x.to(self.device, non_blocking=True)
                 orig_traj = orig_traj.to(self.device, non_blocking=True)
 
-                if self.vae_prior == "Gaussian":
-                    recon_traj, _, z, mu, logvar = self.vae(graph_x, self.edge_index)
-                    beta = get_beta(epoch=i, total_epochs=self.episodes//self.batch_size, strategy=self.strategy, warmup_epochs=self.warm_up, max_beta=self.max_beta)
-                    loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, beta=beta)
+                self.optimizer.zero_grad(set_to_none=True)
 
-                elif self.vae_prior == "GMM":
-                    recon_traj,_, z, mu, logvar, pi = self.vae(graph_x, self.edge_index)
-                    beta = get_beta(epoch=i, total_epochs=self.episodes//self.batch_size, strategy=self.strategy, warmup_epochs=self.warm_up, max_beta=self.max_beta)
-                    loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, pi, beta=beta)
+                # ✅ Wrap forward pass in autocast for AMP
+                with autocast(enabled=True):
+                    # --- Common operations ---
+                    outputs = self.vae(graph_x, self.edge_index)
+                    recon_traj = outputs[0]
+                    beta = get_beta(epoch=global_step, total_epochs=total_steps,
+                                    strategy=self.strategy, warmup_epochs=warmup_steps,
+                                    max_beta=self.max_beta)
 
-                elif self.vae_prior == "Hyperbolic":
-                    recon_traj, _, z, mu, var = self.vae(graph_x, self.edge_index)
-                    beta = get_beta(epoch=i, total_epochs=self.episodes//self.batch_size, strategy=self.strategy, warmup_epochs=self.warm_up, max_beta=self.max_beta)
-                    loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, z,mu,var, beta = beta)
+                    # --- Specific loss calculation ---
+                    if self.vae_prior == "Gaussian":
+                        mu, logvar = outputs[3], outputs[4]
+                        loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, beta=beta)
+                    elif self.vae_prior == "GMM":
+                        mu, logvar, pi = outputs[3], outputs[4], outputs[5]
+                        loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, pi, beta=beta)
+                    elif self.vae_prior == "Hyperbolic":
+                        z, mu, var = outputs[2], outputs[3], outputs[4]
+                        loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, z, mu, var, beta=beta)
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                # ✅ Scale the loss and perform backward pass
+                self.scaler.scale(loss).backward()
+
+                # ✅ Add gradient clipping for stability
+                # Unscales the gradients of optimizer's assigned params in-place
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_clip_value)
+
+                # ✅ scaler.step() calls optimizer.step()
+                self.scaler.step(self.optimizer)
+
+                # ✅ Update the scale for next iteration
+                self.scaler.update()
+
                 self.scheduler.step()
                 print(
-                    f"Batch {i + 1}/{self.episodes//self.batch_size}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}")
+                    f"Epoch {epoch + 1}, Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
 
             if (epoch + 1) % save_interval == 0 or (epoch + 1) == self.num_epochs:
                 if not os.path.exists(self.save_path): os.makedirs(self.save_path)
-                save_path = self.save_path + f"vae_checkpoint_epoch_{epoch+1}.pth"
+                save_path = self.save_path + f"vae_checkpoint_epoch_{epoch + 1}.pth"
                 torch.save(self.vae.state_dict(), save_path)
                 print(f"Saved model checkpoint to {save_path}")

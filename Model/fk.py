@@ -51,8 +51,8 @@ def vectorized_axis_angle_to_rot_matrix(axis_angle):
     R[:, 2, 1] = kz*ky*one_ca + kx*sa
     R[:, 2, 2] = ca + kz*kz*one_ca
 
-    eye = torch.eye(3, device=axis_angle.device).unsqueeze(0).repeat(bs, 1, 1)
-    R[mask] = eye[mask]
+    eye = torch.eye(3, device=axis_angle.device).expand(bs, 3, 3)
+    R = torch.where(mask.view(bs, 1, 1), eye, R)
     if bs == 1:
         return R.squeeze(0)
     return R
