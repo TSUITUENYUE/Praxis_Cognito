@@ -32,16 +32,15 @@ agent:
   end_effector: [11, 20, 29, 38]
 
 dataset:
-  num_envs: 32768
+  num_envs: 8192
   episodes: 500000
   max_episode_seconds: 5
   frame_rate: 30
-  stratification_bins: 10
 
   log_dir: "./Pretrain/primitives/go2-walking"
-  structured_fraction: 0.0
+  curiosity_beta: 0.2
   policy_hidden_dim: 256
-  noise_std_max: 0.1
+  similarity_threshold: 0.95
 
   agent_pos: [ 0.0, 0.0, 0.42]
   obj_pos_low: [ -0.5, -0.5, 0.0 ]
