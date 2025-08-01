@@ -167,7 +167,8 @@ class IntentionVAE(nn.Module):
             kl_loss = (log_qz - log_pz).mean()
         elif self.prior == "Gaussian":
             mu, logvar = args
-            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+            kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+            kl_loss = kl_per_sample.mean()
         else:
             raise ValueError(f"Unsupported prior in loss: {self.prior}")
 

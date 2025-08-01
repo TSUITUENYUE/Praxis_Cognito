@@ -39,9 +39,9 @@ dataset:
   stratification_bins: 10
 
   log_dir: "./Pretrain/primitives/go2-walking"
-  structured_fraction: 0.3
+  structured_fraction: 0.0
   policy_hidden_dim: 256
-  noise_std_max: 0.25
+  noise_std_max: 0.1
 
   agent_pos: [ 0.0, 0.0, 0.42]
   obj_pos_low: [ -0.5, -0.5, 0.0 ]
@@ -72,8 +72,8 @@ trainer:
     lr: 0.001
   beta_anneal:
     strategy: "warmup"
-    warm_up: 100
-    max_beta: 1
+    warm_up: 1000
+    max_beta: 0.0001
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
 

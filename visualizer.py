@@ -35,7 +35,7 @@ class Visualizer:
         self.prior = self.config.model.vae.prior
         self.latent_dim = self.config.model.vae.latent_dim
 
-    def visualize_latent_space(self, subset_fraction=1.0, batch_size_multiplier=2, use_pca=True, use_tsne=True, use_umap=True):
+    def visualize_latent_space(self, subset_fraction=1.0, batch_size_multiplier=1, use_pca=True, use_tsne=True, use_umap=True):
         dataset = TrajectoryDataset(processed_path=self.config.trainer.processed_path,
                                     agent=self.agent)
 

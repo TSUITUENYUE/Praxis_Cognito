@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import geoopt
 import math
-# ✅ Import AMP tools
 from torch.cuda.amp import GradScaler, autocast
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,6 +21,7 @@ def get_beta(epoch, total_epochs, recon_loss=None, kl_loss=None, strategy='cycli
         if epoch < warmup_epochs:
             return 0.0
         else:
+            #print(epoch)
             progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
             return max_beta * progress
 
@@ -70,8 +70,8 @@ class Trainer:
         self.vae = model.to(self.device)
         self.vae_prior = self.vae.prior
         # ✅ Optimized torch.compile mode for static shapes from drop_last=True
-        self.vae = torch.compile(self.vae, mode="reduce-overhead").to(self.device)
 
+        self.vae = torch.compile(self.vae).to(self.device)
         self.agent = self.vae.agent
         self.n_dofs = self.agent.n_dofs
         self.urdf = self.agent.urdf
@@ -116,8 +116,6 @@ class Trainer:
 
         # ✅ Calculate total steps for correct annealing schedule
         total_steps = self.num_epochs * len(dataloader)
-        warmup_steps = int(self.warm_up * len(dataloader))  # Assuming warm_up is in epochs
-
         for epoch in range(self.num_epochs):
             for i, (graph_x, orig_traj) in enumerate(dataloader):
                 # ✅ Calculate a global step for the schedulers
@@ -134,9 +132,8 @@ class Trainer:
                     outputs = self.vae(graph_x, self.edge_index)
                     recon_traj = outputs[0]
                     beta = get_beta(epoch=global_step, total_epochs=total_steps,
-                                    strategy=self.strategy, warmup_epochs=warmup_steps,
+                                    strategy=self.strategy, warmup_epochs=self.warm_up,
                                     max_beta=self.max_beta)
-
                     # --- Specific loss calculation ---
                     if self.vae_prior == "Gaussian":
                         mu, logvar = outputs[3], outputs[4]
@@ -150,21 +147,15 @@ class Trainer:
 
                 # ✅ Scale the loss and perform backward pass
                 self.scaler.scale(loss).backward()
-
-                # ✅ Add gradient clipping for stability
-                # Unscales the gradients of optimizer's assigned params in-place
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_clip_value)
 
-                # ✅ scaler.step() calls optimizer.step()
                 self.scaler.step(self.optimizer)
-
-                # ✅ Update the scale for next iteration
                 self.scaler.update()
 
                 self.scheduler.step()
                 print(
-                    f"Epoch {epoch + 1}, Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
+                    f"Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
 
             if (epoch + 1) % save_interval == 0 or (epoch + 1) == self.num_epochs:
                 if not os.path.exists(self.save_path): os.makedirs(self.save_path)
