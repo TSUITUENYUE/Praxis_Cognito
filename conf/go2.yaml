@@ -32,7 +32,7 @@ agent:
   end_effector: [11, 20, 29, 38]
 
 dataset:
-  num_envs: 8192
+  num_envs: 25000
   episodes: 500000
   max_episode_seconds: 5
   frame_rate: 30

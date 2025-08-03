@@ -62,7 +62,11 @@ class Go2Env:
                 quat=self.base_init_quat.cpu().numpy(),
             ),
         )
-
+        self.ball = self.scene.add_entity(
+            gs.morphs.Sphere(
+                radius=0.05,
+            )
+        )
         # build
         self.scene.build(n_envs=num_envs)
 
@@ -138,6 +142,11 @@ class Go2Env:
         self.dof_pos[:] = self.robot.get_dofs_position(self.motors_dof_idx)
         self.dof_vel[:] = self.robot.get_dofs_velocity(self.motors_dof_idx)
 
+        ball_pos = self.ball.get_pos()
+        ball_vel = self.ball.get_vel()
+        # express in base frame
+        relative_ball_pos = transform_by_quat(ball_pos - self.base_pos, inv_base_quat)
+        relative_ball_vel = transform_by_quat(ball_vel - self.base_lin_vel, inv_base_quat)
         # resample commands
         envs_idx = (
             (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
@@ -173,10 +182,11 @@ class Go2Env:
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
                 self.dof_vel * self.obs_scales["dof_vel"],  # 12
                 self.actions,  # 12
+                relative_ball_pos,  # 3 <-- ADDED
+                relative_ball_vel  # 3 <-- ADDED
             ],
             axis=-1,
         )
-
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
 
@@ -194,6 +204,18 @@ class Go2Env:
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
             return
+
+        ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
+        ball_pos[:, 0] = gs_rand_float(0.5, 1.5, (len(envs_idx),), gs.device)
+        ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
+        ball_pos[:, 2] = gs_rand_float(0.0, 0.5, (len(envs_idx),), gs.device)
+        self.ball.set_pos(ball_pos, envs_idx=envs_idx)
+
+        ball_vel = torch.zeros(len(envs_idx), 3, device=gs.device)
+        ball_vel[:, 0] = gs_rand_float(-1.0, -0.5, (len(envs_idx),), gs.device)  # Flying towards robot
+        ball_vel[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
+        ball_vel[:, 2] = gs_rand_float(1.0, 2.0, (len(envs_idx),), gs.device)  # Flying upwards a bit
+        self.ball.set_dofs_velocity(ball_vel, dofs_idx_local=[0,1,2], envs_idx=envs_idx)
 
         # reset dofs
         self.dof_pos[envs_idx] = self.default_dof_pos
@@ -261,3 +283,20 @@ class Go2Env:
     def _reward_base_height(self):
         # Penalize base height away from target
         return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
+
+    def _reward_survive(self):
+        """
+        Gives a constant positive reward for every step the agent survives.
+        """
+        return torch.ones_like(self.rew_buf)
+
+    def _reward_termination(self):
+        """
+        Applies a large negative penalty for terminating due to reasons other than timeout
+        (e.g., falling over).
+        """
+        # The reset_buf is True for any termination.
+        # The extras["time_outs"] is True only for timeout terminations.
+        # We penalize terminations that are NOT timeouts.
+        failures = torch.logical_and(self.reset_buf, ~self.extras["time_outs"].bool())
+        return -failures.float()
