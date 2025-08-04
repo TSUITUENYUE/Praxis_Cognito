@@ -1,5 +1,3 @@
-import hydra
-from omegaconf import DictConfig
 import torch
 import torch.optim as optim
 from .dataset import TrajectoryDataset
@@ -11,6 +9,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import geoopt
 import math
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter  # Added for TensorBoard
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -49,7 +48,7 @@ def get_beta(epoch, total_epochs, recon_loss=None, kl_loss=None, strategy='cycli
 
 
 class Trainer:
-    def __init__(self, model, config: DictConfig):
+    def __init__(self, model, config):
         self.load_path = config.load_path
         self.save_path = config.save_path
         self.batch_size = config.batch_size
@@ -104,6 +103,9 @@ class Trainer:
         # ✅ Initialize GradScaler for AMP
         self.scaler = GradScaler()
 
+        # Initialize TensorBoard writer
+        self.writer = SummaryWriter(log_dir=os.path.join(self.save_path, 'runs'))
+
     def train(self):
         torch.set_float32_matmul_precision('high')
         self.vae.train()
@@ -157,8 +159,17 @@ class Trainer:
                 print(
                     f"Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
 
+                # Log to TensorBoard per batch
+                self.writer.add_scalar('Loss/total', loss.item(), global_step)
+                self.writer.add_scalar('Loss/recon', recon_loss.item(), global_step)
+                self.writer.add_scalar('Loss/kl', kl_loss.item(), global_step)
+                self.writer.add_scalar('Beta', beta, global_step)
+                self.writer.add_scalar('Learning Rate', self.scheduler.get_last_lr()[0], global_step)
+
             if (epoch + 1) % save_interval == 0 or (epoch + 1) == self.num_epochs:
                 if not os.path.exists(self.save_path): os.makedirs(self.save_path)
                 save_path = self.save_path + f"vae_checkpoint_epoch_{epoch + 1}.pth"
                 torch.save(self.vae.state_dict(), save_path)
                 print(f"Saved model checkpoint to {save_path}")
+
+        self.writer.close()  # Close TensorBoard writer at the end

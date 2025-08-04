@@ -62,12 +62,12 @@ class ImitationModule:
         orig_traj = orig_traj
         np.set_printoptions(threshold=np.inf)
 
-        print("loss:", abs(recon_traj - orig_traj).mean())
-        plt.figure(figsize=(10, 6))
-        plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
-        plt.title(f"loss")
-        plt.xlabel("Dimension 1")
-        plt.ylabel("Dimension 2")
+        print("loss:", ((recon_traj - orig_traj)**2).mean())
+        # plt.figure(figsize=(10, 6))
+        # plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
+        # plt.title(f"loss")
+        # plt.xlabel("Dimension 1")
+        # plt.ylabel("Dimension 2")
         # plt.show()
 
         # Dimensions: object_dim=3, agent positions=126 (42 links * 3D)
