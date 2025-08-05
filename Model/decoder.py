@@ -68,5 +68,6 @@ class Decoder(nn.Module):
         combined_traj_reshaped = combined_traj.view(batch_size, self.seq_len, num_link + 1, 3)
         combined_traj_norm = (combined_traj_reshaped - self.pos_mean) / self.pos_std
         combined_traj_norm = combined_traj_norm.view(batch_size, self.seq_len, -1)
-
-        return combined_traj_norm, joint_traj
+        graph_x = combined_traj_norm
+        graph_x = combined_traj
+        return graph_x, joint_traj

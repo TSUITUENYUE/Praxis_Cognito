@@ -108,6 +108,7 @@ class TrajectoryDataset(Dataset):
                 orig_traj = torch.cat([link_pos.reshape(bs_chunk, seq_len, position_dim), obj_pos.squeeze(2)], dim=2)
 
                 # Z-score Normalize
+                '''
                 graph_x_norm = (graph_x - pos_mean) / pos_std
 
                 orig_traj_reshaped = orig_traj.reshape(bs_chunk, seq_len, num_links + 1, 3)
@@ -116,6 +117,9 @@ class TrajectoryDataset(Dataset):
 
                 f_out['graph_x'][i:end] = graph_x_norm.cpu().numpy()
                 f_out['orig_traj'][i:end] = orig_traj_norm.cpu().numpy()
+                '''
+                f_out['graph_x'][i:end] = graph_x.cpu().numpy()
+                f_out['orig_traj'][i:end] = orig_traj.cpu().numpy()
 
         print("✅ Preprocessing complete.")
 

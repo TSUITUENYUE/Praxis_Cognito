@@ -49,6 +49,12 @@ class ImitationModule:
             processed_path="./Pretrain/data/go2/25000 500000 5 30/preprocess.h5",
             agent=self.agent
         )
+
+        dataset = TrajectoryDataset(
+            processed_path=self.config.processed_path,
+            source_path=demo,
+            agent=self.agent
+        )
         pos_mean = dataset.pos_mean
         pos_std = dataset.pos_std
 
@@ -69,13 +75,10 @@ class ImitationModule:
         orig_traj = orig_traj
         np.set_printoptions(threshold=np.inf)
         loss = ((recon_traj - orig_traj)**2).mean()
-        pos_std = torch.tensor([0.5, 0.6, 0.7])  # Example values
+        #pos_std = torch.tensor([0.5, 0.6, 0.7])  # Example values
 
-        # Unnormalized loss
-        variance = pos_std ** 2
-        mean_variance = variance.mean()
-        loss = loss * mean_variance.item()
-        print("loss:", loss)
+        print(loss)
+
 
         # plt.figure(figsize=(10, 6))
         # plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
@@ -137,7 +140,7 @@ class ImitationModule:
 
         plane = scene.add_entity(gs.morphs.Plane())
         # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True,))
+        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True,fixed=True))
         # Add demo robot (offset, red material for distinction if possible)
         #demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
 
