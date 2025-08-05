@@ -93,11 +93,14 @@ class TrajectoryDataset(Dataset):
             for i in tqdm(range(0, num_samples, chunk_size), desc="Normalizing and saving"):
                 end = min(i + chunk_size, num_samples)
                 joint_angles_chunk = torch.from_numpy(agent_trajs[i:end]).to(device)
+                torch.set_printoptions(threshold=np.inf)
+
                 obj_pos_chunk = torch.from_numpy(obj_trajs[i:end]).to(device)
                 bs_chunk = joint_angles_chunk.shape[0]
 
                 joint_angles_flat = joint_angles_chunk.reshape(bs_chunk * seq_len, n_dofs)
                 link_pos_flat = fk_model(joint_angles_flat)
+
                 link_pos = link_pos_flat.reshape(bs_chunk, seq_len, num_links, 3)
                 obj_pos = obj_pos_chunk.unsqueeze(2)
 

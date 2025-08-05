@@ -30,6 +30,7 @@ class ImitationModule:
         edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.device)
         loss = []
         cmd = []
+        self.vae.eval()
         for i, (graph_x, orig_traj) in enumerate(dataloader):
             output = self.vae(graph_x, edge_index)
             recon_traj = output[0]
@@ -45,15 +46,21 @@ class ImitationModule:
     def visualize_in_sim(self, demo, index=0):
         # Load one sample from the dataset
         dataset = TrajectoryDataset(
-            processed_path=self.config.processed_path,
-            source_path=demo,
+            processed_path="./Pretrain/data/go2/25000 500000 5 30/preprocess.h5",
             agent=self.agent
         )
+        pos_mean = dataset.pos_mean
+        pos_std = dataset.pos_std
+
+
+
         graph_x, orig_traj = dataset[index]
         graph_x = torch.tensor(graph_x, device=self.device)
-        graph_x = graph_x.unsqueeze(0)  # Add batch dimension
+        torch.set_printoptions(threshold=np.inf)
+        #print(graph_x)
+        graph_x = graph_x.unsqueeze(0)
         edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.device)
-
+        self.vae.eval()
         with torch.no_grad():
             recon_traj, joint_cmd, z, *_ = self.vae(graph_x, edge_index)
 
@@ -61,8 +68,15 @@ class ImitationModule:
         joint_cmd = joint_cmd.squeeze(0).cpu().numpy()
         orig_traj = orig_traj
         np.set_printoptions(threshold=np.inf)
+        loss = ((recon_traj - orig_traj)**2).mean()
+        pos_std = torch.tensor([0.5, 0.6, 0.7])  # Example values
 
-        print("loss:", ((recon_traj - orig_traj)**2).mean())
+        # Unnormalized loss
+        variance = pos_std ** 2
+        mean_variance = variance.mean()
+        loss = loss * mean_variance.item()
+        print("loss:", loss)
+
         # plt.figure(figsize=(10, 6))
         # plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
         # plt.title(f"loss")
@@ -123,7 +137,7 @@ class ImitationModule:
 
         plane = scene.add_entity(gs.morphs.Plane())
         # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True, fixed=True))
+        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True,))
         # Add demo robot (offset, red material for distinction if possible)
         #demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
 

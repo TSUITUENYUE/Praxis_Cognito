@@ -42,8 +42,8 @@ def main():
 
     gs.init()
 
-    log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"logs/{args.exp_name}/cfgs.pkl", "rb"))
+    log_dir = f"./Pretrain/primitives/{args.exp_name}"
+    env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"./Pretrain/primitives/{args.exp_name}/cfgs.pkl", "rb"))
     reward_cfg["reward_scales"] = {}
 
     env = Go2Env(
@@ -56,16 +56,24 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
-    resume_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
+    resume_path = os.path.join(log_dir, f"model.pt")
     runner.load(resume_path)
     policy = runner.get_inference_policy(device=gs.device)
 
     joint_names = [
-        'FL_hip_joint', 'FL_thigh_joint', 'FL_calf_joint',
-        'FR_hip_joint', 'FR_thigh_joint', 'FR_calf_joint',
-        'RL_hip_joint', 'RL_thigh_joint', 'RL_calf_joint',
-        'RR_hip_joint', 'RR_thigh_joint', 'RR_calf_joint'
-    ]
+            "FR_hip_joint",
+            "FR_thigh_joint",
+            "FR_calf_joint",
+            "FL_hip_joint",
+            "FL_thigh_joint",
+            "FL_calf_joint",
+            "RR_hip_joint",
+            "RR_thigh_joint",
+            "RR_calf_joint",
+            "RL_hip_joint",
+            "RL_thigh_joint",
+            "RL_calf_joint",
+        ]
     dof_indices = np.array([env.robot.get_joint(name).dof_idx_local for name in joint_names])
     n_dofs = len(dof_indices)
 
@@ -101,6 +109,8 @@ def main():
                     #obj_traj_buffer[t] = torch.tensor([0,0,0],device='cuda')
                     # Policy and Simulation Step
                     actions = policy(obs)
+                    print(f"Step {t}: Actions: {actions[0].cpu().numpy()}")  # Debug: Print actions to see if varying
+                    print(f"Step {t}: Obs summary: {obs[0].mean().item()}")  # Debug:
                     obs, rews, dones, infos = env.step(actions)
 
                 # --- BATCH PROCESSING AND SAVING ---

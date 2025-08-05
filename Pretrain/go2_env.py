@@ -182,8 +182,8 @@ class Go2Env:
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
                 self.dof_vel * self.obs_scales["dof_vel"],  # 12
                 self.actions,  # 12
-                relative_ball_pos,  # 3 <-- ADDED
-                relative_ball_vel  # 3 <-- ADDED
+                #relative_ball_pos,  # 3 <-- ADDED
+                #relative_ball_vel  # 3 <-- ADDED
             ],
             axis=-1,
         )
