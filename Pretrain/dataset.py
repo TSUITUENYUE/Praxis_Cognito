@@ -53,7 +53,7 @@ class TrajectoryDataset(Dataset):
         with h5py.File(source_path, 'r') as f_in:
             agent_trajs = f_in['agent_trajectories']
             obj_trajs = f_in['obj_trajectories']
-            num_samples, seq_len, _ = agent_trajs.shape
+            num_samples, seq_len, joint_dim = agent_trajs.shape
 
             sum_pos = torch.zeros(3, device=device)
             sum_sq = torch.zeros(3, device=device)
@@ -87,6 +87,7 @@ class TrajectoryDataset(Dataset):
 
             f_out.create_dataset('graph_x', (num_samples, seq_len, num_nodes, 3), dtype='f4')
             f_out.create_dataset('orig_traj', (num_samples, seq_len, position_dim + 3), dtype='f4')
+            f_out.create_dataset('joint_trajs', data=agent_trajs)
             f_out.create_dataset('pos_mean', data=pos_mean.cpu().numpy())
             f_out.create_dataset('pos_std', data=pos_std.cpu().numpy())
 
@@ -108,7 +109,7 @@ class TrajectoryDataset(Dataset):
                 orig_traj = torch.cat([link_pos.reshape(bs_chunk, seq_len, position_dim), obj_pos.squeeze(2)], dim=2)
 
                 # Z-score Normalize
-                '''
+
                 graph_x_norm = (graph_x - pos_mean) / pos_std
 
                 orig_traj_reshaped = orig_traj.reshape(bs_chunk, seq_len, num_links + 1, 3)
@@ -120,7 +121,8 @@ class TrajectoryDataset(Dataset):
                 '''
                 f_out['graph_x'][i:end] = graph_x.cpu().numpy()
                 f_out['orig_traj'][i:end] = orig_traj.cpu().numpy()
-
+                '''
+            #f_out['agent_trajs'] = agent_trajs
         print("✅ Preprocessing complete.")
 
     def __len__(self):
@@ -130,4 +132,4 @@ class TrajectoryDataset(Dataset):
         if self.mode == 'load':
             if self.h5_file is None:
                 self.h5_file = h5py.File(self.processed_path, 'r')
-            return self.h5_file['graph_x'][idx], self.h5_file['orig_traj'][idx]
+            return self.h5_file['graph_x'][idx], self.h5_file['orig_traj'][idx], self.h5_file['joint_trajs'][idx]

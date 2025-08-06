@@ -119,19 +119,20 @@ class Trainer:
         # ✅ Calculate total steps for correct annealing schedule
         total_steps = self.num_epochs * len(dataloader)
         for epoch in range(self.num_epochs):
-            for i, (graph_x, orig_traj) in enumerate(dataloader):
+            for i, (graph_x, orig_traj,teacher_joints) in enumerate(dataloader):
                 # ✅ Calculate a global step for the schedulers
                 global_step = epoch * len(dataloader) + i
 
                 graph_x = graph_x.to(self.device, non_blocking=True)
                 orig_traj = orig_traj.to(self.device, non_blocking=True)
+                teacher_joints = teacher_joints.to(self.device, non_blocking=True)
 
                 self.optimizer.zero_grad(set_to_none=True)
 
                 # ✅ Wrap forward pass in autocast for AMP
                 with autocast(enabled=True):
                     # --- Common operations ---
-                    outputs = self.vae(graph_x, self.edge_index)
+                    outputs = self.vae(graph_x, self.edge_index, teacher_joints)
                     recon_traj = outputs[0]
                     beta = get_beta(epoch=global_step, total_epochs=total_steps,
                                     strategy=self.strategy, warmup_epochs=self.warm_up,

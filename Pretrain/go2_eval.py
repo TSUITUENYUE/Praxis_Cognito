@@ -75,6 +75,7 @@ def main():
             "RL_calf_joint",
         ]
     dof_indices = np.array([env.robot.get_joint(name).dof_idx_local for name in joint_names])
+    print(dof_indices)
     n_dofs = len(dof_indices)
 
     # --- Main Continuous Simulation Loop ---
@@ -109,8 +110,6 @@ def main():
                     #obj_traj_buffer[t] = torch.tensor([0,0,0],device='cuda')
                     # Policy and Simulation Step
                     actions = policy(obs)
-                    print(f"Step {t}: Actions: {actions[0].cpu().numpy()}")  # Debug: Print actions to see if varying
-                    print(f"Step {t}: Obs summary: {obs[0].mean().item()}")  # Debug:
                     obs, rews, dones, infos = env.step(actions)
 
                 # --- BATCH PROCESSING AND SAVING ---
@@ -135,6 +134,7 @@ def main():
     print(f"Collected {total_episodes_saved} episodes across {NUM_ENVS} parallel environments.")
     print(f"Dataset saved to '{SAVE_FILENAME}'")
     print(f"Total WALL-CLOCK time taken: {duration:.2f} seconds.")
+
 
 
 if __name__ == "__main__":

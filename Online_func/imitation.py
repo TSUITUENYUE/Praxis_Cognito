@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 import genesis as gs
 import numpy as np
 from matplotlib import pyplot as plt
+import h5py
 
 class ImitationModule:
     def __init__(self, model, cfg: DictConfig):
@@ -49,17 +50,13 @@ class ImitationModule:
             processed_path="./Pretrain/data/go2/25000 500000 5 30/preprocess.h5",
             agent=self.agent
         )
-
+        '''
         dataset = TrajectoryDataset(
             processed_path=self.config.processed_path,
             source_path=demo,
             agent=self.agent
         )
-        pos_mean = dataset.pos_mean
-        pos_std = dataset.pos_std
-
-
-
+        '''
         graph_x, orig_traj = dataset[index]
         graph_x = torch.tensor(graph_x, device=self.device)
         torch.set_printoptions(threshold=np.inf)
@@ -104,7 +101,6 @@ class ImitationModule:
 
         orig_agent_pos = extract_ee_positions(orig_traj[:, :agent_dim], self.agent.end_effector)
         recon_agent_pos = extract_ee_positions(recon_traj[:, :agent_dim], self.agent.end_effector)
-
         # URDF path from config
         urdf_path = self.agent.urdf
         num_legs = 4
@@ -140,7 +136,7 @@ class ImitationModule:
 
         plane = scene.add_entity(gs.morphs.Plane())
         # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True,fixed=True))
+        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True,fixed=False))
         # Add demo robot (offset, red material for distinction if possible)
         #demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
 
@@ -162,10 +158,13 @@ class ImitationModule:
 
         scene.build()
         imit_robot.set_pos(np.array([0.0, 0.0, 0.42]))
+        imit_robot.set_quat(fixed_quat)
         #demo_robot.set_pos(np.array([0.0, 5.0, 0.42]))  # Offset to side
 
         joint_names = self.agent.joint_name
         dof_indices = np.array([imit_robot.get_joint(name).dof_idx_local for name in joint_names])
+        #dof_indices = np.array([7,11,15,6,10,14,9,13,17,8,12,16])
+
         print(dof_indices)
         n_dofs = len(dof_indices)
         # print(dof_indices)
@@ -187,14 +186,19 @@ class ImitationModule:
         '''
         # Imitation joints from model (12 DOFs)
         imit_joints = joint_cmd  # [seq_len, 12]
+        #print(imit_joints)
+        #print(joint_names)
         #print(joint_cmd)
         # Simulation loop to animate both robots and objects
 
         # print(recon_agent_pos)
         # print(orig_agent_pos)
 
-        cam.start_recording()
+        #with h5py.File(demo, 'r') as f_read:
+        #    torch.set_printoptions(threshold=np.inf)
+        #    recon_agent_pos = f_read['agent_trajectories'][:]
 
+        cam.start_recording()
         slow_factor = 1
         repeat_times = 3  # Repeat the sequence 3 times
         for ii in range(seq_len * slow_factor * repeat_times):
@@ -203,7 +207,8 @@ class ImitationModule:
             # Control imitation robot with joint_cmd and move object
             #imit_robot.control_dofs_position(imit_joints[t], dofs_idx)
             # In your visualization loop
-            imit_robot.set_dofs_position(imit_joints[t], dofs_idx_local=dof_indices, zero_velocity=True)
+            #mit_robot.set_dofs_position(recon_agent_pos[0][t], dofs_idx_local=dof_indices,)
+            imit_robot.control_dofs_position(imit_joints[t], dofs_idx_local=dof_indices, )
             # imit_object.set_pos(recon_object_pos[t])
 
             # Control demo robot with IK joints and move object (offset)

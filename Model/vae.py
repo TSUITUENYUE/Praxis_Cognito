@@ -106,23 +106,23 @@ class IntentionVAE(nn.Module):
         # adjusted for the change in volume (the jacobian).
         return log_prob_normal - log_det_jacob.squeeze(-1)
 
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index, teacher_joint):
         if self.prior == "GMM":
             mu, logvar, pi_logits = self.encoder(x, edge_index)
             z = self.reparameterize_gmm(mu, logvar, pi_logits)
-            recon_traj, joint_cmd = self.decoder(z)
+            recon_traj, joint_cmd = self.decoder(z, teacher_joints=teacher_joint)
             return recon_traj, joint_cmd, z, mu, logvar, pi_logits
         elif self.prior == "Hyperbolic":
             mu, logvar = self.encoder(x, edge_index)
             std = F.softplus(logvar)  # Use softplus for stability
             var = std ** 2
             z = self.manifold.wrapped_normal(*mu.shape, mean=mu, std=std)
-            recon_traj, joint_cmd = self.decoder(z)
+            recon_traj, joint_cmd = self.decoder(z, teacher_joints=teacher_joint)
             return recon_traj, joint_cmd, z, mu, var
         elif self.prior == "Gaussian":
             mu, logvar = self.encoder(x, edge_index)
             z = self.reparameterize_gaussian(mu, logvar)
-            recon_traj, joint_cmd = self.decoder(z)
+            recon_traj, joint_cmd = self.decoder(z, teacher_joints=teacher_joint)
             return recon_traj, joint_cmd, z, mu, logvar
         else:
             raise ValueError(f"Unsupported prior in forward: {self.prior}")

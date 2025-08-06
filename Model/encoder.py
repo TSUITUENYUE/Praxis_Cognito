@@ -117,6 +117,10 @@ class VanillaEncoder(nn.Module):
         self.rnn = nn.LSTM(hidden_features, rnn_hidden, batch_first=True, bidirectional=True)
         self.fc_mu = nn.Linear(rnn_hidden * 2, latent_dim)
         self.fc_logvar = nn.Linear(rnn_hidden * 2, latent_dim)
+        torch.nn.init.zeros_(self.fc_mu.weight)
+        torch.nn.init.zeros_(self.fc_mu.bias)
+        torch.nn.init.zeros_(self.fc_logvar.weight)
+        torch.nn.init.zeros_(self.fc_logvar.bias)
 
     def forward(self, x, edge_index):
         # Original shape: [bs, seq_len, num_nodes, features]
