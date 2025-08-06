@@ -201,7 +201,9 @@ class ImitationModule:
             t = (ii // slow_factor) % seq_len
 
             # Control imitation robot with joint_cmd and move object
-            imit_robot.control_dofs_position(imit_joints[t], dofs_idx)
+            #imit_robot.control_dofs_position(imit_joints[t], dofs_idx)
+            # In your visualization loop
+            imit_robot.set_dofs_position(imit_joints[t], dofs_idx_local=dof_indices, zero_velocity=True)
             # imit_object.set_pos(recon_object_pos[t])
 
             # Control demo robot with IK joints and move object (offset)
