@@ -115,6 +115,7 @@ class Trainer:
                                 batch_size=self.batch_size,
                                 num_workers=2,
                                 shuffle=True,
+                                persistent_workers=True,
                                 drop_last=True)
 
         # ✅ Calculate total steps for correct annealing schedule
