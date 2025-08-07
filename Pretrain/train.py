@@ -113,9 +113,8 @@ class Trainer:
         save_interval = max(1, self.num_epochs // 4)
         dataloader = DataLoader(self.dataset,
                                 batch_size=self.batch_size,
-                                num_workers=2,
+                                num_workers=0,
                                 shuffle=True,
-                                persistent_workers=True,
                                 drop_last=True)
 
         # ✅ Calculate total steps for correct annealing schedule
