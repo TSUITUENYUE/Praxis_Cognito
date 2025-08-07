@@ -68,16 +68,16 @@ model:
 
 trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
-  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
+  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess_unnorm.h5'
   batch_size: 128
   device: 'cuda'
   num_epochs: 16
   optimizer:
-    lr: 0.0001
+    lr: 0.001
   beta_anneal:
     strategy: "warmup"
     warm_up: 16000
-    max_beta: 0.1
+    max_beta: 0.0
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
 

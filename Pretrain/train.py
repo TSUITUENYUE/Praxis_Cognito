@@ -5,7 +5,7 @@ from .utils import *
 import sys
 import os
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 import geoopt
 import math
 from torch.cuda.amp import GradScaler, autocast
@@ -52,7 +52,7 @@ class Trainer:
         self.load_path = config.load_path
         self.save_path = config.save_path
         self.batch_size = config.batch_size
-        self.grad_clip_value = 1.0  # ✅ Added for stable training with AMP
+        self.grad_clip_value = 1.0
 
         filename = os.path.basename(self.load_path)
         parts = filename.rstrip('.h5').strip().split()
@@ -87,13 +87,14 @@ class Trainer:
         self.end_effector_indices = self.agent.end_effector
         self.edge_index = build_edge_index(self.fk_model, self.end_effector_indices, self.device)
 
-        self.optimizer = optim.Adam(self.vae.parameters(), lr=config.optimizer.lr, fused=True)
+        self.optimizer = optim.AdamW(self.vae.parameters(), lr=config.optimizer.lr, weight_decay=1e-5, fused=True)
         if self.vae_prior == "Hyperbolic":
             self.optimizer = geoopt.optim.RiemannianAdam(self.vae.parameters(),
                                                          lr=config.optimizer.lr)  # Fused not available
 
         num_total_steps = self.num_epochs * (self.episodes // self.batch_size)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_total_steps)
+        #self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5, threshold=1e-4, min_lr=1e-7)
         self.dataset = TrajectoryDataset(processed_path=config.processed_path, source_path=self.load_path,
                                          agent=self.agent)
 
@@ -112,7 +113,7 @@ class Trainer:
         save_interval = max(1, self.num_epochs // 4)
         dataloader = DataLoader(self.dataset,
                                 batch_size=self.batch_size,
-                                num_workers=4,
+                                num_workers=2,
                                 shuffle=True,
                                 drop_last=True)
 

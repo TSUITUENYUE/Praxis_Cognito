@@ -36,7 +36,7 @@ class Decoder(nn.Module):
 
         self.start_token = nn.Parameter(torch.zeros(1, 1, self.joint_dim))
 
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = 'cuda'
         joint_limits_lower = torch.tensor(self.agent.joint_limits_lower, device=device, dtype=torch.float32)
         joint_limits_upper = torch.tensor(self.agent.joint_limits_upper, device=device, dtype=torch.float32)
 
@@ -96,5 +96,5 @@ class Decoder(nn.Module):
         combined_traj_reshaped = combined_traj.view(batch_size, self.seq_len, num_link + 1, 3)
         combined_traj_norm = (combined_traj_reshaped - self.pos_mean) / self.pos_std
         graph_x = combined_traj_norm.view(batch_size, self.seq_len, -1)
-
+        graph_x = combined_traj
         return graph_x, joint_traj
