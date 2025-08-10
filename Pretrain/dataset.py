@@ -115,13 +115,13 @@ class TrajectoryDataset(Dataset):
                 orig_traj_reshaped = orig_traj.reshape(bs_chunk, seq_len, num_links + 1, 3)
                 orig_traj_norm_reshaped = (orig_traj_reshaped - pos_mean) / pos_std
                 orig_traj_norm = orig_traj_norm_reshaped.reshape(bs_chunk, seq_len, position_dim + 3)
-                '''
+
                 f_out['graph_x'][i:end] = graph_x_norm.cpu().numpy()
                 f_out['orig_traj'][i:end] = orig_traj_norm.cpu().numpy()
                 '''
                 f_out['graph_x'][i:end] = graph_x.cpu().numpy()
                 f_out['orig_traj'][i:end] = orig_traj.cpu().numpy()
-
+                '''
             #f_out['agent_trajs'] = agent_trajs
         print("✅ Preprocessing complete.")
 

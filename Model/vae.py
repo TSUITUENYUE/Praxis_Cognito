@@ -5,6 +5,9 @@ from .encoder import GMMEncoder, PoincareEncoder, VanillaEncoder
 from .decoder import Decoder
 import geoopt
 from torch.distributions import MultivariateNormal
+import math
+
+
 
 
 class IntentionVAE(nn.Module):
@@ -17,8 +20,8 @@ class IntentionVAE(nn.Module):
         self.object_dim = agent.object_dim
         self.joint_dim = agent.n_dofs
         self.urdf = agent.urdf
-        self.pos_mean = torch.zeros(3,device='cuda')
-        self.pos_std = torch.ones(3,device='cuda')
+        self.register_buffer("pos_mean", torch.zeros(3))
+        self.register_buffer("pos_std", torch.ones(3))
 
         # Initialize encoder based on prior
         if self.prior == "GMM":
@@ -42,6 +45,13 @@ class IntentionVAE(nn.Module):
             raise ValueError(f"Unsupported prior: {prior}. Choose from 'GMM', 'Hyperbolic', or 'Gaussian'.")
 
         self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim, self.agent, hidden_dim, self.pos_mean, self.pos_std)
+
+    def hetero_nll(self, x, mu, log_sigma):
+        # x, mu, log_sigma: [B,T,D] in the SAME (normalized) space
+        inv_sigma = torch.exp(-log_sigma)
+        sq = 0.5 * ((x - mu) * inv_sigma) ** 2
+        nll = sq + log_sigma + 0.5 * math.log(2 * math.pi)
+        return nll.mean()
 
     def reparameterize_gmm(self, mu, logvar, pi_logits):
         # Get component probabilities
@@ -110,55 +120,52 @@ class IntentionVAE(nn.Module):
         if self.prior == "GMM":
             mu, logvar, pi_logits = self.encoder(x, edge_index)
             z = self.reparameterize_gmm(mu, logvar, pi_logits)
-            recon_traj, joint_cmd = self.decoder(z, teacher_joints=teacher_joint)
-            return recon_traj, joint_cmd, z, mu, logvar, pi_logits
+            recon_mu, joint_cmd, log_sigma = self.decoder(z, teacher_joints=teacher_joint)
+            return recon_mu, joint_cmd, log_sigma, z, mu, logvar, pi_logits
         elif self.prior == "Hyperbolic":
             mu, logvar = self.encoder(x, edge_index)
-            std = F.softplus(logvar)  # Use softplus for stability
+            std = F.softplus(logvar);
             var = std ** 2
             z = self.manifold.wrapped_normal(*mu.shape, mean=mu, std=std)
-            recon_traj, joint_cmd = self.decoder(z, teacher_joints=teacher_joint)
-            return recon_traj, joint_cmd, z, mu, var
+            recon_mu, joint_cmd, log_sigma = self.decoder(z, teacher_joints=teacher_joint)
+            return recon_mu, joint_cmd, log_sigma, z, mu, var
         elif self.prior == "Gaussian":
             mu, logvar = self.encoder(x, edge_index)
             z = self.reparameterize_gaussian(mu, logvar)
-            recon_traj, joint_cmd = self.decoder(z, teacher_joints=teacher_joint)
-            return recon_traj, joint_cmd, z, mu, logvar
-        else:
-            raise ValueError(f"Unsupported prior in forward: {self.prior}")
+            recon_mu, joint_cmd, log_sigma = self.decoder(z, teacher_joints=teacher_joint)
+            return recon_mu, joint_cmd, log_sigma, z, mu, logvar
 
-    def loss(self, recon_traj, orig_traj, *args, beta):
-        # Common reconstruction loss
-        recon_loss_pos = F.mse_loss(recon_traj, orig_traj, reduction='mean')
-        recon_vel = recon_traj[:, 1:] - recon_traj[:, :-1]
-        orig_vel = orig_traj[:, 1:] - orig_traj[:, :-1]
-        recon_loss_vel = F.mse_loss(recon_vel, orig_vel)
-        total_recon_loss = recon_loss_pos + 0.1 * recon_loss_vel
+    def loss(self, recon_mu, log_sigma, orig_traj, *args, beta):
+        # recon_mu, orig_traj are normalized positions [B,T,D]
+        nll_pos = self.hetero_nll(orig_traj, recon_mu, log_sigma)
+        recon_loss = F.mse_loss(recon_mu, orig_traj)
+        # velocity & (optional) acceleration penalties on the mean only
+        vel_pred = recon_mu[:, 1:] - recon_mu[:, :-1]
+        vel_tgt = orig_traj[:, 1:] - orig_traj[:, :-1]
+        loss_vel = F.mse_loss(vel_pred, vel_tgt)
 
+        # (optional) acceleration
+        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
+        acc_tgt  = vel_tgt[:, 1:] - vel_tgt[:, :-1]
+        loss_acc = F.mse_loss(acc_pred, acc_tgt)
+
+        total_recon = (1.0 * recon_loss) + (0.1 * loss_vel) + (0.01 * loss_acc)
+
+        # ---- KL based on prior type (unchanged) ----
         if self.prior == "GMM":
             mu, logvar, pi_logits = args
             bs = mu.shape[0]
-            pi = F.softmax(pi_logits, dim=-1)  # q(c|x)
-
-            # Expand prior to batch size for calculations
+            pi = F.softmax(pi_logits, dim=-1)
             prior_mu_exp = self.prior_mu.unsqueeze(0).expand(bs, -1, -1)
             prior_logvar_exp = self.prior_logvar.unsqueeze(0).expand(bs, -1, -1)
-
-            # 1. KL divergence between Gaussians: KL(q(z|x,c) || p(z|c))
-            # This has shape [bs, k]
             kl_gaussians = 0.5 * torch.sum(
                 prior_logvar_exp - logvar - 1 +
                 (logvar - prior_logvar_exp).exp() +
                 (mu - prior_mu_exp).pow(2) / prior_logvar_exp.exp(),
                 dim=-1
             )
-
-            # 2. KL divergence between Categorical distributions: KL(q(c|x) || p(c))
-            # This has shape [bs]
             kl_categorical = torch.sum(pi * (torch.log(pi + 1e-10) - torch.log(self.prior_pi + 1e-10)), dim=-1)
-            # Combine them: E_{q(c|x)} [ KL(q(z|x,c) || p(z|c)) ] + KL(q(c|x) || p(c))
             kl_loss = torch.sum(pi * kl_gaussians, dim=-1) + kl_categorical
-            # Average over the batch
             kl_loss = kl_loss.mean()
         elif self.prior == "Hyperbolic":
             z, mu, var = args
@@ -166,12 +173,11 @@ class IntentionVAE(nn.Module):
             log_pz = self.log_prob(z, self.prior_mean, self.prior_var)
             kl_loss = (log_qz - log_pz).mean()
         elif self.prior == "Gaussian":
-            mu, logvar = args
+            z, mu, logvar = args
             kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
             kl_loss = kl_per_sample.mean()
         else:
             raise ValueError(f"Unsupported prior in loss: {self.prior}")
 
-        # Total VAE loss
-        vae_loss = total_recon_loss + beta * kl_loss
-        return vae_loss, total_recon_loss, kl_loss
+        vae_loss = total_recon + beta * kl_loss
+        return vae_loss, total_recon, kl_loss

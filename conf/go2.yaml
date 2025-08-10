@@ -35,7 +35,7 @@ dataset:
   num_envs: 25000
   #num_envs: 32768
   episodes: 500000
-  max_episode_seconds: 5
+  max_episode_seconds: 2
   frame_rate: 30
 
   log_dir: "./Pretrain/primitives/go2-walking"
@@ -60,7 +60,7 @@ model:
     hidden_features: 128
     num_layers: 2
     rnn_hidden: 128
-    latent_dim: 32
+    latent_dim: 64
     seq_len: ${mul:${dataset.max_episode_seconds},${dataset.frame_rate}}
     hidden_dim: 128
   res_rl: {}
@@ -68,10 +68,10 @@ model:
 
 trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
-  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess_unnorm.h5'
-  batch_size: 128
+  processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
+  batch_size: 256
   device: 'cuda'
-  num_epochs: 16
+  num_epochs: 4
   optimizer:
     lr: 0.001
   beta_anneal:

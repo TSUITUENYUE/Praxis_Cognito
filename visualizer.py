@@ -54,11 +54,11 @@ class Visualizer:
         edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.config.trainer.device)
 
         with torch.inference_mode():
-            for (x, traj) in dataloader:
+            for (x, traj,_) in dataloader:
                 x = x.to(self.config.trainer.device)
                 edge_index = edge_index.to(self.config.trainer.device)
 
-                recon_traj, joint_cmd, z, *encoder_outputs = self.model(x, edge_index)
+                recon_traj, joint_cmd, z, *encoder_outputs = self.model(x, edge_index,_)
 
                 latents.append(z.cpu().numpy())
                 originals_x.append(x.cpu().numpy().reshape(x.shape[0], -1))

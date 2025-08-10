@@ -1,119 +1,186 @@
+import math
 import torch
 import torch.nn.functional as F
+from typing import Optional, Tuple, List
 from omegaconf import DictConfig
 from codebook import Codebook
 from Pretrain.dataset import TrajectoryDataset
-from Pretrain.utils import *
+from Pretrain.utils import build_edge_index
 from torch.utils.data import DataLoader
 import genesis as gs
 import numpy as np
-from matplotlib import pyplot as plt
-import h5py
+
 
 class ImitationModule:
     def __init__(self, model, cfg: DictConfig):
         self.vae = model
         self.agent = self.vae.agent
         self.config = cfg
-        self.device = 'cuda'
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.vae.to(self.device).eval()
 
+    # ---------- helpers ----------
+    @staticmethod
+    def _denorm_positions(traj_norm: np.ndarray,
+                          pos_mean: np.ndarray,
+                          pos_std: np.ndarray) -> np.ndarray:
+        """
+        Denormalize a flattened [T, (num_links+1)*3] trajectory (agent links + object).
+        """
+        T, D = traj_norm.shape
+        num_nodes = D // 3  # (num_links + 1)
+        x = traj_norm.reshape(T, num_nodes, 3)
+        x = x * pos_std[None, None, :] + pos_mean[None, None, :]
+        return x.reshape(T, D)
 
-    def imitate(self, demo, *codebook: Codebook):
+    @staticmethod
+    def _extract_indices_for_robot(urdf_robot, joint_names: List[str]) -> np.ndarray:
+        return np.array([urdf_robot.get_joint(name).dof_idx_local for name in joint_names], dtype=np.int32)
+
+    @staticmethod
+    def _extract_ee_positions(flat_agent_pos: np.ndarray, ee_indices: List[int]) -> np.ndarray:
+        """
+        flat_agent_pos: [T, num_links*3] (denormalized)
+        returns EE positions concatenated: [T, len(ee_indices)*3]
+        """
+        T, D = flat_agent_pos.shape
+        num_links = D // 3
+        out = np.zeros((T, len(ee_indices) * 3), dtype=np.float32)
+        for j, idx in enumerate(ee_indices):
+            start = idx * 3
+            out[:, j * 3:(j + 1) * 3] = flat_agent_pos[:, start:start + 3]
+        return out
+
+    def _unpack_forward(self, out_tuple):
+        """
+        Support both forward signatures:
+        - (recon_mu, joint_cmd, z, ...)
+        - (recon_mu, joint_cmd, log_sigma, z, ...)
+        Returns: recon_mu, joint_cmd, z (z may be None if not present)
+        """
+        recon_mu = out_tuple[0]
+        joint_cmd = out_tuple[1]
+        z = None
+        # try to find a latent tensor by last-dim match
+        for t in out_tuple[2:]:
+            if torch.is_tensor(t) and t.dim() >= 2 and t.shape[-1] == getattr(self.vae, "latent_dim", t.shape[-1]):
+                z = t
+                break
+        return recon_mu, joint_cmd, z
+
+    # ---------- main APIs ----------
+    def imitate(self, demo_h5_path: str, codebook: Optional[Codebook] = None):
+        """
+        Run imitation on a dataset built from `demo_h5_path`.
+        Returns: (loss_list, joint_cmd_list) where losses are floats and joint_cmd_list is a list of tensors [B,T,DoF].
+        """
         dataset = TrajectoryDataset(
             processed_path=self.config.processed_path,
-            source_path=demo,
-            agent=self.agent)
-
-        dataloader = DataLoader(dataset,
-                                batch_size=self.config.batch_size,
-                                num_workers=4)
-
-        edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.device)
-        loss = []
-        cmd = []
-        self.vae.eval()
-        for i, (graph_x, orig_traj) in enumerate(dataloader):
-            output = self.vae(graph_x, edge_index)
-            recon_traj = output[0]
-            joint_cmd = output[1]
-            z = output[2]
-            codebook.update(z)
-            recon_loss = F.mse_loss(recon_traj, orig_traj)
-            loss.append(recon_loss)
-            cmd.append(joint_cmd)
-
-        return loss, cmd
-
-    def visualize_in_sim(self, demo, index=0):
-        # Load one sample from the dataset
-        dataset = TrajectoryDataset(
-            processed_path="./Pretrain/data/go2/25000 500000 5 30/preprocess.h5",
+            source_path=demo_h5_path,
             agent=self.agent
         )
-        '''
-        dataset = TrajectoryDataset(
-            processed_path=self.config.processed_path,
-            source_path=demo,
-            agent=self.agent
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
         )
-        '''
-        graph_x, orig_traj = dataset[index]
-        graph_x = torch.tensor(graph_x, device=self.device)
-        torch.set_printoptions(threshold=np.inf)
-        #print(graph_x)
-        graph_x = graph_x.unsqueeze(0)
+
         edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.device)
+
+        losses: List[float] = []
+        cmds: List[torch.Tensor] = []
+
         self.vae.eval()
         with torch.no_grad():
-            recon_traj, joint_cmd, z, *_ = self.vae(graph_x, edge_index)
+            for graph_x, orig_traj in loader:
+                graph_x = graph_x.to(self.device, non_blocking=True)
+                orig_traj = orig_traj.to(self.device, non_blocking=True)
 
-        recon_traj = recon_traj.squeeze(0).cpu().numpy()
-        joint_cmd = joint_cmd.squeeze(0).cpu().numpy()
-        orig_traj = orig_traj
-        np.set_printoptions(threshold=np.inf)
-        loss = ((recon_traj - orig_traj)**2).mean()
-        #pos_std = torch.tensor([0.5, 0.6, 0.7])  # Example values
+                out = self.vae(graph_x, edge_index, teacher_joint=None)
+                recon_mu, joint_cmd, z = self._unpack_forward(out)
 
-        print(loss)
+                # recon_mu and orig_traj are in normalized position space
+                recon_loss = F.mse_loss(recon_mu, orig_traj, reduction="mean").item()
+                losses.append(recon_loss)
+                cmds.append(joint_cmd.detach().cpu())
+
+                if codebook is not None and z is not None:
+                    codebook.update(z.detach().cpu())
+
+        return losses, cmds
+
+    def visualize_in_sim(self, demo, index: int = 0, save_path: str = "animation.mp4"):
+        """
+        Visualize the model rollout in Genesis for one sample from the processed dataset.
+        Uses the model's joint_cmd to drive the robot; denormalizes positions for optional debugging/plots.
+        """
+        dataset = TrajectoryDataset(
+            processed_path="./Pretrain/data/go2/25000 500000 2 30/preprocess.h5",
+            agent=self.agent
+        )
+        '''
+        dataset = TrajectoryDataset(
+            processed_path=self.config.processed_path,
+            source_path=demo,
+            agent=self.agent
+        )
+        '''
+
+        # get one sample
+        graph_x_np, orig_traj_np, _ = dataset[index]  # both normalized
+        pos_mean = dataset.pos_mean.cpu().numpy()  # [3]
+        pos_std = dataset.pos_std.cpu().numpy()    # [3]
+        print(pos_mean, pos_std)
+        # torch tensors
+        graph_x = torch.tensor(graph_x_np, device=self.device).unsqueeze(0)  # [1,T,D]
+        edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.device)
+
+        self.vae.eval()
+        with torch.no_grad():
+            out = self.vae(graph_x, edge_index, teacher_joint=None)
+            # adapt to your forward signature
+            recon_mu, joint_cmd, log_sigma = out[0], out[1], out[2]  # if you return log_sigma
+            sigma = torch.exp(log_sigma)
+            r = (torch.tensor(orig_traj_np, device=sigma.device) - recon_mu) / sigma
+
+            print("NLL (mean):", (0.5 * ((r) ** 2) + torch.log(sigma) + 0.5 * np.log(2 * np.pi)).mean().item())
+            print("E[r^2] (want ≈ 1):", r.pow(2).mean().item())
+            print("sigma min/median/mean/max:",
+                  sigma.min().item(), sigma.median().item(), sigma.mean().item(), sigma.max().item())
+            frac_at_floor = (sigma <= (self.vae.decoder.sigma_min + 1e-8)).float().mean().item()
+            print("fraction at floor:", frac_at_floor)
 
 
-        # plt.figure(figsize=(10, 6))
-        # plt.plot(abs(recon_traj - orig_traj).mean(axis=1))
-        # plt.title(f"loss")
-        # plt.xlabel("Dimension 1")
-        # plt.ylabel("Dimension 2")
-        # plt.show()
+        # to numpy
+        recon_mu_np = recon_mu.squeeze(0).cpu().numpy()  # normalized [T, pos_dim]
+        joint_cmd_np = joint_cmd.squeeze(0).cpu().numpy()  # [T, DoF]
+        orig_traj_np = np.asarray(orig_traj_np)  # normalized [T, pos_dim]
 
-        # Dimensions: object_dim=3, agent positions=126 (42 links * 3D)
-        agent_dim = 126
-        object_dim = 3
-        orig_object_pos = orig_traj[:, agent_dim:]
-        recon_object_pos = recon_traj[:, agent_dim:]
-        seq_len = orig_traj.shape[0]
+        # ---------- denormalize (for any inspection you want) ----------
+        recon_pos_world = self._denorm_positions(recon_mu_np, pos_mean, pos_std)  # [T, pos_dim] in meters
+        orig_pos_world  = self._denorm_positions(orig_traj_np, pos_mean, pos_std)
 
-        def extract_ee_positions(traj, ee_indices):
-            seq_len, _ = traj.shape
-            ee_pos = np.zeros((seq_len, len(ee_indices) * 3))
-            for j, idx in enumerate(ee_indices):
-                start = idx * 3
-                ee_pos[:, j * 3: (j * 3) + 3] = traj[:, start: start + 3]
-            return ee_pos
 
-        orig_agent_pos = extract_ee_positions(orig_traj[:, :agent_dim], self.agent.end_effector)
-        recon_agent_pos = extract_ee_positions(recon_traj[:, :agent_dim], self.agent.end_effector)
-        # URDF path from config
-        urdf_path = self.agent.urdf
-        num_legs = 4
-        pos_per_leg = 3
-        dofs_idx = np.arange(self.agent.n_dofs)  # 0 to 11 for 12 DOFs
+        # optional FK-space MSE in world units (sanity/debug)
+        mse_world = ((recon_pos_world - orig_pos_world) ** 2).mean()
+        print(f"FK-space MSE (world units): {mse_world:.6f}")
 
-        # Fixed quaternion for each foot (identity; adjust if needed for foot orientation)
-        fixed_quat = np.array([1.0, 0.0, 0.0, 0.0])  # w,x,y,z
+        # Split agent vs object (if needed for plotting)
+        pos_dim = recon_pos_world.shape[-1]
+        num_nodes = pos_dim // 3
+        num_links = num_nodes - 1
+        agent_dim = num_links * 3
+        # object_pos_world = recon_pos_world[:, agent_dim:]  # if you want to render an object
 
-        # Initialize scene
-        gs.init(theme="light", logging_level='warning')
+        # Extract EE positions (denormed) if you want to compare
+        # ee_recon = self._extract_ee_positions(recon_pos_world[:, :agent_dim], self.agent.end_effector)
+        # ee_orig  = self._extract_ee_positions(orig_pos_world[:, :agent_dim],  self.agent.end_effector)
 
-        NUM_ENVS = 1
+        # ---------- Genesis visualization (driven by joint_cmd) ----------
+        gs.init(theme="light", logging_level="warning")
         scene = gs.Scene(
             show_viewer=True,
             viewer_options=gs.options.ViewerOptions(
@@ -121,32 +188,19 @@ class ImitationModule:
                 camera_pos=(0.0, 3.5, 2.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=40,
-                max_FPS=60,
+                max_FPS=30,
             ),
             vis_options=gs.options.VisOptions(
                 show_world_frame=True,
                 world_frame_size=1.0,
-                show_link_frame=False,
-                show_cameras=False,
                 plane_reflection=True,
                 ambient_light=(0.1, 0.1, 0.1),
             ),
             renderer=gs.renderers.Rasterizer(),
         )
 
-        plane = scene.add_entity(gs.morphs.Plane())
-        # Add imitation robot (blue material or default)
-        imit_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True,fixed=False))
-        # Add demo robot (offset, red material for distinction if possible)
-        #demo_robot = scene.add_entity(gs.morphs.URDF(file=urdf_path, collision=True))
-
-        # Get end-effector links (calf links)
-        #ee_indices = self.agent.end_effector
-        #print(demo_robot.links)
-        #ee_links = [demo_robot.links[idx] for idx in ee_indices]  # List of RigidLink objects
-        # Add objects as spheres
-        #imit_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
-        #demo_object = scene.add_entity(gs.morphs.Sphere(radius=0.05))
+        _ = scene.add_entity(gs.morphs.Plane())
+        robot = scene.add_entity(gs.morphs.URDF(file=self.agent.urdf, collision=True, fixed=False))
 
         cam = scene.add_camera(
             res=(1280, 960),
@@ -157,65 +211,22 @@ class ImitationModule:
         )
 
         scene.build()
-        imit_robot.set_pos(np.array([0.0, 0.0, 0.42]))
-        imit_robot.set_quat(fixed_quat)
-        #demo_robot.set_pos(np.array([0.0, 5.0, 0.42]))  # Offset to side
+        robot.set_pos(np.array([0.0, 0.0, 0.42]))
+        robot.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))  # identity quaternion
 
-        joint_names = self.agent.joint_name
-        dof_indices = np.array([imit_robot.get_joint(name).dof_idx_local for name in joint_names])
-        #dof_indices = np.array([7,11,15,6,10,14,9,13,17,8,12,16])
+        # map joint names to local dof indices in Genesis
+        dof_indices = self._extract_indices_for_robot(robot, self.agent.joint_name)
 
-        print(dof_indices)
-        n_dofs = len(dof_indices)
-        # print(dof_indices)
-        #imit_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
-        #demo_robot.set_dofs_position(self.agent.init_angles, dofs_idx_local=dof_indices)
-        # Precompute demo joints using multi-link IK
-        '''
-        demo_joints = []
-        for t in range(seq_len):
-            agent_pos_t = orig_agent_pos[t]
-            leg_poses = np.split(agent_pos_t, num_legs)
-            p = demo_robot.inverse_kinematics_multilink(
-                links=ee_links,
-                poss=leg_poses,
-                quats=[fixed_quat] * num_legs
-            )
-            demo_joints.append(p[7:].cpu().numpy())
-        demo_joints = np.array(demo_joints)
-        '''
-        # Imitation joints from model (12 DOFs)
-        imit_joints = joint_cmd  # [seq_len, 12]
-        #print(imit_joints)
-        #print(joint_names)
-        #print(joint_cmd)
-        # Simulation loop to animate both robots and objects
-
-        # print(recon_agent_pos)
-        # print(orig_agent_pos)
-
-        #with h5py.File(demo, 'r') as f_read:
-        #    torch.set_printoptions(threshold=np.inf)
-        #    recon_agent_pos = f_read['agent_trajectories'][:]
-
+        seq_len = joint_cmd_np.shape[0]
         cam.start_recording()
         slow_factor = 1
-        repeat_times = 3  # Repeat the sequence 3 times
-        for ii in range(seq_len * slow_factor * repeat_times):
-            t = (ii // slow_factor) % seq_len
+        repeat_times = 10  # keep 1 by default; increase if you want to loop the clip
 
-            # Control imitation robot with joint_cmd and move object
-            #imit_robot.control_dofs_position(imit_joints[t], dofs_idx)
-            # In your visualization loop
-            #mit_robot.set_dofs_position(recon_agent_pos[0][t], dofs_idx_local=dof_indices,)
-            imit_robot.control_dofs_position(imit_joints[t], dofs_idx_local=dof_indices, )
-            # imit_object.set_pos(recon_object_pos[t])
-
-            # Control demo robot with IK joints and move object (offset)
-            # demo_robot.control_dofs_position(demo_joints[t], dofs_idx)
-            # demo_object.set_pos(orig_object_pos[t] + np.array([0.0, 5.0, 0.0]))
-
+        for k in range(seq_len * slow_factor * repeat_times):
+            t = (k // slow_factor) % seq_len
+            robot.control_dofs_position(joint_cmd_np[t], dofs_idx_local=dof_indices)
             scene.step()
             cam.render()
 
-        cam.stop_recording(save_to_filename='animation.mp4', fps=30)
+        cam.stop_recording(save_to_filename=save_path, fps=30)
+        print(f"Saved sim video to: {save_path}")

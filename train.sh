@@ -1,1 +1,1 @@
-python main.py --mode train --config ./conf/go2.yaml
+taskset -c 0-1,4-7,10-$(($(nproc)-1)) python main.py --mode train --config ./conf/go2.yaml

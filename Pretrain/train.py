@@ -10,7 +10,7 @@ import geoopt
 import math
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter  # Added for TensorBoard
-
+import torch.nn.functional as F
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -98,9 +98,22 @@ class Trainer:
         self.dataset = TrajectoryDataset(processed_path=config.processed_path, source_path=self.load_path,
                                          agent=self.agent)
 
-        self.vae.pos_mean = self.dataset.pos_mean
-        self.vae.pos_std = self.dataset.pos_std
+        pm = self.dataset.pos_mean.to(self.device)
+        ps = self.dataset.pos_std.to(self.device)
+        print(pm, ps)
+        # 🔑 Copy into buffers on BOTH VAE and decoder
+        with torch.no_grad():
+            self.vae.pos_mean.copy_(pm)
+            self.vae.pos_std.copy_(ps)
+            self.vae.decoder.pos_mean.copy_(pm)
+            self.vae.decoder.pos_std.copy_(ps)
 
+            dl = DataLoader(self.dataset, batch_size=64, shuffle=True, num_workers=2)
+            graph_x_b, _, teacher_joints_b = next(iter(dl))  # [B,T,DoF]
+            dq = teacher_joints_b[:, 1:] - teacher_joints_b[:, :-1]  # [B,T-1,DoF]
+            dq_med = dq.abs().median(dim=1).values.median(dim=0).values  # [DoF]
+            dq_init = torch.clamp(dq_med.to(self.device), 0.02, 0.20)  # 0.02–0.20 rad
+            self.vae.decoder.delta_scale.data.copy_(dq_init)
         # ✅ Initialize GradScaler for AMP
         self.scaler = GradScaler()
 
@@ -124,21 +137,42 @@ class Trainer:
                 # ✅ Calculate a global step for the schedulers
                 global_step = epoch * len(dataloader) + i
 
-                graph_x = graph_x.to(self.device, non_blocking=True)
-                orig_traj = orig_traj.to(self.device, non_blocking=True)
-                teacher_joints = teacher_joints.to(self.device, non_blocking=True)
+                graph_x = graph_x.to(self.device,)
+                orig_traj = orig_traj.to(self.device,)
+                teacher_joints = teacher_joints.to(self.device,)
 
                 self.optimizer.zero_grad(set_to_none=True)
 
                 # ✅ Wrap forward pass in autocast for AMP
                 with autocast(enabled=True):
                     # --- Common operations ---
-                    outputs = self.vae(graph_x, self.edge_index, teacher_joints)
-                    recon_traj = outputs[0]
                     beta = get_beta(epoch=global_step, total_epochs=total_steps,
                                     strategy=self.strategy, warmup_epochs=self.warm_up,
                                     max_beta=self.max_beta)
-                    # --- Specific loss calculation ---
+
+                    tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
+                    use_teacher = torch.rand(1).item() < tf_ratio
+
+                    recon_mu, joint_cmd, log_sigma, *aux = self.vae(
+                        graph_x, self.edge_index,
+                        teacher_joints if use_teacher else None
+                    )
+                    loss, recon_loss, kl_loss = self.vae.loss(recon_mu, log_sigma, orig_traj, *aux, beta=beta)
+
+                    def _denorm_positions(traj_norm,pos_mean,pos_std):
+                        """
+                        Denormalize a flattened [T, (num_links+1)*3] trajectory (agent links + object).
+                        """
+                        B, T, D = traj_norm.shape
+                        num_nodes = D // 3  # (num_links + 1)
+                        x = traj_norm.reshape(B, T, num_nodes, 3)
+                        x = x * pos_std[None, None, None, :].to('cuda') + pos_mean[None, None, None, :].to('cuda')
+                        return x.reshape(B, T, D)
+                    unnormalized_recon_mu = _denorm_positions(recon_mu,self.dataset.pos_mean,self.dataset.pos_std)
+                    unnormalized_graph_x = _denorm_positions(graph_x.reshape(recon_mu.shape),self.dataset.pos_mean,self.dataset.pos_std)
+                    unnormalized_loss = F.mse_loss(unnormalized_recon_mu, unnormalized_graph_x)
+
+                    '''
                     if self.vae_prior == "Gaussian":
                         mu, logvar = outputs[3], outputs[4]
                         loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, beta=beta)
@@ -148,7 +182,7 @@ class Trainer:
                     elif self.vae_prior == "Hyperbolic":
                         z, mu, var = outputs[2], outputs[3], outputs[4]
                         loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, z, mu, var, beta=beta)
-
+                    '''
                 # ✅ Scale the loss and perform backward pass
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -159,7 +193,7 @@ class Trainer:
 
                 self.scheduler.step()
                 print(
-                    f"Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
+                    f"Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, Unnorm_Recon:{unnormalized_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
 
                 # Log to TensorBoard per batch
                 self.writer.add_scalar('Loss/total', loss.item(), global_step)
