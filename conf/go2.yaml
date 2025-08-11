@@ -31,11 +31,95 @@ agent:
     - -1.5  # RL_calf_joint
   end_effector: [11, 20, 29, 38]
 
+
+rl:
+  env:
+    kp: 20.0
+    kd: 0.5
+    termination_if_roll_greater_than: 10
+    termination_if_pitch_greater_than: 10
+    base_init_pos: [0.0, 0.0, 0.42]
+    base_init_quat: [1.0, 0.0, 0.0, 0.0]
+    episode_length_s: 20.0
+    resampling_time_s: 4.0
+    action_scale: 0.25
+    simulate_action_latency: true
+    clip_actions: 100.0
+    dt: 0.02
+
+  obs:
+    # if omitted or null, go2_env.py derives num_obs automatically
+    num_obs: null
+    obs_scales:
+      lin_vel: 2.0
+      ang_vel: 0.25
+      dof_pos: 1.0
+      dof_vel: 0.05
+
+  reward:
+    tracking_sigma: 0.25
+    base_height_target: 0.3
+    feet_height_target: 0.075
+    reward_scales:
+      tracking_lin_vel: 1.0
+      tracking_ang_vel: 0.2
+      lin_vel_z: -1.0
+      base_height: -50.0
+      action_rate: -0.005
+      similar_to_default: -0.1
+
+  command:
+    num_commands: 3
+    lin_vel_x_range: [0.5, 0.5]
+    lin_vel_y_range: [0.0, 0.0]
+    ang_vel_range: [0.0, 0.0]
+
+  train:
+    algorithm:
+      class_name: PPO
+      clip_param: 0.2
+      desired_kl: 0.01
+      entropy_coef: 0.01
+      gamma: 0.99
+      lam: 0.95
+      learning_rate: 0.001
+      max_grad_norm: 1.0
+      num_learning_epochs: 5
+      num_mini_batches: 4
+      schedule: adaptive
+      use_clipped_value_loss: true
+      value_loss_coef: 1.0
+    init_member_classes: {}
+    policy:
+      activation: elu
+      actor_hidden_dims: [512, 256, 128]
+      critic_hidden_dims: [512, 256, 128]
+      init_noise_std: 1.0
+      class_name: ActorCritic
+    runner:
+      checkpoint: -1
+      experiment_name: go2-walking
+      load_run: -1
+      log_interval: 1
+      max_iterations: 200
+      record_interval: -1
+      resume: false
+      resume_path: null
+      run_name: ""
+    runner_class_name: OnPolicyRunner
+    num_steps_per_env: 24
+    save_interval: 100
+    empirical_normalization: null
+    seed: 1
+
+
+
+
 dataset:
-  num_envs: 128
+  num_envs: 25000
   #num_envs: 32768
-  episodes: 128
-  max_episode_seconds: 5
+  episodes: 500000
+  max_episode_seconds: 2
   frame_rate: 30
 
   log_dir: "./Pretrain/primitives/go2-walking"
@@ -69,9 +153,9 @@ model:
 trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
   processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
-  batch_size: 64
+  batch_size: 256
   device: 'cuda'
-  num_epochs: 256
+  num_epochs: 4
   optimizer:
     lr: 0.0005
   beta_anneal:

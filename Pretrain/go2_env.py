@@ -9,17 +9,21 @@ def gs_rand_float(lower, upper, shape, device):
 
 
 class Go2Env:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, agent,show_viewer=False):
         self.num_envs = num_envs
-        self.num_obs = obs_cfg["num_obs"]
+        # derive observation dimension if not provided (keeps pipeline consistent)
+        self.num_actions = env_cfg.get("num_actions", 12)
+        self.num_commands = command_cfg.get("num_commands", 3)
+        # base_ang_vel(3) + gravity(3) + commands(C) + dof_pos(A) + dof_vel(A) + actions(A) + rel_ball_pos(3) + rel_ball_vel(3)
+        derived_num_obs = 3 + 3 + self.num_commands + (3 * self.num_actions) + 3 + 3
+        self.num_obs = int(obs_cfg.get("num_obs") or derived_num_obs)
         self.num_privileged_obs = None
-        self.num_actions = env_cfg["num_actions"]
-        self.num_commands = command_cfg["num_commands"]
         self.device = gs.device
 
-        self.simulate_action_latency = True  # there is a 1 step latency on real robot
-        self.dt = 0.02  # control frequency on real robot is 50hz
-        self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
+        # honor config if provided
+        self.simulate_action_latency = env_cfg.get("simulate_action_latency", True)
+        self.dt = float(env_cfg.get("dt", 0.02))  # control frequency default 50Hz
+        self.max_episode_length = math.ceil(env_cfg.get("episode_length_s", 20.0) / self.dt)
 
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
@@ -57,7 +61,7 @@ class Go2Env:
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
-                file="./Pretrain/urdfs/go2_description/urdf/go2_description.urdf",
+                file=agent.urdf,
                 pos=self.base_init_pos.cpu().numpy(),
                 quat=self.base_init_quat.cpu().numpy(),
             ),
@@ -70,8 +74,15 @@ class Go2Env:
         # build
         self.scene.build(n_envs=num_envs)
 
+        # --- Agent wiring (preferred over env_cfg when provided) ---
+        joint_names = agent.joint_name
+        self.num_actions = len(joint_names)
+        self.default_dof_pos = agent.init_angles.to(gs.device).to(dtype=gs.tc_float)
+
+        self.motors_dof_idx = [self.robot.get_joint(name).dof_start for name in joint_names]
+        
         # names to indices
-        self.motors_dof_idx = [self.robot.get_joint(name).dof_start for name in self.env_cfg["joint_names"]]
+        
 
         # PD control parameters
         self.robot.set_dofs_kp([self.env_cfg["kp"]] * self.num_actions, self.motors_dof_idx)
@@ -108,11 +119,7 @@ class Go2Env:
         self.last_dof_vel = torch.zeros_like(self.actions)
         self.base_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_envs, 4), device=gs.device, dtype=gs.tc_float)
-        self.default_dof_pos = torch.tensor(
-            [self.env_cfg["default_joint_angles"][name] for name in self.env_cfg["joint_names"]],
-            device=gs.device,
-            dtype=gs.tc_float,
-        )
+        
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
