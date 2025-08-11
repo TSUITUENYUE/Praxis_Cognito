@@ -2,10 +2,15 @@ import torch
 import torch.nn as nn
 from xml.etree import ElementTree as ET
 from collections import defaultdict
-import os
-import sys
+from torch.cuda.amp import autocast
 
-def vectorized_euler_to_rot_matrix(rpy):
+# --- utilities ---
+
+def vectorized_euler_to_rot_matrix(rpy: torch.Tensor):
+    """
+    rpy: [...,3] or [3]. Returns rotation matrix 3x3 (if bs==1) or [B,3,3].
+    Used only for URDF origins (constants), so the original behavior is kept.
+    """
     if rpy.dim() == 1:
         rpy = rpy.unsqueeze(0)
     bs = rpy.shape[0]
@@ -14,7 +19,7 @@ def vectorized_euler_to_rot_matrix(rpy):
     cp, sp = torch.cos(p), torch.sin(p)
     cy, sy = torch.cos(y), torch.sin(y)
 
-    R = torch.zeros(bs, 3, 3, device=rpy.device)
+    R = torch.zeros(bs, 3, 3, device=rpy.device, dtype=rpy.dtype)
     R[:, 0, 0] = cy * cp
     R[:, 0, 1] = cy * sp * sr - sy * cr
     R[:, 0, 2] = cy * sp * cr + sy * sr
@@ -28,41 +33,57 @@ def vectorized_euler_to_rot_matrix(rpy):
         return R.squeeze(0)
     return R
 
-def vectorized_axis_angle_to_rot_matrix(axis_angle):
+def _skew(v: torch.Tensor):
+    """v: [B,3] -> [B,3,3] skew-symmetric matrices."""
+    B = v.shape[0]
+    K = torch.zeros(B, 3, 3, device=v.device, dtype=v.dtype)
+    vx, vy, vz = v[:, 0], v[:, 1], v[:, 2]
+    K[:, 0, 1] = -vz; K[:, 0, 2] =  vy
+    K[:, 1, 0] =  vz; K[:, 1, 2] = -vx
+    K[:, 2, 0] = -vy; K[:, 2, 1] =  vx
+    return K
+
+def rotmat_axis_angle_stable(axis_angle: torch.Tensor):
+    """
+    axis_angle: [B,3] (axis * angle, axis need not be unit).
+    Returns [B,3,3]. Smooth at theta -> 0, with Taylor expansions for A,B.
+    """
     if axis_angle.dim() == 1:
         axis_angle = axis_angle.unsqueeze(0)
-    bs = axis_angle.shape[0]
-    angle = torch.norm(axis_angle, dim=1)
-    mask = (angle == 0)
-    axis = axis_angle / angle.unsqueeze(1).clamp(min=1e-6)
-    ca = torch.cos(angle)
-    sa = torch.sin(angle)
-    one_ca = 1 - ca
-    kx, ky, kz = axis[:,0], axis[:,1], axis[:,2]
+    B = axis_angle.shape[0]
+    aa = axis_angle
+    theta = aa.norm(dim=1)                       # [B]
+    eps = 1e-8
+    theta2 = theta * theta + eps
+    A = torch.sin(theta) / (theta + eps)         # sinθ/θ
+    Bc = (1.0 - torch.cos(theta)) / theta2       # (1-cosθ)/θ^2
 
-    R = torch.zeros(bs, 3, 3, device=axis_angle.device)
-    R[:, 0, 0] = ca + kx*kx*one_ca
-    R[:, 0, 1] = kx*ky*one_ca - kz*sa
-    R[:, 0, 2] = kx*kz*one_ca + ky*sa
-    R[:, 1, 0] = ky*kx*one_ca + kz*sa
-    R[:, 1, 1] = ca + ky*ky*one_ca
-    R[:, 1, 2] = ky*kz*one_ca - kx*sa
-    R[:, 2, 0] = kz*kx*one_ca - ky*sa
-    R[:, 2, 1] = kz*ky*one_ca + kx*sa
-    R[:, 2, 2] = ca + kz*kz*one_ca
+    # Taylor for very small angles
+    small = theta < 1e-3
+    if small.any():
+        th = theta[small]
+        A_t = 1.0 - (th**2)/6.0 + (th**4)/120.0
+        B_t = 0.5 - (th**2)/24.0 + (th**4)/720.0
+        A = A.clone(); Bc = Bc.clone()
+        A[small]  = A_t
+        Bc[small] = B_t
 
-    eye = torch.eye(3, device=axis_angle.device).expand(bs, 3, 3)
-    R = torch.where(mask.view(bs, 1, 1), eye, R)
-    if bs == 1:
-        return R.squeeze(0)
+    K = _skew(aa)                                # [B,3,3]
+    I = torch.eye(3, device=aa.device, dtype=aa.dtype).expand(B, 3, 3)
+    A = A.view(B, 1, 1); Bc = Bc.view(B, 1, 1)
+    R = I + A * K + Bc * (K @ K)                 # Rodrigues
     return R
+
+# --- FK model ---
 
 class FKModel(nn.Module):
     def __init__(self, urdf):
         super(FKModel, self).__init__()
         self.parse_urdf_file(urdf)
+        # default device for buffers/constants
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # Precompute topological computation order (list of (parent, child, joint_name))
+
+        # Precompute traversal order (parent -> child)
         self.computation_order = []
         stack = ['base']
         visited = set()
@@ -75,22 +96,29 @@ class FKModel(nn.Module):
                 self.computation_order.append((link, child, joint_name))
                 stack.append(child)
 
-        # Precompute fixed tensors for each joint
-        self.eye_4 = torch.eye(4, device=self.device)
+        # Buffers
+        self.register_buffer('eye_4', torch.eye(4, device=self.device, dtype=torch.float32))
         self.joint_idx = {name: i for i, name in enumerate(self.joint_names)}
+
+        # Precompute constant transforms per joint
+        self.joint_data = {}
         for joint_name, joint in self.joint_map.items():
-            xyz = torch.tensor(joint['xyz'], device=self.device)
-            rpy = torch.tensor(joint['rpy'], device=self.device)
-            R = vectorized_euler_to_rot_matrix(rpy)
-            t = xyz
+            # origin transform (URDF constant)
+            xyz = torch.tensor(joint['xyz'], device=self.device, dtype=torch.float32)
+            rpy = torch.tensor(joint['rpy'], device=self.device, dtype=torch.float32)
+            R = vectorized_euler_to_rot_matrix(rpy)  # [3,3]
             T_origin = self.eye_4.clone()
             T_origin[:3, :3] = R
-            T_origin[:3, 3] = t
-            joint['T_origin'] = T_origin
+            T_origin[:3, 3]  = xyz
+            data = {'type': joint['type'], 'parent': joint['parent'], 'child': joint['child'],
+                    'T_origin': T_origin}
             if joint['type'] == 'revolute':
-                joint['axis_tensor'] = torch.tensor(joint['axis'], device=self.device)
+                axis = torch.tensor(joint['axis'], device=self.device, dtype=torch.float32)
+                # keep axis unnormalized; axis-angle uses axis * angle
+                data['axis_tensor'] = axis
             else:
-                joint['T_joint'] = self.eye_4.clone()
+                data['T_joint'] = self.eye_4.clone()
+            self.joint_data[joint_name] = data
 
     def parse_urdf_file(self, filename):
         tree = ET.parse(filename)
@@ -99,7 +127,8 @@ class FKModel(nn.Module):
 
     def _parse_urdf_root(self, root):
         self.link_names = [link.get('name') for link in root.findall('link')]
-        self.joint_names = [joint.get('name') for joint in root.findall('joint') if joint.get('type') == 'revolute']
+        # only revolute joints are actuated; but keep all joints in maps
+        self.joint_names = [j.get('name') for j in root.findall('joint') if j.get('type') == 'revolute']
         self.joint_map = {}
         self.child_map = defaultdict(list)
         self.parent_map = {}
@@ -111,41 +140,56 @@ class FKModel(nn.Module):
             self.child_map[parent].append((child, name))
             self.parent_map[child] = parent
             origin = joint.find('origin')
-
             xyz = list(map(float, (origin.get('xyz') or "0 0 0").split())) if origin is not None else [0.0, 0.0, 0.0]
             rpy = list(map(float, (origin.get('rpy') or "0 0 0").split())) if origin is not None else [0.0, 0.0, 0.0]
             axis_elem = joint.find('axis')
             axis = list(map(float, (axis_elem.get('xyz') or "1 0 0").split())) if axis_elem else [1.0, 0.0, 0.0]
-            self.joint_map[name] = {'type': jtype, 'parent': parent, 'child': child, 'xyz': xyz, 'rpy': rpy,
-                                    'axis': axis}
+            self.joint_map[name] = {'type': jtype, 'parent': parent, 'child': child,
+                                    'xyz': xyz, 'rpy': rpy, 'axis': axis}
 
-    def forward(self, joint_angles):
-        if joint_angles.dim() == 1:
-            joint_angles = joint_angles.unsqueeze(0)
-        bs = joint_angles.shape[0]
-        transforms = {'base': self.eye_4.unsqueeze(0).repeat(bs, 1, 1)}
-        for parent, child, joint_name in self.computation_order:
-            joint = self.joint_map[joint_name]
-            T_origin = joint['T_origin'].unsqueeze(0).repeat(bs, 1, 1)
-            if joint['type'] == 'revolute':
-                angle = joint_angles[:, self.joint_idx[joint_name]]
-                axis = joint['axis_tensor'].unsqueeze(0).repeat(bs, 1)
-                axis_angle = axis * angle.unsqueeze(1)
-                R_joint = vectorized_axis_angle_to_rot_matrix(axis_angle)
-                T_joint = self.eye_4.unsqueeze(0).repeat(bs, 1, 1)
-                T_joint[:, :3, :3] = R_joint
-            else:
-                T_joint = joint['T_joint'].unsqueeze(0).repeat(bs, 1, 1)
-            T_child = torch.matmul(transforms[parent], torch.matmul(T_origin, T_joint))
-            transforms[child] = T_child
-        positions = torch.cat([transforms.get(link, self.eye_4.unsqueeze(0).repeat(bs, 1, 1))[:, :3, 3] for link in self.link_names], dim=1)
-        if bs == 1:
-            positions = positions.squeeze(0)
-        return positions
+    def forward(self, joint_angles: torch.Tensor):
+        """
+        joint_angles: [B, DoF] or [DoF]
+        returns: [B, len(link_names)*3] (never squeezed; always batched)
+        """
+        # Force FK in fp32 for stable trig/gradients (even under AMP)
+        with autocast(False):
+            if joint_angles.dim() == 1:
+                joint_angles = joint_angles.unsqueeze(0)
+            joint_angles = joint_angles.to(dtype=torch.float32)
 
-if __name__ == '__main__':
-    fk = FKModel("../Pretrain/urdfs/go2_description/urdf/go2_description.urdf")
-    end_effector_names = ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
-    end_effector_indices = [fk.link_names.index(name) for name in end_effector_names]
-    print(len(fk.link_names))
-    print("End effector indices:", end_effector_indices)
+            B = joint_angles.shape[0]
+            # base transform
+            transforms = {'base': self.eye_4.unsqueeze(0).expand(B, 4, 4).clone()}
+
+            for parent, child, joint_name in self.computation_order:
+                jd = self.joint_data[joint_name]
+                T_origin = jd['T_origin'].unsqueeze(0).expand(B, 4, 4)  # [B,4,4]
+
+                if jd['type'] == 'revolute':
+                    idx = self.joint_idx.get(joint_name, None)
+                    if idx is None:
+                        # Non-actuated revolute (unlikely): treat as fixed identity
+                        T_joint = self.eye_4.unsqueeze(0).expand(B, 4, 4)
+                    else:
+                        angle = joint_angles[:, idx]                         # [B]
+                        axis  = jd['axis_tensor'].unsqueeze(0).expand(B, 3)  # [B,3]
+                        aa    = axis * angle.unsqueeze(1)                    # [B,3]
+                        Rj    = rotmat_axis_angle_stable(aa)                 # [B,3,3]
+                        T_joint = self.eye_4.unsqueeze(0).expand(B, 4, 4).clone()
+                        T_joint[:, :3, :3] = Rj
+                else:
+                    T_joint = jd['T_joint'].unsqueeze(0).expand(B, 4, 4)
+
+                T_parent = transforms[parent]                               # [B,4,4]
+                # T_child = T_parent @ T_origin @ T_joint
+                T_child = T_parent.matmul(T_origin).matmul(T_joint)
+                transforms[child] = T_child
+
+            # collect link positions in world
+            pos_list = []
+            for link in self.link_names:
+                T = transforms.get(link, self.eye_4.unsqueeze(0).expand(B, 4, 4))
+                pos_list.append(T[:, :3, 3])                                # [B,3]
+            positions = torch.cat(pos_list, dim=1)                           # [B, 3*links]
+            return positions

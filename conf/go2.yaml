@@ -32,10 +32,10 @@ agent:
   end_effector: [11, 20, 29, 38]
 
 dataset:
-  num_envs: 25000
+  num_envs: 128
   #num_envs: 32768
-  episodes: 500000
-  max_episode_seconds: 2
+  episodes: 128
+  max_episode_seconds: 5
   frame_rate: 30
 
   log_dir: "./Pretrain/primitives/go2-walking"
@@ -69,11 +69,11 @@ model:
 trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
   processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
-  batch_size: 256
+  batch_size: 64
   device: 'cuda'
-  num_epochs: 4
+  num_epochs: 256
   optimizer:
-    lr: 0.001
+    lr: 0.0005
   beta_anneal:
     strategy: "warmup"
     warm_up: 16000

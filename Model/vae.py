@@ -149,7 +149,7 @@ class IntentionVAE(nn.Module):
         acc_tgt  = vel_tgt[:, 1:] - vel_tgt[:, :-1]
         loss_acc = F.mse_loss(acc_pred, acc_tgt)
 
-        total_recon = (1.0 * recon_loss) + (0.1 * loss_vel) + (0.01 * loss_acc)
+        total_recon = (1.0 * recon_loss) + (0.0 * loss_vel) + (0.00 * loss_acc)
 
         # ---- KL based on prior type (unchanged) ----
         if self.prior == "GMM":

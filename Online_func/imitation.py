@@ -117,23 +117,24 @@ class ImitationModule:
         Visualize the model rollout in Genesis for one sample from the processed dataset.
         Uses the model's joint_cmd to drive the robot; denormalizes positions for optional debugging/plots.
         """
+
         dataset = TrajectoryDataset(
-            processed_path="./Pretrain/data/go2/25000 500000 2 30/preprocess.h5",
+            processed_path="./Pretrain/data/go2/128 128 5 30/preprocess.h5",
             agent=self.agent
         )
-        '''
+        pos_mean = dataset.pos_mean.cpu().numpy()  # [3]
+        pos_std = dataset.pos_std.cpu().numpy()    # [3]
+        print(pos_mean, pos_std)
         dataset = TrajectoryDataset(
             processed_path=self.config.processed_path,
             source_path=demo,
             agent=self.agent
         )
-        '''
+
 
         # get one sample
-        graph_x_np, orig_traj_np, _ = dataset[index]  # both normalized
-        pos_mean = dataset.pos_mean.cpu().numpy()  # [3]
-        pos_std = dataset.pos_std.cpu().numpy()    # [3]
-        print(pos_mean, pos_std)
+        graph_x_np, orig_traj_np, joint_traj_np = dataset[index]  # both normalized
+
         # torch tensors
         graph_x = torch.tensor(graph_x_np, device=self.device).unsqueeze(0)  # [1,T,D]
         edge_index = build_edge_index(self.agent.fk_model, self.agent.end_effector, self.device)
@@ -173,7 +174,7 @@ class ImitationModule:
         num_nodes = pos_dim // 3
         num_links = num_nodes - 1
         agent_dim = num_links * 3
-        # object_pos_world = recon_pos_world[:, agent_dim:]  # if you want to render an object
+        object_pos_world = recon_pos_world[:, agent_dim:]  # if you want to render an object
 
         # Extract EE positions (denormed) if you want to compare
         # ee_recon = self._extract_ee_positions(recon_pos_world[:, :agent_dim], self.agent.end_effector)
@@ -201,7 +202,11 @@ class ImitationModule:
 
         _ = scene.add_entity(gs.morphs.Plane())
         robot = scene.add_entity(gs.morphs.URDF(file=self.agent.urdf, collision=True, fixed=False))
-
+        ball = scene.add_entity(
+            gs.morphs.Sphere(
+                radius=0.05,
+            )
+        )
         cam = scene.add_camera(
             res=(1280, 960),
             pos=(0.0, 3.5, 2.5),
@@ -220,11 +225,12 @@ class ImitationModule:
         seq_len = joint_cmd_np.shape[0]
         cam.start_recording()
         slow_factor = 1
-        repeat_times = 10  # keep 1 by default; increase if you want to loop the clip
+        repeat_times = 3  # keep 1 by default; increase if you want to loop the clip
 
         for k in range(seq_len * slow_factor * repeat_times):
             t = (k // slow_factor) % seq_len
-            robot.control_dofs_position(joint_cmd_np[t], dofs_idx_local=dof_indices)
+            robot.set_dofs_position(joint_cmd_np[t], dofs_idx_local=dof_indices)
+            #ball.set_dofs_position(object_pos_world[t], dofs_idx_local=[0,1,2])
             scene.step()
             cam.render()
 
