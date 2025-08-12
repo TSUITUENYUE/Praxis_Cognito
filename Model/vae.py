@@ -116,29 +116,51 @@ class IntentionVAE(nn.Module):
         # adjusted for the change in volume (the jacobian).
         return log_prob_normal - log_det_jacob.squeeze(-1)
 
-    def forward(self, x, edge_index, teacher_joint):
+    def forward(self, x, edge_index, teacher_joints=None, tf_ratio: float = 1.0, obs_seq=None):
+        """
+        x:           [B, T, N, F]  (graph features)
+        edge_index:  PyG edges for a single graph; we internally batch them as before
+        teacher_joints: [B,T,DoF] or None
+        tf_ratio:    float in [0,1], per-step TF probability
+        obs_seq:     optional [B,T,obs_dim] if you want RL obs conditioning
+        Returns:
+          recon_mu:     [B,T,pos_dim]  (normalized)
+          joint_traj:   [B,T,DoF]
+          actions_seq:  [B,T,DoF]      in [-1,1]
+          log_sigma:    [B,T,pos_dim]
+          ... latents   (for KL)
+        """
         if self.prior == "GMM":
             mu, logvar, pi_logits = self.encoder(x, edge_index)
             z = self.reparameterize_gmm(mu, logvar, pi_logits)
-            recon_mu, joint_cmd, log_sigma = self.decoder(z, teacher_joints=teacher_joint)
-            return recon_mu, joint_cmd, log_sigma, z, mu, logvar, pi_logits
+            recon_mu, joint_cmd, actions_seq, log_sigma = self.decoder(
+                z, obs_seq=obs_seq, teacher_joints=teacher_joints, tf_ratio=tf_ratio
+            )
+            return recon_mu, joint_cmd, actions_seq, log_sigma, mu, logvar, pi_logits
+
         elif self.prior == "Hyperbolic":
             mu, logvar = self.encoder(x, edge_index)
-            std = F.softplus(logvar);
-            var = std ** 2
+            std = F.softplus(logvar)
             z = self.manifold.wrapped_normal(*mu.shape, mean=mu, std=std)
-            recon_mu, joint_cmd, log_sigma = self.decoder(z, teacher_joints=teacher_joint)
-            return recon_mu, joint_cmd, log_sigma, z, mu, var
+            recon_mu, joint_cmd, actions_seq, log_sigma = self.decoder(
+                z, obs_seq=obs_seq, teacher_joints=teacher_joints, tf_ratio=tf_ratio
+            )
+            return recon_mu, joint_cmd, actions_seq, log_sigma, z, mu, std**2
+
         elif self.prior == "Gaussian":
             mu, logvar = self.encoder(x, edge_index)
             z = self.reparameterize_gaussian(mu, logvar)
-            recon_mu, joint_cmd, log_sigma = self.decoder(z, teacher_joints=teacher_joint)
-            return recon_mu, joint_cmd, log_sigma, z, mu, logvar
+            recon_mu, joint_cmd, actions_seq, log_sigma = self.decoder(
+                z, obs_seq=obs_seq, teacher_joints=teacher_joints, tf_ratio=tf_ratio
+            )
+            return recon_mu, joint_cmd, actions_seq, log_sigma, z, mu, logvar
 
     def loss(self, recon_mu, log_sigma, orig_traj, *args, beta):
         # recon_mu, orig_traj are normalized positions [B,T,D]
+        orig_traj = orig_traj.reshape(recon_mu.shape)
         nll_pos = self.hetero_nll(orig_traj, recon_mu, log_sigma)
         recon_loss = F.mse_loss(recon_mu, orig_traj)
+        '''
         # velocity & (optional) acceleration penalties on the mean only
         vel_pred = recon_mu[:, 1:] - recon_mu[:, :-1]
         vel_tgt = orig_traj[:, 1:] - orig_traj[:, :-1]
@@ -148,8 +170,9 @@ class IntentionVAE(nn.Module):
         acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
         acc_tgt  = vel_tgt[:, 1:] - vel_tgt[:, :-1]
         loss_acc = F.mse_loss(acc_pred, acc_tgt)
-
-        total_recon = (1.0 * recon_loss) + (0.0 * loss_vel) + (0.00 * loss_acc)
+        '''
+        total_recon = recon_loss
+        #total_recon = nll_pos
 
         # ---- KL based on prior type (unchanged) ----
         if self.prior == "GMM":
@@ -180,4 +203,4 @@ class IntentionVAE(nn.Module):
             raise ValueError(f"Unsupported prior in loss: {self.prior}")
 
         vae_loss = total_recon + beta * kl_loss
-        return vae_loss, total_recon, kl_loss
+        return vae_loss, recon_loss, kl_loss
