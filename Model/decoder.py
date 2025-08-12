@@ -152,7 +152,8 @@ class Decoder(nn.Module):
         self,
         z: torch.Tensor,                     # [B, Z]
         obs_seq: Optional[torch.Tensor]=None,# [B, T, obs_dim] or None
-        teacher_joints: Optional[torch.Tensor]=None,  # [B, T, DoF] or None
+        q: Optional[torch.Tensor]=None,  # [B, T, DoF] or None
+        dq: Optional[torch.Tensor]=None, # [B, T, DoF] or None
         object_override: Optional[torch.Tensor]=None, # [B, T, 3] optional
         tf_ratio: float = 1.0               # teacher forcing ratio (1.0 == full TF)
     ):
@@ -180,13 +181,13 @@ class Decoder(nn.Module):
 
         for t in range(self.seq_len):
             # choose input joints: TF uses t-1; free-roll uses carried prev
-            use_teacher = self.training and (teacher_joints is not None) and (torch.rand(()) < tf_ratio)
+            use_teacher = self.training and (q is not None) and (torch.rand(()) < tf_ratio)
             if use_teacher:
                 if t == 0:
                     # 🔧 expand default pose to batch
                     prev_for_input = self.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B, DoF]
                 else:
-                    prev_for_input = teacher_joints[:, t - 1, :]  # [B, DoF]
+                    prev_for_input = q[:, t - 1, :]  # [B, DoF]
             else:
                 prev_for_input = prev_free  # [B, DoF]
             prev_norm = (prev_for_input - self.joint_mean) / self.joint_range

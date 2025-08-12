@@ -40,13 +40,3 @@ def load_configs(yaml_path: str, exp_name: str, max_iterations: int) -> RLConfig
     train_cfg["runner"].setdefault("max_iterations", max_iterations)
 
     return RLConfigs(env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg)
-
-def load_agent_cfg(yaml_path: str) -> Optional[Dict[str, Any]]:
-    """Return top-level 'agent' dict if present; else None."""
-    try:
-        with open(yaml_path, "r") as f:
-            raw = yaml.safe_load(f)
-    except Exception:
-        return None
-    agent = raw.get("agent", None)
-    return agent

@@ -1,123 +1,149 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-import h5py
-import numpy as np
-import os
+import os, h5py, torch, numpy as np
 from tqdm import tqdm
-import genesis as gs
-
+from torch.utils.data import Dataset
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, processed_path, source_path=None, agent=None, force_reprocess=False):
+    """
+    Raw HDF5 must contain:
+      - agent_trajectories: [N, T, n_dofs]
+      - obj_trajectories:   [N, T, 3]
+      - obs:                [N, T, obs_dim]
+    We compute:
+      - graph_x:  z-scored positions of [links + object]  -> [N, T, num_nodes, 3]
+      - joint_trajs: raw joint angles                      -> [N, T, n_dofs]
+      - joint_vels: raw dq (rad/s), dq[0]=0                -> [N, T, n_dofs]
+      - obs:       raw                                     -> [N, T, obs_dim]
+      - pos_mean/std: [3]
+      - attrs: dt
+    __getitem__ returns (graph_x, joint_trajs, obs, joint_vels)
+    """
+    def __init__(self, processed_path: str, source_path: str, agent, dt: float, force_reprocess: bool = False):
         super().__init__()
-        self.mode = None
+        assert agent is not None
+        assert dt > 0
         self.processed_path = processed_path
+        self.source_path = source_path
         self.agent = agent
-        self.n_dofs = self.agent.n_dofs
-        self.pos_mean = torch.zeros(3)
-        self.pos_std = torch.ones(3)
-        if os.path.exists(processed_path) and not force_reprocess:
-            # --- MODE 1: LOAD EXISTING PREPROCESSED DATA ---
-            self._init_load_mode()
+        self.n_dofs = int(agent.n_dofs)
+        self.dt = float(dt)
+        self.h5_file = None
 
-        elif source_path:
-            # --- MODE 2: PREPROCESS FROM SOURCE, THEN LOAD ---
-            print(f"Preprocessing source file: {source_path}")
-            self._run_preprocessing(source_path)
-            self._init_load_mode()
+        if (not os.path.exists(processed_path)) or force_reprocess:
+            self._preprocess()
 
-    def _init_load_mode(self):
-        """Initializes the dataset for loading from a preprocessed file."""
-        self.mode = 'load'
-        self.h5_file = None  # Will be opened by each worker in __getitem__
         with h5py.File(self.processed_path, 'r') as f:
-            self.num_samples = f['graph_x'].shape[0]
-            if 'pos_mean' in f and 'pos_std' in f:
-                self.pos_mean = torch.from_numpy(f['pos_mean'][:])
-                self.pos_std = torch.from_numpy(f['pos_std'][:])
-            else:
-                print("Warning: pos_mean and pos_std not found in the processed file. Using defaults (mean=0, std=1).")
-        print(f"✅ Dataset in 'load' mode. Found {self.num_samples} samples.")
+            gx = f['graph_x']
+            self.num_samples, self.seq_len, self.num_nodes, _ = gx.shape
+            self._pos_mean = torch.from_numpy(f['pos_mean'][:]).float()
+            self._pos_std  = torch.from_numpy(f['pos_std'][:]).float()
+            self.dt_attr   = float(f.attrs.get('dt', self.dt))
 
-    def _run_preprocessing(self, source_path):
-        """Performs the one-time preprocessing of the source dataset."""
-        print("Starting data preprocessing...")
+        print(f"✅ Dataset ready: N={self.num_samples}, T={self.seq_len}, nodes={self.num_nodes}, dt={self.dt_attr:.4f}s")
+
+    def __len__(self): return self.num_samples
+
+    def __getitem__(self, idx: int):
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.processed_path, 'r', libver='latest', swmr=True)
+        gx  = torch.from_numpy(self.h5_file['graph_x'][idx]).float()      # [T, nodes, 3] (normalized)
+        obs = torch.from_numpy(self.h5_file['obs'][idx]).float()          # [T, obs_dim] (raw)
+        q   = torch.from_numpy(self.h5_file['joint_trajs'][idx]).float()  # [T, n_dofs]  (raw)
+        dq  = torch.from_numpy(self.h5_file['joint_vels'][idx]).float()   # [T, n_dofs]  (raw rad/s)
+        return gx, obs, q, dq
+
+    @property
+    def pos_mean(self): return self._pos_mean
+    @property
+    def pos_std(self):  return self._pos_std
+
+    # ---------------- internals ----------------
+    def _preprocess(self):
+        assert os.path.exists(self.source_path), f"Missing raw file: {self.source_path}"
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        fk_model = self.agent.fk_model.to(device)
-        n_dofs = self.n_dofs
-        num_links = len(fk_model.link_names)
-        position_dim = num_links * 3
-        num_nodes = num_links + 1
+        fk = self.agent.fk_model.to(device)
 
-        # First pass: Compute mean and std (open f_in here)
-        with h5py.File(source_path, 'r') as f_in:
-            agent_trajs = f_in['agent_trajectories']
-            obj_trajs = f_in['obj_trajectories']
-            num_samples, seq_len, joint_dim = agent_trajs.shape
+        # ---- Pass 1: position stats (links + object) ----
+        with h5py.File(self.source_path, 'r') as f_in:
+            assert all(k in f_in for k in ('agent_trajectories','obj_trajectories','obs'))
+            agent_trajs = f_in['agent_trajectories']  # [N,T,D]
+            obj_trajs   = f_in['obj_trajectories']    # [N,T,3]
+            N, T, _ = agent_trajs.shape
+            num_links = len(fk.link_names)
 
             sum_pos = torch.zeros(3, device=device)
-            sum_sq = torch.zeros(3, device=device)
-            count = 0
-            chunk_size = 8192
-            for i in tqdm(range(0, num_samples, chunk_size), desc="Computing stats"):
-                end = min(i + chunk_size, num_samples)
-                joint_angles_chunk = torch.from_numpy(agent_trajs[i:end]).to(device)
-                obj_pos_chunk = torch.from_numpy(obj_trajs[i:end]).to(device)
-                bs_chunk = joint_angles_chunk.shape[0]
+            sum_sq  = torch.zeros(3, device=device)
+            count   = 0
 
-                joint_angles_flat = joint_angles_chunk.reshape(bs_chunk * seq_len, n_dofs)
-                link_pos_flat = fk_model(joint_angles_flat)
-                link_pos = link_pos_flat.reshape(bs_chunk, seq_len, num_links, 3)
-
-                # All positions: links + objs
-                all_pos = torch.cat([link_pos.reshape(-1, 3), obj_pos_chunk.reshape(-1, 3)], dim=0)
-
+            chunk = 1024
+            for i in tqdm(range(0, N, chunk), desc="Stats pass"):
+                j = min(i+chunk, N)
+                q  = torch.from_numpy(agent_trajs[i:j]).to(device)      # [B,T,D]
+                ob = torch.from_numpy(obj_trajs[i:j]).to(device)        # [B,T,3]
+                B = q.shape[0]
+                qf = q.reshape(B*T, self.n_dofs)
+                links_flat = fk(qf)                                      # [B*T, links*3]
+                links = links_flat.view(B, T, num_links, 3)
+                all_pos = torch.cat([links.reshape(-1,3), ob.reshape(-1,3)], dim=0)
                 sum_pos += all_pos.sum(dim=0)
-                sum_sq += (all_pos ** 2).sum(dim=0)
-                count += all_pos.size(0)
+                sum_sq  += (all_pos**2).sum(dim=0)
+                count   += all_pos.size(0)
 
-        pos_mean = sum_pos / count
-        pos_var = (sum_sq / count) - (pos_mean ** 2)
-        pos_std = torch.sqrt(pos_var) + 1e-6  # Avoid division by zero
+            pos_mean = sum_pos / count
+            pos_var  = (sum_sq / count) - (pos_mean**2)
+            pos_std  = torch.sqrt(pos_var.clamp_min(1e-12)) + 1e-6
 
-        # Second pass: Normalize and save (reopen f_in here)
-        with h5py.File(source_path, 'r') as f_in, h5py.File(self.processed_path, 'w') as f_out:
+        # ---- Pass 2: write processed ----
+        with h5py.File(self.source_path, 'r') as f_in, h5py.File(self.processed_path, 'w') as f_out:
             agent_trajs = f_in['agent_trajectories']
-            obj_trajs = f_in['obj_trajectories']
+            obj_trajs   = f_in['obj_trajectories']
+            obs_dset    = f_in['obs']
 
-            f_out.create_dataset('graph_x', (num_samples, seq_len, num_nodes, 3), dtype='f4')
-            f_out.create_dataset('orig_traj', (num_samples, seq_len, position_dim + 3), dtype='f4')
-            f_out.create_dataset('joint_trajs', data=agent_trajs)
+            N, T, _ = agent_trajs.shape
+            num_links = len(fk.link_names)
+            num_nodes = num_links + 1
+            obs_dim   = obs_dset.shape[-1]
+
+            f_out.create_dataset('graph_x',     (N, T, num_nodes, 3), dtype='f4')
+            f_out.create_dataset('joint_trajs', (N, T, self.n_dofs),  dtype='f4')
+            f_out.create_dataset('obs',         (N, T, obs_dim),      dtype='f4')
+            f_out.create_dataset('joint_vels',  (N, T, self.n_dofs),  dtype='f4')
             f_out.create_dataset('pos_mean', data=pos_mean.cpu().numpy())
-            f_out.create_dataset('pos_std', data=pos_std.cpu().numpy())
+            f_out.create_dataset('pos_std',  data=pos_std.cpu().numpy())
+            f_out.attrs['dt'] = self.dt
 
-            for i in tqdm(range(0, num_samples, chunk_size), desc="Normalizing and saving"):
-                end = min(i + chunk_size, num_samples)
-                joint_angles_chunk = torch.from_numpy(agent_trajs[i:end]).to(device)
-                torch.set_printoptions(threshold=np.inf)
+            chunk = 512
+            for i in tqdm(range(0, N, chunk), desc="Writing processed"):
+                j = min(i+chunk, N)
 
-                obj_pos_chunk = torch.from_numpy(obj_trajs[i:end]).to(device)
-                bs_chunk = joint_angles_chunk.shape[0]
+                # FK -> positions
+                q  = torch.from_numpy(agent_trajs[i:j]).to(device)      # [B,T,D]
+                ob = torch.from_numpy(obj_trajs[i:j]).to(device)        # [B,T,3]
+                B = q.shape[0]
+                qf = q.reshape(B*T, self.n_dofs)
+                links_flat = fk(qf)                                      # [B*T, links*3]
+                links = links_flat.view(B, T, num_links, 3)
+                ob = ob.unsqueeze(2)                                     # [B,T,1,3]
+                graph_x = torch.cat([links, ob], dim=2)                  # [B,T,num_nodes,3]
 
-                joint_angles_flat = joint_angles_chunk.reshape(bs_chunk * seq_len, n_dofs)
-                link_pos_flat = fk_model(joint_angles_flat)
+                # normalize ONLY positions for loss
+                graph_x = (graph_x - pos_mean) / pos_std
 
-                link_pos = link_pos_flat.reshape(bs_chunk, seq_len, num_links, 3)
-                obj_pos = obj_pos_chunk.unsqueeze(2)
+                # raw obs
+                obs = torch.from_numpy(obs_dset[i:j]).float()            # [B,T,O]
 
-                graph_x = torch.cat([link_pos, obj_pos], dim=2)
-                # Z-score Normalize
-                graph_x_norm = (graph_x - pos_mean) / pos_std
+                # raw joint vels (dq[0]=0)
+                q_cpu = torch.from_numpy(agent_trajs[i:j]).float()
+                dq = torch.zeros_like(q_cpu)
+                dq[:,1:] = (q_cpu[:,1:] - q_cpu[:, :-1]) / self.dt
 
-                f_out['graph_x'][i:end] = graph_x_norm.cpu().numpy()
-            #f_out['agent_trajs'] = agent_trajs
-        print("✅ Preprocessing complete.")
+                # write
+                f_out['graph_x'][i:j]     = graph_x.cpu().numpy()
+                f_out['joint_trajs'][i:j] = q_cpu.cpu().numpy()
+                f_out['obs'][i:j]         = obs.cpu().numpy()
+                f_out['joint_vels'][i:j]  = dq.cpu().numpy()
 
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        if self.mode == 'load':
-            if self.h5_file is None:
-                self.h5_file = h5py.File(self.processed_path, 'r')
-            return self.h5_file['graph_x'][idx], self.h5_file['joint_trajs'][idx]
+    # expose for your decoder init
+    @property
+    def pos_std(self):  return self._pos_std
+    @property
+    def pos_mean(self): return self._pos_mean

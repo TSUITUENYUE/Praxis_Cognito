@@ -12,7 +12,7 @@ import yaml
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Pretrain.rl_config import load_configs, load_agent_cfg
+from Pretrain.rl_config import load_configs
 from Model.agent import Agent
 
 try:
@@ -70,24 +70,11 @@ def main():
         cfgs.env_cfg, cfgs.obs_cfg, cfgs.reward_cfg, cfgs.command_cfg, cfgs.train_cfg
     )
 
-    agent_cfg = load_agent_cfg(args.config)
-    if agent_cfg is None:
-        raise RuntimeError(f"'agent' section missing in config: {args.config}")
 
-    agent = Agent(
-        name=agent_cfg.get('name', 'go2'),
-        urdf=agent_cfg['urdf'],
-        n_dofs=agent_cfg['n_dofs'],
-        object_dim=agent_cfg.get('object_dim', 3),
-        joint_name=agent_cfg['joint_name'],
-        end_effector=agent_cfg.get('end_effector', []),
-        init_angles=agent_cfg.get('init_angles', [0.0] * agent_cfg['n_dofs']),
-    )
+    agent = Agent(**args.config.agent)
 
-    # Align seconds/fps with dataset config (overrides CLI if present)
-    ds_timing = _load_dataset_cfg(args.config)
-    MAX_EPISODE_SECONDS = float(ds_timing.get("seconds"))
-    FRAME_RATE = int(ds_timing.get("fps"))
+    MAX_EPISODE_SECONDS = args.config.dataset.max_episode_seconds
+    FRAME_RATE = args.config.dataset.frame_rate
 
     log_dir = (
         f"Pretrain/primitives/{args.exp_name}"

@@ -48,8 +48,8 @@ rl:
     dt: 0.02
 
   obs:
-    # if omitted or null, go2_env.py derives num_obs automatically
-    num_obs: null
+
+    num_obs: 51
     obs_scales:
       lin_vel: 2.0
       ang_vel: 0.25
@@ -116,13 +116,13 @@ rl:
 
 
 dataset:
-  num_envs: 25000
+  num_envs: 16384
   #num_envs: 32768
-  episodes: 500000
+  episodes: 250000
   max_episode_seconds: 2
   frame_rate: 30
 
-  log_dir: "./Pretrain/primitives/go2-walking"
+  log_dir: "Pretrain/primitives/go2-walking"
   curiosity_beta: 0.1
   policy_hidden_dim: 256
   similarity_threshold: 0.95

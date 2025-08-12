@@ -127,10 +127,10 @@ class Trainer:
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
-            for i, (graph_x, teacher_joints) in enumerate(dataloader):
+            for i, (graph_x, obs, q, dq) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
                 graph_x = graph_x.to(self.device)
-                teacher_joints = teacher_joints.to(self.device)
+                q = q.to(self.device)
 
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -144,9 +144,9 @@ class Trainer:
                     # --- forward (policy decoder returns actions) ---
                     recon_mu, joint_cmd, actions_seq, log_sigma, *aux = self.vae(
                         graph_x, self.edge_index,
-                        teacher_joints=teacher_joints,
+                        teacher_joints=q,
                         tf_ratio=tf_ratio,
-                        obs_seq=None,
+                        obs_seq=obs,
                     )
 
                     # --- main loss: heteroscedastic NLL on normalized graph positions ---
@@ -155,7 +155,7 @@ class Trainer:
 
                     # --- tiny aux: match joint deltas to encourage motion amplitude ---
                     dq_pred = joint_cmd[:, 1:] - joint_cmd[:, :-1]
-                    dq_true = teacher_joints[:, 1:] - teacher_joints[:, :-1]
+                    dq_true =q[:, 1:] - q[:, :-1]
                     L_delta = F.mse_loss(dq_pred, dq_true)
                     loss = loss + 0.05 * L_delta
 

@@ -116,11 +116,12 @@ class IntentionVAE(nn.Module):
         # adjusted for the change in volume (the jacobian).
         return log_prob_normal - log_det_jacob.squeeze(-1)
 
-    def forward(self, x, edge_index, teacher_joints=None, tf_ratio: float = 1.0, obs_seq=None):
+    def forward(self, x, edge_index, obs_seq=None, q=None, dq=None, tf_ratio: float = 1.0):
         """
         x:           [B, T, N, F]  (graph features)
         edge_index:  PyG edges for a single graph; we internally batch them as before
         teacher_joints: [B,T,DoF] or None
+        dq: [B,T,DoF]
         tf_ratio:    float in [0,1], per-step TF probability
         obs_seq:     optional [B,T,obs_dim] if you want RL obs conditioning
         Returns:
@@ -134,7 +135,7 @@ class IntentionVAE(nn.Module):
             mu, logvar, pi_logits = self.encoder(x, edge_index)
             z = self.reparameterize_gmm(mu, logvar, pi_logits)
             recon_mu, joint_cmd, actions_seq, log_sigma = self.decoder(
-                z, obs_seq=obs_seq, teacher_joints=teacher_joints, tf_ratio=tf_ratio
+                z, obs_seq=obs_seq, q=q, dq=dq,tf_ratio=tf_ratio
             )
             return recon_mu, joint_cmd, actions_seq, log_sigma, mu, logvar, pi_logits
 
@@ -143,7 +144,7 @@ class IntentionVAE(nn.Module):
             std = F.softplus(logvar)
             z = self.manifold.wrapped_normal(*mu.shape, mean=mu, std=std)
             recon_mu, joint_cmd, actions_seq, log_sigma = self.decoder(
-                z, obs_seq=obs_seq, teacher_joints=teacher_joints, tf_ratio=tf_ratio
+                z, obs_seq=obs_seq, q=q, dq=dq,tf_ratio=tf_ratio
             )
             return recon_mu, joint_cmd, actions_seq, log_sigma, z, mu, std**2
 
@@ -151,7 +152,7 @@ class IntentionVAE(nn.Module):
             mu, logvar = self.encoder(x, edge_index)
             z = self.reparameterize_gaussian(mu, logvar)
             recon_mu, joint_cmd, actions_seq, log_sigma = self.decoder(
-                z, obs_seq=obs_seq, teacher_joints=teacher_joints, tf_ratio=tf_ratio
+                z, obs_seq=obs_seq, q=q, dq=dq,tf_ratio=tf_ratio
             )
             return recon_mu, joint_cmd, actions_seq, log_sigma, z, mu, logvar
 
