@@ -106,22 +106,10 @@ class TrajectoryDataset(Dataset):
                 obj_pos = obj_pos_chunk.unsqueeze(2)
 
                 graph_x = torch.cat([link_pos, obj_pos], dim=2)
-                orig_traj = torch.cat([link_pos.reshape(bs_chunk, seq_len, position_dim), obj_pos.squeeze(2)], dim=2)
-
                 # Z-score Normalize
-
                 graph_x_norm = (graph_x - pos_mean) / pos_std
 
-                orig_traj_reshaped = orig_traj.reshape(bs_chunk, seq_len, num_links + 1, 3)
-                orig_traj_norm_reshaped = (orig_traj_reshaped - pos_mean) / pos_std
-                orig_traj_norm = orig_traj_norm_reshaped.reshape(bs_chunk, seq_len, position_dim + 3)
-
                 f_out['graph_x'][i:end] = graph_x_norm.cpu().numpy()
-                f_out['orig_traj'][i:end] = orig_traj_norm.cpu().numpy()
-                '''
-                f_out['graph_x'][i:end] = graph_x.cpu().numpy()
-                f_out['orig_traj'][i:end] = orig_traj.cpu().numpy()
-                '''
             #f_out['agent_trajs'] = agent_trajs
         print("✅ Preprocessing complete.")
 
@@ -132,4 +120,4 @@ class TrajectoryDataset(Dataset):
         if self.mode == 'load':
             if self.h5_file is None:
                 self.h5_file = h5py.File(self.processed_path, 'r')
-            return self.h5_file['graph_x'][idx], self.h5_file['orig_traj'][idx], self.h5_file['joint_trajs'][idx]
+            return self.h5_file['graph_x'][idx], self.h5_file['joint_trajs'][idx]
