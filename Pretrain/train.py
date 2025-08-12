@@ -11,36 +11,6 @@ import math
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter  # Added for TensorBoard
 import torch.nn.functional as F
-
-@torch.no_grad()
-def mean_abs_dq(joints):  # joints: [B,T,DoF]
-    dq = joints[:, 1:] - joints[:, :-1]                   # [B,T-1,DoF]
-    return dq.abs().mean(dim=(0,1,2))                     # scalar
-
-@torch.no_grad()
-def amplitude_ratio(joints_pred, joints_true, eps=1e-8):  # both [B,T,DoF]
-    dq_p = joints_pred[:, 1:] - joints_pred[:, :-1]       # [B,T-1,DoF]
-    dq_t = joints_true[:, 1:] - joints_true[:, :-1]
-    num = dq_p.abs().mean(dim=(1,2))                      # [B]
-    den = dq_t.abs().mean(dim=(1,2)) + eps                # [B]
-    ratio = (num / den).clamp(max=5.0)                    # [B]
-    # Return per-sample and batch mean (useful for logging)
-    return ratio, ratio.mean()
-
-@torch.no_grad()
-def hf_energy_ratio_batch(joints, fps: float, cutoff_hz: float):  # joints: [B,T,DoF]
-    # Remove mean over time to avoid DC dominating
-    x = joints - joints.mean(dim=1, keepdim=True)          # [B,T,DoF]
-    B, T, D = x.shape
-    # rFFT over time
-    X = torch.fft.rfft(x.float(), dim=1)                   # [B,F,DoF]
-    freqs = torch.fft.rfftfreq(T, d=1.0 / fps).to(x.device)  # [F] in Hz
-    mask = freqs >= cutoff_hz                              # [F]
-    # Power above cutoff vs total
-    pow_all = (X.abs()**2).sum(dim=(1,2)) + 1e-12          # [B]
-    pow_hf  = (X[:, mask, :].abs()**2).sum(dim=(1,2))      # [B]
-    return (pow_hf / pow_all).clamp(0.0, 1.0)              # [B]
-
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -82,7 +52,7 @@ class Trainer:
         self.load_path = config.load_path
         self.save_path = config.save_path
         self.batch_size = config.batch_size
-        self.grad_clip_value = 1.0 * 5
+        self.grad_clip_value = 1.0
 
         filename = os.path.basename(self.load_path)
         parts = filename.rstrip('.h5').strip().split()
@@ -117,42 +87,7 @@ class Trainer:
         self.end_effector_indices = self.agent.end_effector
         self.edge_index = build_edge_index(self.fk_model, self.end_effector_indices, self.device)
 
-        base_lr = config.optimizer.lr
-        dec = self.vae.decoder
-
-        # params for the Δq head only (mlp_delta + delta_scale)
-        delta_params = list(dec.mlp_delta.parameters()) + [dec.delta_scale]
-
-        # everything else (no duplicates)
-        other_params = []
-        for name, p in self.vae.named_parameters():
-            if not p.requires_grad:
-                continue
-            if any(p is dp for dp in delta_params):
-                continue
-            other_params.append(p)
-
-        # optional: sanity check
-        # print(f"delta_params: {sum(p.numel() for p in delta_params)}",
-        #       f"other_params: {sum(p.numel() for p in other_params)}")
-
-        if self.vae_prior == "Hyperbolic":
-            # geoopt can take param groups too
-            self.optimizer = geoopt.optim.RiemannianAdam(
-                [
-                    {"params": delta_params, "lr": base_lr * 5.0},
-                    {"params": other_params, "lr": base_lr},
-                ]
-            )
-        else:
-            self.optimizer = optim.AdamW(
-                [
-                    {"params": delta_params, "lr": base_lr * 5.0},
-                    {"params": other_params, "lr": base_lr},
-                ],
-                weight_decay=1e-5,
-                fused=True,
-            )
+        self.optimizer = optim.AdamW(self.vae.parameters(), lr=config.optimizer.lr, weight_decay=1e-5, fused=True)
         if self.vae_prior == "Hyperbolic":
             self.optimizer = geoopt.optim.RiemannianAdam(self.vae.parameters(),
                                                          lr=config.optimizer.lr)  # Fused not available
@@ -198,110 +133,79 @@ class Trainer:
         # ✅ Calculate total steps for correct annealing schedule
         total_steps = self.num_epochs * len(dataloader)
         for epoch in range(self.num_epochs):
-            for i, (graph_x, orig_traj, teacher_joints) in enumerate(dataloader):
+            for i, (graph_x, orig_traj,teacher_joints) in enumerate(dataloader):
+                # ✅ Calculate a global step for the schedulers
                 global_step = epoch * len(dataloader) + i
 
-                graph_x = graph_x.to(self.device)
-                orig_traj = orig_traj.to(self.device)
-                teacher_joints = teacher_joints.to(self.device)
+                graph_x = graph_x.to(self.device,)
+                orig_traj = orig_traj.to(self.device,)
+                teacher_joints = teacher_joints.to(self.device,)
 
                 self.optimizer.zero_grad(set_to_none=True)
 
-                # ----------------------- forward (AMP) -----------------------
+                # ✅ Wrap forward pass in autocast for AMP
                 with autocast(enabled=True):
+                    # --- Common operations ---
                     beta = get_beta(epoch=global_step, total_epochs=total_steps,
                                     strategy=self.strategy, warmup_epochs=self.warm_up,
                                     max_beta=self.max_beta)
 
-                    # teacher forcing schedule (your current one)
-                    tf_ratio = max(0.0, 0.7 - global_step / total_steps)
+                    tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
                     use_teacher = torch.rand(1).item() < tf_ratio
-
+                    use_teacher = True
                     recon_mu, joint_cmd, log_sigma, *aux = self.vae(
                         graph_x, self.edge_index,
                         teacher_joints if use_teacher else None
                     )
                     loss, recon_loss, kl_loss = self.vae.loss(recon_mu, log_sigma, orig_traj, *aux, beta=beta)
 
-                    # (your unnormalized MSE for reference)
-                    def _denorm_positions(traj_norm, pos_mean, pos_std):
+                    def _denorm_positions(traj_norm,pos_mean,pos_std):
+                        """
+                        Denormalize a flattened [T, (num_links+1)*3] trajectory (agent links + object).
+                        """
                         B, T, D = traj_norm.shape
-                        num_nodes = D // 3
+                        num_nodes = D // 3  # (num_links + 1)
                         x = traj_norm.reshape(B, T, num_nodes, 3)
                         x = x * pos_std[None, None, None, :].to('cuda') + pos_mean[None, None, None, :].to('cuda')
                         return x.reshape(B, T, D)
-
-                    unnormalized_recon_mu = _denorm_positions(recon_mu, self.dataset.pos_mean, self.dataset.pos_std)
-                    unnormalized_graph_x = _denorm_positions(graph_x.reshape(recon_mu.shape), self.dataset.pos_mean,
-                                                             self.dataset.pos_std)
+                    unnormalized_recon_mu = _denorm_positions(recon_mu,self.dataset.pos_mean,self.dataset.pos_std)
+                    unnormalized_graph_x = _denorm_positions(graph_x.reshape(recon_mu.shape),self.dataset.pos_mean,self.dataset.pos_std)
                     unnormalized_loss = F.mse_loss(unnormalized_recon_mu, unnormalized_graph_x)
 
-                # --------------------- motion diagnostics ---------------------
-                with torch.no_grad():
-                    # 1) mean |Δq_pred|
-                    dq_mean = mean_abs_dq(joint_cmd)  # scalar
-
-                    # 2) amplitude ratio (per-sample + batch mean)
-                    amp_ratio_samples, amp_ratio_mean = amplitude_ratio(joint_cmd, teacher_joints)
-
-                    # 3) HF energy ratios (prediction vs target)
-                    fps = float(self.frame_rate)
-                    cutoff_hz = 6.0  # tweak 6–8 Hz for walking
-                    hf_pred = hf_energy_ratio_batch(joint_cmd, fps, cutoff_hz)  # [B]
-                    hf_true = hf_energy_ratio_batch(teacher_joints, fps, cutoff_hz)  # [B]
-
-                    # "walking-only" slice: top 30% by true |Δq|
-                    dq_true_per_sample = (teacher_joints[:, 1:] - teacher_joints[:, :-1]).abs().mean(dim=(1, 2))  # [B]
-                    if dq_true_per_sample.numel() >= 4:
-                        thr = torch.quantile(dq_true_per_sample, 0.70)
-                        mask = dq_true_per_sample >= thr
-                    else:
-                        mask = dq_true_per_sample >= 0.02  # fallback threshold (rad/frame)
-
-                    if mask.any():
-                        amp_ratio_walk = amp_ratio_samples[mask].mean()
-                        hf_pred_walk = hf_pred[mask].mean()
-                        hf_true_walk = hf_true[mask].mean()
-                    else:
-                        amp_ratio_walk = torch.tensor(float('nan'), device=self.device)
-                        hf_pred_walk = torch.tensor(float('nan'), device=self.device)
-                        hf_true_walk = torch.tensor(float('nan'), device=self.device)
-
-                    # Optional console peek
-                    if global_step % 1 == 0:
-                        print(f"[Diag] |Δq|={dq_mean:.4f}  amp={amp_ratio_mean:.3f}  "
-                              f"HF(pred/true)={hf_pred.mean():.3f}/{hf_true.mean():.3f}  "
-                              f"(walk amp={amp_ratio_walk.item() if mask.any() else float('nan'):.3f})")
-
-                # -------------------- backward & optimize --------------------
+                    '''
+                    if self.vae_prior == "Gaussian":
+                        mu, logvar = outputs[3], outputs[4]
+                        loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, beta=beta)
+                    elif self.vae_prior == "GMM":
+                        mu, logvar, pi = outputs[3], outputs[4], outputs[5]
+                        loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, mu, logvar, pi, beta=beta)
+                    elif self.vae_prior == "Hyperbolic":
+                        z, mu, var = outputs[2], outputs[3], outputs[4]
+                        loss, recon_loss, kl_loss = self.vae.loss(recon_traj, orig_traj, z, mu, var, beta=beta)
+                    '''
+                # ✅ Scale the loss and perform backward pass
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_clip_value)
+
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
                 self.scheduler.step()
+                print(
+                    f"Batch {i + 1}/{len(dataloader)}, Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, Unnorm_Recon:{unnormalized_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
 
-                # -------------------------- logs -----------------------------
-                print(f"Batch {i + 1}/{len(dataloader)}, "
-                      f"Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, "
-                      f"Unnorm_Recon:{unnormalized_loss.item():.4f}, KL: {kl_loss.item():.4f}, Beta: {beta:.3f}")
-
-                # main losses
+                # Log to TensorBoard per batch
                 self.writer.add_scalar('Loss/total', loss.item(), global_step)
                 self.writer.add_scalar('Loss/recon', recon_loss.item(), global_step)
                 self.writer.add_scalar('Loss/kl', kl_loss.item(), global_step)
-                self.writer.add_scalar('Loss/unnorm_recon', unnormalized_loss.item(), global_step)
                 self.writer.add_scalar('Beta', beta, global_step)
                 self.writer.add_scalar('Learning Rate', self.scheduler.get_last_lr()[0], global_step)
 
-                # diagnostics
-                self.writer.add_scalar('diag/mean_abs_dq', dq_mean.item(), global_step)
-                self.writer.add_scalar('diag/amplitude_ratio_mean', amp_ratio_mean.item(), global_step)
-                self.writer.add_scalar('diag/hf_ratio_pred_mean', hf_pred.mean().item(), global_step)
-                self.writer.add_scalar('diag/hf_ratio_true_mean', hf_true.mean().item(), global_step)
-                if mask.any():
-                    self.writer.add_scalar('diag_walk/amplitude_ratio', amp_ratio_walk.item(), global_step)
-                    self.writer.add_scalar('diag_walk/hf_ratio_pred', hf_pred_walk.item(), global_step)
-                    self.writer.add_scalar('diag_walk/hf_ratio_true', hf_true_walk.item(), global_step)
+            if (epoch + 1) % save_interval == 0 or (epoch + 1) == self.num_epochs:
+                if not os.path.exists(self.save_path): os.makedirs(self.save_path)
+                save_path = self.save_path + f"vae_checkpoint_epoch_{epoch + 1}.pth"
+                torch.save(self.vae.state_dict(), save_path)
+                print(f"Saved model checkpoint to {save_path}")
 
         self.writer.close()  # Close TensorBoard writer at the end
