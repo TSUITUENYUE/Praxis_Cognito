@@ -57,8 +57,7 @@ class Decoder(nn.Module):
         # === Conditional policy network ===
         # Input: q_norm + q̇ + obs + z + time
         policy_input_dim = (
-                self.joint_dim +  # normalized joints for network
-                self.joint_dim +  # joint velocities
+                2 * self.joint_dim +  # normalized joints for network + velocity
                 self.obs_dim +  # environment observation
                 self.latent_dim # trajectory intention
         )
@@ -156,6 +155,10 @@ class Decoder(nn.Module):
             action = self.action_head(features)  # [-1, 1]
 
             # Convert to target joints
+            '''TO DO'''
+            '''Add similar control strategy as go2env'''
+            '''How to address the physics in the envs???'''
+
             target_joints = action * self.action_scale + self.default_dof_pos
 
             # Simple integration

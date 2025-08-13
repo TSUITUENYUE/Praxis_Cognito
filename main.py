@@ -19,7 +19,8 @@ class Runner:
 
         self.agent = Agent(**config.agent)
         if self.mode != "generate":
-            self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.obs_dim, fps=config.dataset.frame_rate, **config.model.vae)
+            self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, **config.model.vae)
+
             if self.mode == "train":
                 self.trainer = Trainer(self.model, config.trainer)
             if self.mode != "train":
@@ -42,7 +43,7 @@ class Runner:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="train")
-    parser.add_argument("--config", default="./conf/go2v.yaml")
+    parser.add_argument("--config", default="./conf/go2.yaml")
     parser.add_argument("--demo", default=None)
     args, unknown_args = parser.parse_known_args()
     if args.mode == "imitate" and args.demo is None:

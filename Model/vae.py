@@ -156,24 +156,14 @@ class IntentionVAE(nn.Module):
             )
             return recon_mu, joint_cmd, actions_seq, log_sigma, z, mu, logvar
 
-    def loss(self, recon_mu, log_sigma, orig_traj, *args, beta):
+    def loss(self, recon_mu, log_sigma, orig_traj, action_seq, act, *args, beta):
         # recon_mu, orig_traj are normalized positions [B,T,D]
         orig_traj = orig_traj.reshape(recon_mu.shape)
-        nll_pos = self.hetero_nll(orig_traj, recon_mu, log_sigma)
-        recon_loss = F.mse_loss(recon_mu, orig_traj)
-        '''
-        # velocity & (optional) acceleration penalties on the mean only
-        vel_pred = recon_mu[:, 1:] - recon_mu[:, :-1]
-        vel_tgt = orig_traj[:, 1:] - orig_traj[:, :-1]
-        loss_vel = F.mse_loss(vel_pred, vel_tgt)
-
-        # (optional) acceleration
-        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-        acc_tgt  = vel_tgt[:, 1:] - vel_tgt[:, :-1]
-        loss_acc = F.mse_loss(acc_pred, acc_tgt)
-        '''
-        total_recon = recon_loss
-        #total_recon = nll_pos
+        nll_loss = self.hetero_nll(orig_traj, recon_mu, log_sigma)
+        kinematic_loss = F.mse_loss(recon_mu, orig_traj)
+        dynamic_loss = F.mse_loss(action_seq, act)
+        total_recon = kinematic_loss + dynamic_loss
+        #total_recon = nll_loss
 
         # ---- KL based on prior type (unchanged) ----
         if self.prior == "GMM":
@@ -204,4 +194,4 @@ class IntentionVAE(nn.Module):
             raise ValueError(f"Unsupported prior in loss: {self.prior}")
 
         vae_loss = total_recon + beta * kl_loss
-        return vae_loss, recon_loss, kl_loss
+        return vae_loss, kinematic_loss, dynamic_loss, kl_loss

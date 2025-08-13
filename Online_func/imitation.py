@@ -133,7 +133,7 @@ class ImitationModule:
 
 
         # get one sample
-        graph_x_np, orig_traj_np, joint_traj_np = dataset[index]  # both normalized
+        graph_x_np, joint_traj_np = dataset[index]  # both normalized
 
         # torch tensors
         graph_x = torch.tensor(graph_x_np, device=self.device).unsqueeze(0)  # [1,T,D]
