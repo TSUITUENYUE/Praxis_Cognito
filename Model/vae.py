@@ -11,7 +11,7 @@ import math
 
 
 class IntentionVAE(nn.Module):
-    def __init__(self, prior, node_features, hidden_features, num_layers, rnn_hidden, latent_dim, seq_len, agent, hidden_dim, num_components=128):
+    def __init__(self, prior, node_features, hidden_features, num_layers, rnn_hidden, latent_dim, seq_len, agent, hidden_dim,obs_dim, fps, num_components=128):
         super(IntentionVAE, self).__init__()
         self.prior = prior
         self.num_components = num_components if prior == "GMM" else None
@@ -44,7 +44,7 @@ class IntentionVAE(nn.Module):
         else:
             raise ValueError(f"Unsupported prior: {prior}. Choose from 'GMM', 'Hyperbolic', or 'Gaussian'.")
 
-        self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim, self.agent, hidden_dim, self.pos_mean, self.pos_std)
+        self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim, self.agent, hidden_dim, self.pos_mean, self.pos_std, obs_dim, fps)
 
     def hetero_nll(self, x, mu, log_sigma):
         # x, mu, log_sigma: [B,T,D] in the SAME (normalized) space

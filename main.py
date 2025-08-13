@@ -8,6 +8,7 @@ from codebook import Codebook
 from Pretrain.generate_dataset import generate
 import argparse
 import os
+
 import torch._dynamo as dynamo
 dynamo.config.capture_scalar_outputs = True
 
@@ -18,7 +19,7 @@ class Runner:
 
         self.agent = Agent(**config.agent)
         if self.mode != "generate":
-            self.model = IntentionVAE(agent=self.agent, **config.model.vae)
+            self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.obs_dim, fps=config.dataset.frame_rate, **config.model.vae)
             if self.mode == "train":
                 self.trainer = Trainer(self.model, config.trainer)
             if self.mode != "train":

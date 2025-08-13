@@ -21,9 +21,8 @@ class Decoder(nn.Module):
             hidden_dim: int,
             pos_mean: torch.Tensor,
             pos_std: torch.Tensor,
-            time_bands: int = 6,
-            include_linear_time: bool = True,
-            obs_dim: int = 51,  # Go2 observation dimension
+            obs_dim: int = 51,
+            fps: int = 30 # Go2 config
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -34,7 +33,7 @@ class Decoder(nn.Module):
         self.obs_dim = obs_dim
         self.agent = agent
         self.fk_model = self.agent.fk_model
-
+        self.frame_rate = fps
         # Normalization buffers (for FK output only)
         self.register_buffer("pos_mean", pos_mean)
         self.register_buffer("pos_std", pos_std)
@@ -51,11 +50,6 @@ class Decoder(nn.Module):
         init_angles = torch.as_tensor(self.agent.init_angles, device=device, dtype=torch.float32)
         self.register_buffer("default_dof_pos", init_angles)
 
-        # Time embedding
-        self.time_bands = time_bands
-        self.include_linear_time = include_linear_time
-        self.time_dim = (2 * time_bands) + (1 if include_linear_time else 0)
-
         # Sizes
         self.num_links = len(self.fk_model.link_names)
         self.pos_dim = (self.num_links + 1) * 3
@@ -66,8 +60,7 @@ class Decoder(nn.Module):
                 self.joint_dim +  # normalized joints for network
                 self.joint_dim +  # joint velocities
                 self.obs_dim +  # environment observation
-                self.latent_dim +  # trajectory intention
-                self.time_dim  # time encoding
+                self.latent_dim # trajectory intention
         )
 
         # Feature extraction
@@ -101,17 +94,6 @@ class Decoder(nn.Module):
         self.sigma_max = 0.5
         self.action_scale = 0.25  # From go2_env
 
-    def _time_features(self, T, device):
-        t = torch.linspace(0.0, 1.0, T, device=device)
-        feats = []
-        if self.include_linear_time:
-            feats.append(t)
-        for k in range(self.time_bands):
-            f = 2.0 ** k
-            feats.append(torch.sin(2 * math.pi * f * t))
-            feats.append(torch.cos(2 * math.pi * f * t))
-        return torch.stack(feats, dim=-1)
-
     def forward(
             self,
             z: torch.Tensor,  # [B, latent_dim]
@@ -126,10 +108,6 @@ class Decoder(nn.Module):
         """
         B = z.size(0)
         dev = z.device
-
-        # Time features
-        time_feats = self._time_features(self.seq_len, dev)
-        time_feats = time_feats.unsqueeze(0).expand(B, -1, -1)
 
         # Initialize
         all_joints = []
@@ -159,16 +137,15 @@ class Decoder(nn.Module):
             # Get current observation
             current_obs = obs_seq[:, t, :] if obs_seq is not None else torch.zeros(B, self.obs_dim, device=dev)
 
-            # Normalize ONLY for network input (not for FK!)
+            # Normalize ONLY for network input (not for FK)
             joints_norm = (input_joints - self.joint_mean) / self.joint_range
 
-            # Build policy input: [q_norm, q̇, obs, z, time]
+            # Build policy input: [q_norm, q̇, obs, z]
             policy_input = torch.cat([
                 joints_norm,  # Normalized for network
                 input_dq,  # Joint velocities
                 current_obs,  # Environment observation
                 z,  # Latent intention
-                time_feats[:, t, :]  # Time
             ], dim=-1)
 
             # Forward through policy
@@ -192,7 +169,7 @@ class Decoder(nn.Module):
             if t == 0:
                 current_dq = torch.zeros_like(current_joints)
             else:
-                current_dq = current_joints - prev_joints
+                current_dq = (current_joints - prev_joints) * self.frame_rate
 
             # Object prediction
             if object_override is not None:

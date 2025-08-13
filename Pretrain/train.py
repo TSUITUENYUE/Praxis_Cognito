@@ -144,9 +144,10 @@ class Trainer:
                     # --- forward (policy decoder returns actions) ---
                     recon_mu, joint_cmd, actions_seq, log_sigma, *aux = self.vae(
                         graph_x, self.edge_index,
-                        teacher_joints=q,
-                        tf_ratio=tf_ratio,
                         obs_seq=obs,
+                        q=q,
+                        dq=dq,
+                        tf_ratio=tf_ratio,
                     )
 
                     # --- main loss: heteroscedastic NLL on normalized graph positions ---
