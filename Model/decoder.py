@@ -67,7 +67,6 @@ class Decoder(nn.Module):
             nn.Linear(policy_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
@@ -89,6 +88,7 @@ class Decoder(nn.Module):
         nn.init.zeros_(self.var_head.weight)
         nn.init.constant_(self.var_head.bias, -2.0)
 
+        self.alpha_logits = nn.Parameter(torch.full((joint_dim,), math.log(0.3)))
         self.sigma_min = 0.05
         self.sigma_max = 0.5
         self.action_scale = 0.25  # From go2_env
@@ -161,16 +161,17 @@ class Decoder(nn.Module):
 
             target_joints = action * self.action_scale + self.default_dof_pos
 
-            # Simple integration
-            alpha = 0.8  # Higher alpha for more responsive control
+
+            alpha = torch.sigmoid(self.alpha_logits)  # (d,), in (0,1)
             current_joints = input_joints + alpha * (target_joints - input_joints)
 
             # Clamp to limits
             current_joints = torch.clamp(current_joints, self.joint_lower, self.joint_upper)
 
             # Compute velocity for next step
-            if t == 0:
-                current_dq = torch.zeros_like(current_joints)
+            if use_teacher:
+                current_joints = q[:, t, :]
+                current_dq = dq[:, t, :] if dq is not None else torch.zeros_like(current_joints)
             else:
                 current_dq = (current_joints - prev_joints) * self.frame_rate
 

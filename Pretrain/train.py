@@ -91,13 +91,14 @@ class Trainer:
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
-            for i, (graph_x, obs, act, q, dq) in enumerate(dataloader):
+            for i, (graph_x, obs, act, q, dq, mask) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
                 graph_x = graph_x.to(self.device)
                 obs = obs.to(self.device)
                 act = act.to(self.device)
                 q = q.to(self.device)
                 dq = q.to(self.device)
+                mask = mask.to(self.device)
 
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -119,7 +120,7 @@ class Trainer:
 
                     # --- main loss: heteroscedastic NLL on normalized graph positions ---
                     # IMPORTANT: target is graph_x (normalized), not orig_traj
-                    loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(recon_mu, log_sigma, graph_x, actions_seq, act,  *aux, beta=beta)
+                    loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(recon_mu, log_sigma, graph_x, act, actions_seq,  *aux, beta=beta)
 
                     # --- diag: unnormalized recon MSE in world units ---
                     unnormalized_recon_mu = _denorm_positions(recon_mu, self.dataset.pos_mean, self.dataset.pos_std)

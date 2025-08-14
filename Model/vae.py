@@ -156,12 +156,13 @@ class IntentionVAE(nn.Module):
             )
             return recon_mu, joint_cmd, actions_seq, log_sigma, z, mu, logvar
 
-    def loss(self, recon_mu, log_sigma, orig_traj, action_seq, act, *args, beta):
+    def loss(self, recon_mu, log_sigma, orig_traj, act_mu, action_seq, *args, beta):
         # recon_mu, orig_traj are normalized positions [B,T,D]
         orig_traj = orig_traj.reshape(recon_mu.shape)
         nll_loss = self.hetero_nll(orig_traj, recon_mu, log_sigma)
         kinematic_loss = F.mse_loss(recon_mu, orig_traj)
-        dynamic_loss = F.mse_loss(action_seq, act)
+        print(action_seq.mean(), act_mu.mean())
+        dynamic_loss = F.mse_loss(action_seq, act_mu)
         total_recon = kinematic_loss + dynamic_loss
         #total_recon = nll_loss
 
