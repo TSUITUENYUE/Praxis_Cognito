@@ -164,6 +164,8 @@ trainer:
     max_beta: 0.0
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
+  lambda_kinematic: 1.0
+  lambda_dynamic: 0.2
 
 imitator:
   processed_path: './Pretrain/data/${agent.name}/demo/preprocess.h5'

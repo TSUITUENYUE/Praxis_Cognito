@@ -9,7 +9,6 @@ import os, math
 
 from .dataset import TrajectoryDataset
 from .utils import build_edge_index
-import geoopt
 
 def get_beta(epoch, total_epochs, strategy='cyclical', num_cycles=4, max_beta=1.0, warmup_epochs=20):
     if strategy == 'warmup':
@@ -54,7 +53,6 @@ class Trainer:
         pm = self.dataset.pos_mean.to(self.device); ps = self.dataset.pos_std.to(self.device)
         with torch.no_grad():
             self.vae.pos_mean.copy_(pm); self.vae.pos_std.copy_(ps)
-            self.vae.decoder.pos_mean.copy_(pm); self.vae.decoder.pos_std.copy_(ps)
 
         # optimizer (give policy head a bit more LR)
         base_lr = config.optimizer.lr
@@ -70,6 +68,9 @@ class Trainer:
         self.strategy = config.beta_anneal.strategy
         self.warm_up  = config.beta_anneal.warm_up
         self.max_beta = config.beta_anneal.max_beta
+
+        self.lambda_kinematic = config.lambda_kinematic
+        self.lambda_dynamic = config.lambda_dynamic
 
     def train(self):
         torch.set_float32_matmul_precision('high')
@@ -98,8 +99,7 @@ class Trainer:
                 act = act.to(self.device)
                 q = q.to(self.device)
                 dq = q.to(self.device)
-                mask = mask.to(self.device)
-
+                mask = mask.to(self.device)[:,:,None]
                 self.optimizer.zero_grad(set_to_none=True)
 
                 with autocast(enabled=True):
@@ -111,7 +111,7 @@ class Trainer:
 
                     # --- forward (policy decoder returns actions) ---
                     recon_mu, joint_cmd, actions_seq, log_sigma, *aux = self.vae(
-                        graph_x, self.edge_index,
+                        graph_x, self.edge_index, mask,
                         obs_seq=obs,
                         q=q,
                         dq=dq,
@@ -119,8 +119,12 @@ class Trainer:
                     )
 
                     # --- main loss: heteroscedastic NLL on normalized graph positions ---
-                    # IMPORTANT: target is graph_x (normalized), not orig_traj
-                    loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(recon_mu, log_sigma, graph_x, act, actions_seq,  *aux, beta=beta)
+                    loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
+                        recon_mu, log_sigma, graph_x, act, actions_seq, mask, *aux,
+                        beta=beta,
+                        lambda_kinematic=self.lambda_kinematic,
+                        lambda_dynamic=self.lambda_dynamic
+                    )
 
                     # --- diag: unnormalized recon MSE in world units ---
                     unnormalized_recon_mu = _denorm_positions(recon_mu, self.dataset.pos_mean, self.dataset.pos_std)

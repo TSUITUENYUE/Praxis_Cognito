@@ -156,7 +156,7 @@ class TrajectoryDataset(Dataset):
                     vlen_block = valid_len_src[i:j].astype(np.int32)  # [B]
                 else:
                     vlen_block = np.full((j - i,), T, dtype=np.int32)
-                mask_block = float((t_index < vlen_block[:, None])[:, :, None])  # [B, T, 1] bool
+                mask_block = (t_index < vlen_block[:, None])[:,:, None].astype(np.float32)  # [B, T, 1] bool
 
                 # write
                 f_out['graph_x'][i:j]      = graph_x.cpu().numpy()

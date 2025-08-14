@@ -12,7 +12,6 @@ from rsl_rl.runners import OnPolicyRunner
 from .go2_env import Go2Env
 from Model.agent import Agent
 import faiss
-import logging
 
 class RunningMeanStd:
     def __init__(self, shape, epsilon=1e-4, device='cuda'):
@@ -160,16 +159,16 @@ def generate(cfg: DictConfig):
     start_time = time.time()
 
     # Reset with extras; normalize like OnPolicyRunner
-    obs, extras = env.reset()
-    critic_obs = extras["observations"].get("critic", obs)
+    obs, _ = env.reset()
+    critic_obs = obs
     obs_n        = runner.obs_normalizer(obs)
     critic_obs_n = runner.critic_obs_normalizer(critic_obs)
+
 
     # Save normalizers for downstream reuse
     norm_state_path = os.path.join(path, "normalizers.pt")
     torch.save({
         "obs_norm": runner.obs_normalizer.state_dict(),
-        "critic_obs_norm": runner.critic_obs_normalizer.state_dict()
     }, norm_state_path)
     print(f"Saved normalizer state to {norm_state_path}")
 
@@ -216,7 +215,7 @@ def generate(cfg: DictConfig):
             # A) Collect a full fixed-length clip per env
             first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)  # ★ NEW
             for t in range(max_episode_len):
-                # log raw obs_t (store raw; use saved normalizer later)
+                # log obs_t (store norm)
                 obs_traj_buffer[t] = obs
 
                 # act with *normalized* obs like OnPolicyRunner
