@@ -165,6 +165,7 @@ class IntentionVAE(nn.Module):
             x,
             edge_index,
             mask,  # [B,T,1] float {0,1}
+            normalizer,
             obs_seq=None,  # [B,T,obs_dim] or None
             q=None,  # [B,T,d] (teacher joints) or None
             dq=None,  # [B,T,d] (teacher vels) or None
@@ -201,7 +202,7 @@ class IntentionVAE(nn.Module):
         q_prev  = self.decoder.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B,d]
         dq_prev = torch.zeros(B, d, device=dev)
         obs_state = obs_seq[:, 0, :] if obs_seq is not None else torch.zeros(B, self.decoder.obs_dim, device=dev)
-
+        obs_state = normalizer(obs_state)
         for t in range(T):
             mask_t = mask[:, t, :]  # [B,1]
 
@@ -222,7 +223,7 @@ class IntentionVAE(nn.Module):
 
             # ---- Surrogate dynamics step (replaces alpha-integration) ----
             q_pred, dq_pred, obs_pred = self.surrogate(q_in, dq_in, obs_state, action_t)
-
+            obs_pred = normalizer(obs_pred)
             # Clamp joints to limits
             q_pred = torch.clamp(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 

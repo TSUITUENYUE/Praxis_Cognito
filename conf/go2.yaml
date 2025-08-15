@@ -115,9 +115,9 @@ rl:
 
 
 dataset:
-  num_envs: 1024
+  num_envs: 16384
   #num_envs: 32768
-  episodes: 10000
+  episodes: 250000
   max_episode_seconds: 2
   frame_rate: 30
 
@@ -152,6 +152,7 @@ model:
 trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
   processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
+  normalizer_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/normalizers.pt'
   batch_size: 256
   device: 'cuda'
   num_epochs: 4

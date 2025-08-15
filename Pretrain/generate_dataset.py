@@ -169,6 +169,7 @@ def generate(cfg: DictConfig):
     norm_state_path = os.path.join(path, "normalizers.pt")
     torch.save({
         "obs_norm": runner.obs_normalizer.state_dict(),
+        "critic_obs_norm": runner.critic_obs_normalizer.state_dict(),
     }, norm_state_path)
     print(f"Saved normalizer state to {norm_state_path}")
 
@@ -215,7 +216,7 @@ def generate(cfg: DictConfig):
             # A) Collect a full fixed-length clip per env
             first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)  # ★ NEW
             for t in range(max_episode_len):
-                # log obs_t (store norm)
+                # log obs_t (store raw)
                 obs_traj_buffer[t] = obs
 
                 # act with *normalized* obs like OnPolicyRunner

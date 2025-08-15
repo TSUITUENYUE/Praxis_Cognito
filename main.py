@@ -16,13 +16,12 @@ class Runner:
     def __init__(self, mode, config: DictConfig):
         self.mode = mode
         self.config = config
-        rl_config = load_configs(config)
         self.agent = Agent(**config.agent)
         if self.mode != "generate":
             self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, **config.model.vae)
 
             if self.mode == "train":
-                self.trainer = Trainer(self.model, rl_config, config.trainer)
+                self.trainer = Trainer(self.model, config.rl, config.trainer)
             if self.mode != "train":
                 self.codebook = Codebook(**config.codebook)
                 checkpoint_path = self.config.trainer.save_path + f"vae_checkpoint_epoch_{self.config.trainer.num_epochs}.pth"
