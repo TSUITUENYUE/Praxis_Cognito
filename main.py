@@ -6,23 +6,23 @@ from Pretrain.train import *
 from Model.agent import *
 from codebook import Codebook
 from Pretrain.generate_dataset import generate
+from Pretrain.go2_env import Go2Env
 import argparse
 import os
-
-import torch._dynamo as dynamo
-#dynamo.config.capture_scalar_outputs = True
+import genesis as gs
+from Pretrain.rl_config import load_configs
 
 class Runner:
     def __init__(self, mode, config: DictConfig):
         self.mode = mode
         self.config = config
-
+        rl_config = load_configs(config)
         self.agent = Agent(**config.agent)
         if self.mode != "generate":
             self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, **config.model.vae)
 
             if self.mode == "train":
-                self.trainer = Trainer(self.model, config.trainer)
+                self.trainer = Trainer(self.model, rl_config, config.trainer)
             if self.mode != "train":
                 self.codebook = Codebook(**config.codebook)
                 checkpoint_path = self.config.trainer.save_path + f"vae_checkpoint_epoch_{self.config.trainer.num_epochs}.pth"

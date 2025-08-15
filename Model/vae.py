@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder
-
+from .sd import SurrogateDynamics
 
 class IntentionVAE(nn.Module):
     def __init__(
@@ -59,6 +59,15 @@ class IntentionVAE(nn.Module):
             self.agent, hidden_dim, obs_dim, fps
         )
 
+        self.dt = 1.0 / float(fps)
+        self.surrogate = SurrogateDynamics(
+            joint_dim=self.joint_dim,
+            obs_dim=obs_dim,
+            hidden_dim=hidden_dim,
+            dt=self.dt,
+        )
+
+
     # ---------- Latent sampling ----------
     @staticmethod
     def reparameterize_gaussian(mu, logvar):
@@ -95,6 +104,61 @@ class IntentionVAE(nn.Module):
         elem = 0.5 * ((x - mu) ** 2) * inv_var + log_sigma + 0.5 * math.log(2 * math.pi)  # [B,T,D]
         return elem.mean(dim=-1)  # [B,T]
 
+
+    def predict_dynamics(self, actions_seq, obs0, q0, dq0, mask):
+        """
+        actions_seq: [B, T, d]  (Trainer passes DETACHED actions so sim loss
+                                 only updates this surrogate)
+        obs0: [B, obs_dim], q0: [B, d], dq0: [B, d]
+        mask: [B, T, 1] float {0,1}
+        Returns:
+          sur_obs_seq: [B, T, obs_dim]
+          sur_q_seq:   [B, T, d]
+          sur_dq_seq:  [B, T, d]
+        """
+        B, T, d = actions_seq.shape
+        dev = actions_seq.device
+
+        # Buffers/limits from decoder (already registered there)
+        q_lower = self.decoder.joint_lower
+        q_upper = self.decoder.joint_upper
+        q_lower = q_lower.to(dev)
+        q_upper = q_upper.to(dev)
+
+        obs_seq_out = []
+        q_seq_out = []
+        dq_seq_out = []
+
+        # Current state
+        q_t = q0.to(dev)
+        dq_t = dq0.to(dev)
+        obs_t = obs0.to(dev)
+
+        for t in range(T):
+            mask_t = mask[:, t, :]  # [B,1]
+            a_t = actions_seq[:, t, :]
+
+            # One-step surrogate
+            q_pred, dq_pred, obs_pred = self.surrogate(q_t, dq_t, obs_t, a_t)
+
+            # Clamp q to joint limits (post integration)
+            q_pred = torch.clamp(q_pred, q_lower, q_upper)
+
+            # Freeze beyond padding
+            q_t_next  = mask_t * q_pred  + (1.0 - mask_t) * q_t
+            dq_t_next = mask_t * dq_pred + (1.0 - mask_t) * dq_t
+            obs_next  = mask_t * obs_pred + (1.0 - mask_t) * obs_t
+
+            q_seq_out.append(q_t_next)
+            dq_seq_out.append(dq_t_next)
+            obs_seq_out.append(obs_next)
+
+            q_t, dq_t, obs_t = q_t_next, dq_t_next, obs_next
+
+        sur_q_seq   = torch.stack(q_seq_out, dim=1)    # [B,T,d]
+        sur_dq_seq  = torch.stack(dq_seq_out, dim=1)   # [B,T,d]
+        sur_obs_seq = torch.stack(obs_seq_out, dim=1)  # [B,T,obs_dim]
+        return sur_obs_seq, sur_q_seq, sur_dq_seq
     # ---------- Forward ----------
     def forward(
             self,
@@ -131,56 +195,56 @@ class IntentionVAE(nn.Module):
         if obs_seq is None:
             obs_seq = torch.zeros(B, T, self.decoder.obs_dim, device=dev)
 
-        actions_seq = []
-        joints_seq = []
-        objects_seq = []
-        logsig_seq = []
+        actions_seq, joints_seq, objects_seq, logsig_seq = [], [], [], []
 
-        q_prev = self.decoder.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B,d]
+        # Running state: start at default q, zero dq, and obs from first frame (or zeros)
+        q_prev  = self.decoder.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B,d]
         dq_prev = torch.zeros(B, d, device=dev)
-        # ----- AR rollout with mask + teacher forcing -----
+        obs_state = obs_seq[:, 0, :] if obs_seq is not None else torch.zeros(B, self.decoder.obs_dim, device=dev)
+
         for t in range(T):
             mask_t = mask[:, t, :]  # [B,1]
-            obs_t = obs_seq[:, t, :]
 
-            # Teacher forcing gate (per-step, scalar). Only active in training w/ q provided.
+            # ---- Teacher forcing on inputs (same logic as before) ----
             if self.training and (q is not None):
                 tf_gate = (torch.rand(1, device=dev) < tf_ratio).float().view(1, 1)  # [1,1]
-                q_in = tf_gate * (q[:, t - 1, :] if t > 0 else self.decoder.default_dof_pos.unsqueeze(0)) + (
-                            1 - tf_gate) * q_prev
-                dq_in = tf_gate * (dq[:, t - 1, :] if (t > 0 and dq is not None) else 0.0) + (1 - tf_gate) * dq_prev
+                q_in = tf_gate * (q[:, t - 1, :] if t > 0 else self.decoder.default_dof_pos.unsqueeze(0)) \
+                       + (1.0 - tf_gate) * q_prev
+                dq_in = tf_gate * (dq[:, t - 1, :] if (t > 0 and dq is not None) else 0.0) \
+                        + (1.0 - tf_gate) * dq_prev
             else:
                 q_in, dq_in = q_prev, dq_prev
 
-            # One-step policy
+            # ---- One-step policy (use rolled obs_state, not GT obs[t]) ----
             action_t, obj_t, log_sig_t, _ = self.decoder(
-                z, q_in, dq_in, obs_t=obs_t, mask_t=mask_t
+                z, q_in, dq_in, obs_t=obs_state, mask_t=mask_t
             )  # action_t:[B,d], obj_t:[B,obj_dim], log_sig_t:[B,pos_dim]
 
-            # Map to target joints & integrate with learned α
-            target = action_t * self.decoder.action_scale + self.decoder.default_dof_pos
-            alpha = self.decoder.alpha.view(1, -1)  # [1,d]
-            q_new = q_in + alpha * (target - q_in)
-            q_new = torch.clamp(q_new, self.decoder.joint_lower, self.decoder.joint_upper)
-            dq_new = (q_new - q_prev) * self.decoder.frame_rate
+            # ---- Surrogate dynamics step (replaces alpha-integration) ----
+            q_pred, dq_pred, obs_pred = self.surrogate(q_in, dq_in, obs_state, action_t)
 
-            # Freeze beyond padding (no drift past valid length)
-            q_new = mask_t * q_new + (1 - mask_t) * q_prev
-            dq_new = mask_t * dq_new + (1 - mask_t) * dq_prev
-            act_t = mask_t * action_t
-            obj_t = mask_t * obj_t
-            # keep log_sig_t value; it will be masked in the loss
+            # Clamp joints to limits
+            q_pred = torch.clamp(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
-            actions_seq.append(act_t)
+            # Freeze beyond padding (no drift on padded frames)
+            q_new  = mask_t * q_pred  + (1.0 - mask_t) * q_prev
+            dq_new = mask_t * dq_pred + (1.0 - mask_t) * dq_prev
+            obs_new = mask_t * obs_pred + (1.0 - mask_t) * obs_state
+
+            # Store masked outputs
+            actions_seq.append(mask_t * action_t)
             joints_seq.append(q_new)
-            objects_seq.append(obj_t)
-            logsig_seq.append(log_sig_t)
+            objects_seq.append(mask_t * obj_t)   # object head still supervised by VAE loss
+            logsig_seq.append(log_sig_t)         # mask applied in loss
 
-            q_prev, dq_prev = q_new, dq_new
+            # Advance state
+            q_prev, dq_prev, obs_state = q_new, dq_new, obs_new
+
         actions_seq = torch.stack(actions_seq, dim=1)  # [B,T,d]
-        joints_seq = torch.stack(joints_seq, dim=1)  # [B,T,d]
+        joints_seq  = torch.stack(joints_seq,  dim=1)  # [B,T,d]
         objects_seq = torch.stack(objects_seq, dim=1)  # [B,T,obj_dim]
-        logsig_seq = torch.stack(logsig_seq, dim=1)  # [B,T,(links+1)*3]
+        logsig_seq  = torch.stack(logsig_seq,  dim=1)  # [B,T,(links+1)*3]
+
 
         # ----- FK + normalization → recon_mu -----
         B, T, d = joints_seq.shape

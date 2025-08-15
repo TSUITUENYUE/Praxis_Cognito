@@ -262,7 +262,7 @@ class Go2Env:
     def reset(self):
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
-        return self.obs_buf, None
+        return self.obs_buf, self.extras
 
     # ------------ reward functions----------------
     def _reward_tracking_lin_vel(self):

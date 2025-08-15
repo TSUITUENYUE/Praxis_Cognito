@@ -159,8 +159,8 @@ def generate(cfg: DictConfig):
     start_time = time.time()
 
     # Reset with extras; normalize like OnPolicyRunner
-    obs, _ = env.reset()
-    critic_obs = obs
+    obs, extras = env.reset()
+    critic_obs = extras['observations'].get("critic", obs)
     obs_n        = runner.obs_normalizer(obs)
     critic_obs_n = runner.critic_obs_normalizer(critic_obs)
 

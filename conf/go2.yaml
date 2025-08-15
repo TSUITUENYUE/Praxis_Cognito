@@ -48,7 +48,6 @@ rl:
     dt: 0.02
 
   obs:
-
     num_obs: 51
     obs_scales:
       lin_vel: 2.0
@@ -116,9 +115,9 @@ rl:
 
 
 dataset:
-  num_envs: 16384
+  num_envs: 1024
   #num_envs: 32768
-  episodes: 250000
+  episodes: 10000
   max_episode_seconds: 2
   frame_rate: 30
 
@@ -164,8 +163,14 @@ trainer:
     max_beta: 0.0
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
-  lambda_kinematic: 1.0
-  lambda_dynamic: 0.2
+  kino:
+    lambda_kinematic: 1.0
+    lambda_dynamic: 0.2
+  sim:
+    lambda_sim: 1.0
+    w_q: 1.0
+    w_dq: 0.5
+    w_obs: 0.1
 
 imitator:
   processed_path: './Pretrain/data/${agent.name}/demo/preprocess.h5'
