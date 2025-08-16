@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
@@ -42,7 +43,7 @@ class Trainer:
         self.max_episode_len = self.max_episode_seconds * self.frame_rate
 
         # model & geometry
-        self.vae = torch.compile(model.to(self.device))
+        self.vae = torch.compile(model.to(self.device),mode="reduce-overhead")
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
@@ -86,12 +87,19 @@ class Trainer:
             '''
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)
+            for p in self.obs_normalizer.parameters():
+                p.requires_grad_(False)
             self.critic_obs_normalizer = torch.nn.Identity().to(self.device)
+            for p in self.critic_obs_normalizer.parameters():
+                p.requires_grad_(False)
         # push dataset normalization into VAE + decoder buffers
         pm = self.dataset.pos_mean.to(self.device); ps = self.dataset.pos_std.to(self.device)
         with torch.no_grad():
             self.vae.pos_mean.copy_(pm)
             self.vae.pos_std.copy_(ps)
+        # in __init__ (after you computed pm/ps and copied into buffers)
+        self.pos_mean_d = self.dataset.pos_mean.to(self.device)
+        self.pos_std_d = self.dataset.pos_std.to(self.device)
 
         # optimizer & schedulers
         base_lr = config.optimizer.lr
@@ -106,7 +114,7 @@ class Trainer:
         self.max_beta = config.beta_anneal.max_beta
 
         self.lambda_kinematic = config.kino.lambda_kinematic
-        self.lambda_dynamic   = config.kino.lambda_dynamic
+        self.lambda_dynamic   = config.kino.lambda_dynamic / self.agent.n_dofs
 
         self.lambda_sim = config.sim.lambda_sim
         self.w_q  = config.sim.w_q
@@ -137,18 +145,19 @@ class Trainer:
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            num_workers=0,
+            num_workers=4,
             shuffle=True,
             drop_last=True
         )
 
         total_steps = self.num_epochs * len(dataloader)
 
-        def _denorm_positions(traj_norm, pos_mean, pos_std):
+        def _denorm_positions(traj_norm, pos_mean_d, pos_std_d):
+            # traj_norm: [B,T,3*num_nodes]; pos_mean_d/pos_std_d already on device
             B, T, D = traj_norm.shape
             num_nodes = D // 3
             x = traj_norm.reshape(B, T, num_nodes, 3)
-            x = x * pos_std[None, None, None, :].to(self.device) + pos_mean[None, None, None, :].to(self.device)
+            x = x * pos_std_d[None, None, None, :] + pos_mean_d[None, None, None, :]
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
@@ -163,7 +172,6 @@ class Trainer:
                 mask    = mask.to(self.device)[:, :, None] # [B,T,1]
 
                 self.optimizer.zero_grad(set_to_none=True)
-
                 with autocast(enabled=True):
                     beta = get_beta(global_step, total_steps, strategy=self.strategy,
                                     warmup_epochs=self.warm_up, max_beta=self.max_beta)
@@ -172,7 +180,7 @@ class Trainer:
                     tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
 
                     # --- forward (policy decoder returns actions) ---
-                    recon_mu, joint_cmd, actions_seq, log_sigma, *aux = self.vae(
+                    recon_mu, joint_cmd, actions_seq, pre_mu_seq, log_std_seq, log_sigma, *aux = self.vae(
                         graph_x, self.edge_index, mask, self.obs_normalizer,
                         obs_seq=obs,
                         q=q,
@@ -180,36 +188,37 @@ class Trainer:
                         tf_ratio=tf_ratio,
                     )
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
-                    with torch.no_grad():
+                    with torch.no_grad():  # inference_mode would also work, but no_grad is perfectly fine here
                         reset_out = self.env.reset()
                         obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
-                        q0  = self.env.robot.get_dofs_position(self.env.motors_dof_idx)  # [B,d]
+                        q0 = self.env.robot.get_dofs_position(self.env.motors_dof_idx)  # [B,d]
                         dq0 = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)  # [B,d]
 
-                        obs0_n = self.obs_normalizer(obs0_raw.to(self.device))
+                        obs0_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
 
-                        obs_sim_n_seq, q_sim_seq, dq_sim_seq = [], [], []
+                        B = actions_seq.shape[0]
                         T = actions_seq.shape[1]
+                        d = q0.shape[-1]
+                        # Pre-allocate on device with correct dtypes
+                        obs_sim_n_seq = torch.empty(B, T, self.obs_dim, device=self.device, dtype=obs0_n.dtype)
+                        q_sim_seq = torch.empty(B, T, d, device=self.device, dtype=q0.dtype)
+                        dq_sim_seq = torch.empty(B, T, d, device=self.device, dtype=dq0.dtype)
 
                         for t in range(T):
-                            a_t = actions_seq[:, t, :].detach()  # do not backprop into policy via sim
+                            a_t = actions_seq[:, t, :].detach()
                             obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
-                            q_t  = self.env.robot.get_dofs_position(self.env.motors_dof_idx)
+                            q_t = self.env.robot.get_dofs_position(self.env.motors_dof_idx)
                             dq_t = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)
 
-                            obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device))
+                            obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
 
-                            obs_sim_n_seq.append(obs_t_n)
-                            q_sim_seq.append(q_t.to(self.device))
-                            dq_sim_seq.append(dq_t.to(self.device))
+                            # write into preallocated buffers
+                            obs_sim_n_seq[:, t].copy_(obs_t_n)
+                            q_sim_seq[:, t].copy_(q_t.to(self.device, non_blocking=True))
+                            dq_sim_seq[:, t].copy_(dq_t.to(self.device, non_blocking=True))
 
-                        obs_sim_n_seq = torch.stack(obs_sim_n_seq, dim=1)  # [B,T,obs_dim] (normalized)
-                        q_sim_seq     = torch.stack(q_sim_seq, dim=1)      # [B,T,d]
-                        dq_sim_seq    = torch.stack(dq_sim_seq, dim=1)     # [B,T,d]
-
-                        q0  = q0.to(self.device)
-                        dq0 = dq0.to(self.device)
-
+                        q0 = q0.to(self.device, non_blocking=True)
+                        dq0 = dq0.to(self.device, non_blocking=True)
                     # --------------- Surrogate rollout (inside the VAE) ---------------
                     sur_obs_seq, sur_q_seq, sur_dq_seq = self.vae.predict_dynamics(
                         actions_seq.detach(),    # [B,T,d] — only surrogate learns from sim loss
@@ -221,7 +230,10 @@ class Trainer:
 
                     # --- VAE loss (pose + action + KL) ---
                     loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
-                        recon_mu, log_sigma, graph_x, act, actions_seq, mask, *aux,
+                        recon_mu, log_sigma, graph_x,
+                        act, actions_seq,
+                        pre_mu_seq, log_std_seq,
+                        mask, *aux,
                         beta=beta,
                         lambda_kinematic=self.lambda_kinematic,
                         lambda_dynamic=self.lambda_dynamic
@@ -248,14 +260,17 @@ class Trainer:
                 self.scaler.update()
                 self.scheduler.step()
 
-                print(
-                    f"Batch {i + 1}/{len(dataloader)}, "
-                    f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
-                    f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss.item():.4f} "
-                    f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
-                    f"| Sim:{sim_loss.item():.4f} (q={q_loss.item():.4f}, dq={dq_loss.item():.4f}, obs={obs_loss.item():.4f}) "
-                    f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
-                )
+                log_every = 50
+
+                if (global_step % log_every == 0) or (i == len(dataloader) - 1):
+                    print(
+                        f"Batch {i + 1}/{len(dataloader)}, "
+                        f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
+                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss.item():.4f} "
+                        f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
+                        f"| Sim:{sim_loss.item():.4f} (q={q_loss.item():.4f}, dq={dq_loss.item():.4f}, obs={obs_loss.item():.4f}) "
+                        f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
+                    )
 
             os.makedirs(self.save_path, exist_ok=True)
             save_path = os.path.join(self.save_path, f"vae_checkpoint_epoch_{epoch + 1}.pth")

@@ -117,9 +117,9 @@ rl:
 dataset:
   num_envs: 16384
   #num_envs: 32768
-  episodes: 250000
-  max_episode_seconds: 2
-  frame_rate: 30
+  episodes: 500000
+  max_episode_seconds: 5
+  frame_rate: 50
 
   log_dir: "Pretrain/primitives/go2-walking"
   curiosity_beta: 0.1

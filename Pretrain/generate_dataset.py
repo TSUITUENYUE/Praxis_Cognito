@@ -19,7 +19,6 @@ class RunningMeanStd:
         self.var = torch.ones(shape, device=device)
         self.count = epsilon
         self.epsilon = epsilon
-
     def update(self, x):
         batch_mean = torch.mean(x, dim=0)
         batch_var = torch.var(x, dim=0, unbiased=False)
@@ -32,7 +31,6 @@ class RunningMeanStd:
         M2 = m_a + m_b + torch.square(delta) * self.count * batch_count / tot_count
         self.var = M2 / tot_count
         self.count = tot_count
-
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
 
@@ -55,7 +53,6 @@ class ICMModule(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim)
         )
-
     def forward(self, state, action, next_state):
         state_action = torch.cat([state, action], dim=-1)
         phi = self.encoder(state_action)
@@ -104,26 +101,22 @@ def generate(cfg: DictConfig):
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    primitives = os.path.join(log_dir, "model_199.pt")
+    runner.load(primitives)
     policy_alg = runner.alg
 
-    # ICM (curiosity) — separate normalization
+    # ICM (curiosity)
     icm = ICMModule(state_dim=env.num_obs, action_dim=env.num_actions, hidden_dim=POLICY_HIDDEN_DIM).to(gs.device)
     icm_optimizer = torch.optim.Adam(icm.parameters(), lr=1e-4)
 
-    # --- RMS for ICM (unchanged) ---
+    # RMS for ICM
     state_dim = env.num_obs
     action_dim = env.num_actions
     state_normalizer = RunningMeanStd((state_dim,), device=gs.device)
     action_normalizer = RunningMeanStd((action_dim,), device=gs.device)
     reward_normalizer = RunningMeanStd((1,), device=gs.device)
 
-    # ★ NEW: RMS for dedup features (global running stats)
     n_dofs = len(env.motors_dof_idx)
-    dedup_q_rms   = RunningMeanStd((n_dofs,), device=gs.device)         # joints
-    dedup_dq_rms  = RunningMeanStd((n_dofs,), device=gs.device)         # joint velocities
-    dedup_ball_rms    = RunningMeanStd((3,), device=gs.device)          # ball pos
-    dedup_ballv_rms   = RunningMeanStd((3,), device=gs.device)          # ball vel
-
     input_dim = env.num_obs
     output_dim = env.num_actions
     max_episode_len = int(MAX_EPISODE_SECONDS * FRAME_RATE)
@@ -134,12 +127,10 @@ def generate(cfg: DictConfig):
     obs_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, env.num_obs), device=gs.device)
     act_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, env.num_actions), device=gs.device)
     dof_vel_traj_buffer = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
-    # ★ NEW: track dones so we can mask after first reset per env
     done_traj_buffer    = torch.zeros((max_episode_len, NUM_ENVS), dtype=torch.bool, device=gs.device)
 
-    embedding_dim = (max_episode_len // DOWNSAMPLE_FACTOR) * (
-        n_dofs + n_dofs + 3 + 3   # q, dq, ball pos, ball vel
-    )
+    # >>> DEDUP EMBEDDING BACK TO JOINTS-ONLY <<<
+    embedding_dim = (max_episode_len // DOWNSAMPLE_FACTOR) * n_dofs
     res = faiss.StandardGpuResources()
     faiss_index = faiss.GpuIndexFlatIP(res, embedding_dim)
 
@@ -148,7 +139,7 @@ def generate(cfg: DictConfig):
     icm_loss = torch.tensor(0.0)
     agent_save_buffer, obj_save_buffer = [], []
     obs_save_buffer, act_save_buffer, vel_save_buffer = [], [], []
-    valid_len_save_buffer = []  # ★ NEW
+    valid_len_save_buffer = []
 
     print(f"Starting curiosity-driven data generation. Target: {EPISODES_TO_COLLECT} episodes.")
 
@@ -163,7 +154,6 @@ def generate(cfg: DictConfig):
     critic_obs = extras['observations'].get("critic", obs)
     obs_n        = runner.obs_normalizer(obs)
     critic_obs_n = runner.critic_obs_normalizer(critic_obs)
-
 
     # Save normalizers for downstream reuse
     norm_state_path = os.path.join(path, "normalizers.pt")
@@ -189,7 +179,6 @@ def generate(cfg: DictConfig):
         dof_vel_ds = f.create_dataset('dof_vel',
                                       shape=(EPISODES_TO_COLLECT, max_episode_len, n_dofs),
                                       dtype='float32', compression="gzip")
-        # ★ NEW: store per-clip valid lengths
         valid_len_ds = f.create_dataset('valid_length',
                                         shape=(EPISODES_TO_COLLECT,), dtype='int32', compression="gzip")
 
@@ -203,8 +192,8 @@ def generate(cfg: DictConfig):
             meta.attrs['action_scale'] = float(act_scale)
         meta.create_dataset('default_dof_pos', data=np.asarray(env.default_dof_pos.cpu(), dtype=np.float32))
         meta.attrs['normalizer_pt'] = os.path.abspath(norm_state_path)
-        meta.attrs['faiss_threshold'] = float(SIMILARITY_THRESHOLD)  # ★ NEW
-        meta.attrs['downsample_factor'] = int(DOWNSAMPLE_FACTOR)     # ★ NEW
+        meta.attrs['faiss_threshold'] = float(SIMILARITY_THRESHOLD)
+        meta.attrs['downsample_factor'] = int(DOWNSAMPLE_FACTOR)
 
         episodes_since_last_save = 0
         while total_episodes_saved < EPISODES_TO_COLLECT:
@@ -213,29 +202,28 @@ def generate(cfg: DictConfig):
             action_mean = 0.0
             action_std = 0.0
 
-            # A) Collect a full fixed-length clip per env
-            first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)  # ★ NEW
+            first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)
             for t in range(max_episode_len):
-                # log obs_t (store raw)
+                # store raw obs
                 obs_traj_buffer[t] = obs
 
-                # act with *normalized* obs like OnPolicyRunner
+                # act with normalized obs like training
                 actions = policy_alg.act(obs_n, critic_obs_n)
                 act_traj_buffer[t] = actions
 
-                # step env to t+1
+                # env step
                 next_obs, rews, dones, infos = env.step(actions)
                 done_traj_buffer[t] = (dones.squeeze(-1) > 0) if dones.ndim == 2 else (dones > 0)
 
-                # update dedup RMS from kinematics and ball (global stats) ★ NEW
+                # record kinematics AFTER step
                 q_now  = env.robot.get_dofs_position(env.motors_dof_idx)
                 dq_now = env.robot.get_dofs_velocity(env.motors_dof_idx)
-                ball_now = env.ball.get_pos()
-                dedup_q_rms.update(q_now)
-                dedup_dq_rms.update(dq_now)
-                dedup_ball_rms.update(ball_now)
+                agent_traj_buffer[t]   = q_now
+                dof_vel_traj_buffer[t] = dq_now
+                if hasattr(env, "ball"):
+                    obj_traj_buffer[t] = env.ball.get_pos()
 
-                # curiosity plumbing (ICM uses its own RMS)
+                # curiosity plumbing
                 state_normalizer.update(obs)
                 action_normalizer.update(actions)
                 state_normalizer.update(next_obs)
@@ -250,30 +238,21 @@ def generate(cfg: DictConfig):
                 intrinsic_reward /= torch.sqrt(reward_normalizer.var + reward_normalizer.epsilon)
                 total_reward = rews + intrinsic_reward * CURIOSITY_BETA
 
-                # PPO storage update
+                # PPO store & update cadence
                 policy_alg.process_env_step(total_reward, dones, infos)
 
-                # record kinematics AFTER step (post a_t)
-                agent_traj_buffer[t]   = q_now
-                dof_vel_traj_buffer[t] = dq_now
-                obj_traj_buffer[t]     = ball_now
-
-                # advance raw obs + compute normalized obs for next action using runner's normalizers
+                # advance obs and recompute normalized views
                 obs = next_obs
-                if "observations" in infos and "critic" in infos["observations"]:
-                    critic_obs = infos["observations"]["critic"]
-                else:
-                    critic_obs = obs
+                critic_obs = infos["observations"]["critic"] if ("observations" in infos and "critic" in infos["observations"]) else obs
                 obs_n        = runner.obs_normalizer(obs)
                 critic_obs_n = runner.critic_obs_normalizer(critic_obs)
 
-                # record first done index per env (to mask later) ★ NEW
+                # first done per env
                 freshly_done = (done_traj_buffer[t] & (first_done_seen == max_episode_len))
                 if freshly_done.any():
                     idxs = torch.nonzero(freshly_done, as_tuple=False).squeeze(-1)
-                    first_done_seen[idxs] = t + 1  # valid length is up to and including this step
+                    first_done_seen[idxs] = t + 1  # inclusive
 
-                # PPO update cadence
                 if policy_alg.storage.step >= runner.num_steps_per_env:
                     num_transitions = policy_alg.storage.step
                     if num_transitions > 1:
@@ -294,33 +273,30 @@ def generate(cfg: DictConfig):
                         icm_loss.backward()
                         icm_optimizer.step()
 
-                    policy_alg.compute_returns(critic_obs_n)  # ★ CHANGED: use critic obs (normalized)
+                    policy_alg.compute_returns(critic_obs_n)
                     mean_value_loss, mean_surrogate_loss, _, _, _ = policy_alg.update()
 
             action_mean = torch.mean(actions).item()
             action_std  = torch.std(actions).item()
 
-            # B) Move to CPU + build dedup embeddings
+            # ---- Build dedup embeddings (JOINTS ONLY, NO Z-SCORE) ----
             agent_np = agent_traj_buffer.cpu().numpy()    # [T, E, DoF]
             obj_np   = obj_traj_buffer.cpu().numpy()      # [T, E, 3]
             obs_np   = obs_traj_buffer.cpu().numpy()
             act_np   = act_traj_buffer.cpu().numpy()
-            vel_np   = dof_vel_traj_buffer.cpu().numpy()  # [T, E, DoF]
-            done_np  = done_traj_buffer.cpu().numpy()     # [T, E]
-            # valid length per env clip = first done if seen, else max len
+            vel_np   = dof_vel_traj_buffer.cpu().numpy()
             valid_len_np = np.where(first_done_seen.cpu().numpy() == max_episode_len,
                                     max_episode_len,
                                     first_done_seen.cpu().numpy())
 
-            # transpose to [E, T, ...]
+            # [E, T, ...]
             agent_batch = np.transpose(agent_np, (1, 0, 2))
             obj_batch   = np.transpose(obj_np,   (1, 0, 2))
             obs_batch   = np.transpose(obs_np,   (1, 0, 2))
             act_batch   = np.transpose(act_np,   (1, 0, 2))
             vel_batch   = np.transpose(vel_np,   (1, 0, 2))
-            done_batch  = np.transpose(done_np,  (1, 0))    # [E, T]
 
-            # ★ NEW: mask frames after first reset per env to avoid mixing clips
+            # zero invalid tail (matches written data)
             for e in range(NUM_ENVS):
                 L = valid_len_np[e]
                 if L < max_episode_len:
@@ -330,48 +306,16 @@ def generate(cfg: DictConfig):
                     obs_batch[e,   L:] = 0.0
                     act_batch[e,   L:] = 0.0
 
-            # ★ NEW: compute ball velocity (central difference with padding)
-            ball_vel_batch = np.zeros_like(obj_batch)
-            ball_vel_batch[:, 1:-1, :] = 0.5 * (obj_batch[:, 2:, :] - obj_batch[:, :-2, :])
-            ball_vel_batch[:, 0,   :] = (obj_batch[:, 1,  :] - obj_batch[:, 0,  :])
-            ball_vel_batch[:, -1,  :] = (obj_batch[:, -1, :] - obj_batch[:, -2, :])
+            # Downsample joints ONLY for dedup
+            agent_dsmp = agent_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, DoF]
 
-            # Downsample all streams on time axis
-            agent_dsmp   = agent_batch[:, ::DOWNSAMPLE_FACTOR, :]     # [E, Td, DoF]
-            vel_dsmp     = vel_batch[:,   ::DOWNSAMPLE_FACTOR, :]
-            ball_dsmp    = obj_batch[:,   ::DOWNSAMPLE_FACTOR, :]     # [E, Td, 3]
-            ballv_dsmp   = ball_vel_batch[:, ::DOWNSAMPLE_FACTOR, :]
+            new_embeddings = agent_dsmp.reshape(NUM_ENVS, -1).astype(np.float32)
+            faiss.normalize_L2(new_embeddings)  # cosine via IP
 
-            # ★ NEW: z-score per feature using global RMS from GPU
-            q_mean  = dedup_q_rms.mean.cpu().numpy()
-            q_std   = np.sqrt(dedup_q_rms.var.cpu().numpy() + 1e-6)
-            dq_mean = dedup_dq_rms.mean.cpu().numpy()
-            dq_std  = np.sqrt(dedup_dq_rms.var.cpu().numpy() + 1e-6)
-            b_mean  = dedup_ball_rms.mean.cpu().numpy()
-            b_std   = np.sqrt(dedup_ball_rms.var.cpu().numpy() + 1e-6)
-            bv_mean = dedup_ballv_rms.mean.cpu().numpy()
-            bv_std  = np.sqrt(dedup_ballv_rms.var.cpu().numpy() + 1e-6)
-
-            agent_z = (agent_dsmp - q_mean) / q_std
-            vel_z   = (vel_dsmp   - dq_mean) / dq_std
-            ball_z  = (ball_dsmp  - b_mean) / b_std
-            ballv_z = (ballv_dsmp - bv_mean) / bv_std
-
-            # Flatten to embeddings and L2-normalize → cosine similarity under IndexFlatIP
-            emb_parts = [
-                agent_z.reshape(NUM_ENVS, -1),
-                vel_z.reshape(NUM_ENVS,   -1),
-                ball_z.reshape(NUM_ENVS,  -1),
-                ballv_z.reshape(NUM_ENVS, -1)
-            ]
-            new_embeddings = np.concatenate(emb_parts, axis=1).astype(np.float32)
-            faiss.normalize_L2(new_embeddings)
-
-            # FAISS dedup: keep if max cosine similarity < τ
             if faiss_index.ntotal == 0:
                 unique_indices = np.arange(len(new_embeddings))
             else:
-                D, I = faiss_index.search(x=new_embeddings, k=1)  # D: cosine similarity in [-1,1]
+                D, I = faiss_index.search(x=new_embeddings, k=1)
                 is_unique_mask = D[:, 0] < SIMILARITY_THRESHOLD
                 unique_indices = np.where(is_unique_mask)[0]
 
@@ -381,7 +325,7 @@ def generate(cfg: DictConfig):
                 obs_save_buffer.append(obs_batch[unique_indices])
                 act_save_buffer.append(act_batch[unique_indices])
                 vel_save_buffer.append(vel_batch[unique_indices])
-                valid_len_save_buffer.append(valid_len_np[unique_indices])  # ★ NEW
+                valid_len_save_buffer.append(valid_len_np[unique_indices])
                 faiss_index.add(x=new_embeddings[unique_indices])
                 episodes_since_last_save += len(unique_indices)
 
@@ -406,12 +350,12 @@ def generate(cfg: DictConfig):
                         obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
                         actions_ds[start_idx:end_idx] = act_block[:num_to_write]
                         dof_vel_ds[start_idx:end_idx] = vel_block[:num_to_write]
-                        valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]  # ★ NEW
+                        valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
                         total_episodes_saved = end_idx
 
                     agent_save_buffer, obj_save_buffer = [], []
                     obs_save_buffer, act_save_buffer, vel_save_buffer = [], [], []
-                    valid_len_save_buffer = []  # ★ NEW
+                    valid_len_save_buffer = []
                     episodes_since_last_save = 0
 
             print(f"  ...Collected: {total_episodes_saved}/{EPISODES_TO_COLLECT} | PPO Loss: {mean_surrogate_loss:.3f} "
@@ -438,7 +382,7 @@ def generate(cfg: DictConfig):
                 obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
                 actions_ds[start_idx:end_idx] = act_block[:num_to_write]
                 dof_vel_ds[start_idx:end_idx] = vel_block[:num_to_write]
-                valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]  # ★ NEW
+                valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
                 total_episodes_saved = end_idx
 
     end_time = time.time()

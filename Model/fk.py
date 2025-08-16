@@ -142,6 +142,11 @@ class FKModel(nn.Module):
         self.order_Torigin = torch.stack(self.order_Torigin, dim=0).to(torch.float32)  # [E,4,4]
 
         self.E = len(order)
+        self.num_links = len(self.link_names)
+        # positions are emitted in link_names order; caching avoids per-call .index
+        self._pos_link_indices_py = list(range(self.num_links))
+        self.register_buffer("order_axes_buf", self.order_axes)
+        self.register_buffer("order_Torigin_buf", self.order_Torigin)
 
     def parse_urdf_file(self, filename):
         tree = ET.parse(filename)
@@ -171,38 +176,56 @@ class FKModel(nn.Module):
                                     'xyz': xyz, 'rpy': rpy, 'axis': axis}
 
     def forward(self, joint_angles: torch.Tensor):
-        with autocast(False):
+        with autocast(False):  # keep numerics identical
             if joint_angles.dim() == 1:
                 joint_angles = joint_angles.unsqueeze(0)
-            q = joint_angles.to(dtype=torch.float32, device=self.device)  # [B, DoF]
+
+            dev = self.eye_4.device  # stick to module's device for safety
+            q = joint_angles.to(dtype=torch.float32, device=dev)  # [B, DoF]
             B = q.shape[0]
 
-            # world transforms for each link
-            T_links = self.eye_4.unsqueeze(0).expand(B, -1, -1).clone()  # [B,4,4] for 'base'
-            # store per-link as a list to avoid dict overhead in the loop
-            link_T = [T_links.clone() if i == 0 else self.eye_4.unsqueeze(0).expand(B, -1, -1).clone()
-                      for i in range(len(self.link_names))]
+            # --- allocate all link transforms at once: [B, L, 4, 4], fill with identity
+            link_T_all = self.eye_4.view(1, 1, 4, 4).expand(B, self.num_links, 4, 4).clone()
+
+            # scratch buffer for a joint transform (reused every edge)
+            T_joint_buf = self.eye_4.view(1, 4, 4).expand(B, 4, 4).clone()
+
+            # choose constant source (buffer if registered; else tensors)
+            order_axes = getattr(self, "order_axes_buf", self.order_axes)  # [E,3]
+            order_Torig = getattr(self, "order_Torigin_buf", self.order_Torigin)  # [E,4,4]
 
             for e in range(self.E):
-                p = self.order_parent_idx_py[e]
-                c = self.order_child_idx_py[e]
+                p_idx = self.order_parent_idx_py[e]  # python int
+                c_idx = self.order_child_idx_py[e]
 
-                T_origin = self.order_Torigin[e].unsqueeze(0).expand(B, -1, -1)  # [B,4,4]
+                # parent world transform
+                T_p = link_T_all[:, p_idx, :, :]  # [B,4,4]
+
+                # constant origin transform for this joint
+                T_origin_b = order_Torig[e].unsqueeze(0).expand(B, 4, 4)  # [B,4,4]
 
                 if self.order_is_rev_py[e]:
-                    idx = self.order_dof_idx_py[e]  # python int
-                    angle = q[:, idx]  # [B]
-                    axis = self.order_axes[e].unsqueeze(0).expand(B, -1)  # [B,3]
+                    # joint rotation (Rodrigues) and full 4x4 transform
+                    dof_idx = self.order_dof_idx_py[e]  # python int
+                    angle = q[:, dof_idx]  # [B]
+                    axis = order_axes[e].unsqueeze(0).expand(B, 3)  # [B,3]
                     Rj = rotmat_axis_angle_stable(axis * angle.unsqueeze(1))  # [B,3,3]
-                    T_joint = self.eye_4.unsqueeze(0).expand(B, -1, -1).clone()
-                    T_joint[:, :3, :3] = Rj
+
+                    # reset scratch to identity and insert rotation in-place
+                    T_joint_buf.copy_(self.eye_4)  # [B,4,4] all identity
+                    T_joint_buf[:, :3, :3] = Rj
+
+                    # T_child = T_p @ T_origin @ T_joint
+                    T_pc = torch.bmm(T_p, T_origin_b)  # [B,4,4]
+                    T_child = torch.bmm(T_pc, T_joint_buf)
                 else:
-                    T_joint = self.eye_4.unsqueeze(0).expand(B, -1, -1)
+                    # fixed/prismatic treated as identity joint here => only origin transform
+                    T_child = torch.bmm(T_p, T_origin_b)  # [B,4,4]
 
-                T_child = link_T[p].matmul(T_origin).matmul(T_joint)
-                link_T[c] = T_child
+                # write back
+                link_T_all[:, c_idx, :, :] = T_child
 
-            # collect positions
-            pos_list = [link_T[self.link_names.index(ln)][:, :3, 3] for ln in self.link_names]
-            positions = torch.cat(pos_list, dim=1)  # [B, 3*links]
+            # positions in link_names order
+            positions = link_T_all[:, :, :3, 3].reshape(B, 3 * self.num_links)  # [B, 3*links]
             return positions
+
