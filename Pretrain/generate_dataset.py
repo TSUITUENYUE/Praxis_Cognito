@@ -85,9 +85,8 @@ def generate(cfg: DictConfig):
     log_dir = cfg.dataset.log_dir
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"{log_dir}/cfgs.pkl", "rb"))
 
-    original_entropy = train_cfg['algorithm'].get('entropy_coef', 0.0)
+    # original_entropy = train_cfg['algorithm'].get('entropy_coef', 0.0)
     train_cfg['algorithm']['entropy_coef'] = 0.02
-    print(f"Updated entropy coefficient from {original_entropy} to {train_cfg['algorithm']['entropy_coef']} to encourage exploration.")
 
     gs.init(logging_level='warning')
 

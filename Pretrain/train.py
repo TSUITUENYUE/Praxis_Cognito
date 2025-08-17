@@ -43,7 +43,11 @@ class Trainer:
         self.max_episode_len = self.max_episode_seconds * self.frame_rate
 
         # model & geometry
-        self.vae = torch.compile(model.to(self.device),mode="reduce-overhead")
+        #self.vae = torch.compile(model.to(self.device),mode="reduce-overhead")
+        self.vae = model.to(self.device)
+        #self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
+        #self.vae.decoder = torch.compile(self.vae.decoder,mode="reduce-overhead")
+        #self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
@@ -177,6 +181,7 @@ class Trainer:
                                     warmup_epochs=self.warm_up, max_beta=self.max_beta)
 
                     # teacher forcing ratio: decay to 0 by midway
+
                     tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
 
                     # --- forward (policy decoder returns actions) ---
@@ -248,8 +253,8 @@ class Trainer:
                     total_loss = loss + self.lambda_sim * sim_loss
 
                     # --- diag: unnormalized recon MSE in world units ---
-                    unnormalized_recon_mu = _denorm_positions(recon_mu, self.dataset.pos_mean, self.dataset.pos_std)
-                    unnormalized_graph_x  = _denorm_positions(graph_x.reshape(recon_mu.shape), self.dataset.pos_mean, self.dataset.pos_std)
+                    unnormalized_recon_mu = _denorm_positions(recon_mu, self.pos_mean_d, self.pos_std_d)
+                    unnormalized_graph_x  = _denorm_positions(graph_x.reshape(recon_mu.shape), self.pos_mean_d, self.pos_std_d)
                     unnormalized_loss = self.masked_mse(unnormalized_recon_mu, unnormalized_graph_x, mask)
 
                 # Backprop THROUGH total_loss so surrogate learns from sim_loss
@@ -260,7 +265,7 @@ class Trainer:
                 self.scaler.update()
                 self.scheduler.step()
 
-                log_every = 50
+                log_every = 2
 
                 if (global_step % log_every == 0) or (i == len(dataloader) - 1):
                     print(
