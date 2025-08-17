@@ -226,7 +226,7 @@ class IntentionVAE(nn.Module):
             mask_t = mask[:, t, :]  # [B,1]
             obs_tf_n = obs_tf_n_all[:, t, :]  # [B,obs_dim]
 
-            # Teacher forcing gate
+            # Teacher forcing gat
             if self.training and (q is not None):
                 tf_gate = (torch.rand(B, 1, device=dev) < tf_ratio).float()
                 q_in = tf_gate * (q[:, t - 1, :] if t > 0 else self.decoder.default_dof_pos.unsqueeze(0)) \
