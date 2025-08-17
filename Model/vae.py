@@ -7,17 +7,6 @@ from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder
 from .sd import SurrogateDynamics
 
-import torch._dynamo as dynamo
-
-@dynamo.disable
-def _store_col(dst, t, src):
-    # identical effect to: dst[:, t].copy_(src)
-    dst[:, t].copy_(src)
-
-@dynamo.disable
-def _clamp_to_limits(x, lo, hi):
-    # identical numerics to clamp_ but out-of-place & eager
-    return torch.clamp(x, lo, hi)
 
 class IntentionVAE(nn.Module):
     def __init__(
@@ -79,7 +68,6 @@ class IntentionVAE(nn.Module):
             dt=self.dt,
         )
 
-
     # ---------- Latent sampling ----------
     @staticmethod
     def reparameterize_gaussian(mu, logvar):
@@ -111,7 +99,6 @@ class IntentionVAE(nn.Module):
         x, mu, log_sigma: [B,T,D] in same (normalized) space.
         Returns per-step NLL averaged over features: [B,T].
         """
-        # per-element NLL
         inv_var = torch.exp(-2.0 * log_sigma)     # 1/σ^2
         elem = 0.5 * ((x - mu) ** 2) * inv_var + log_sigma + 0.5 * math.log(2 * math.pi)  # [B,T,D]
         return elem.mean(dim=-1)  # [B,T]
@@ -124,11 +111,8 @@ class IntentionVAE(nn.Module):
         q_lower = self.decoder.joint_lower.to(dev)
         q_upper = self.decoder.joint_upper.to(dev)
 
-        # Preallocate outputs
-
-        sur_obs_seq = torch.empty(B, T, self.surrogate.obs_dim, device=dev, dtype=obs0.dtype)
-        sur_q_seq = torch.empty(B, T, d, device=dev, dtype=q0.dtype)
-        sur_dq_seq = torch.empty(B, T, d, device=dev, dtype=dq0.dtype)
+        # Collect per-step outputs (avoid in-place writes)
+        obs_list, q_list, dq_list = [], [], []
 
         # Current state (already on GPU)
         q_t = q0.to(dev, non_blocking=True)
@@ -140,20 +124,21 @@ class IntentionVAE(nn.Module):
             a_t = actions_seq[:, t, :]
 
             q_pred, dq_pred, obs_pred = self.surrogate(q_t, dq_t, obs_t, a_t)
-            q_pred = _clamp_to_limits(q_pred, q_lower, q_upper)
+            q_pred = torch.clamp(q_pred, q_lower, q_upper)
 
             # Freeze beyond padding (no drift on padded frames)
             q_t = mask_t * q_pred + (1.0 - mask_t) * q_t
             dq_t = mask_t * dq_pred + (1.0 - mask_t) * dq_t
             obs_t = mask_t * obs_pred + (1.0 - mask_t) * obs_t
 
-            # write outputs
+            # collect outputs
+            q_list.append(q_t)
+            dq_list.append(dq_t)
+            obs_list.append(obs_t)
 
-            # sur_q_seq[:, t].copy_(q_t)  etc.
-            _store_col(sur_q_seq, t, q_t)
-            _store_col(sur_dq_seq, t, dq_t)
-            _store_col(sur_obs_seq, t, obs_t)
-
+        sur_obs_seq = torch.stack(obs_list, dim=1)
+        sur_q_seq   = torch.stack(q_list,  dim=1)
+        sur_dq_seq  = torch.stack(dq_list, dim=1)
         return sur_obs_seq, sur_q_seq, sur_dq_seq
 
     # ---------- Forward ----------
@@ -195,13 +180,9 @@ class IntentionVAE(nn.Module):
         # Pre-normalize teacher observations ONCE (used for the action distribution head)
         obs_tf_n_all = normalizer(obs_seq)  # [B,T,obs_dim]
 
-        # Preallocate output tensors (match your original dtypes/shapes)
-        pre_mu_seq  = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
-        log_std_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
-        actions_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
-        joints_seq  = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
-        objects_seq = torch.empty(B, T, self.object_dim, device=dev, dtype=obs_seq.dtype)
-        logsig_seq  = torch.empty(B, T, (self.agent.fk_model.num_links + 1) * 3, device=dev, dtype=obs_seq.dtype)
+        # Collect per-step outputs (avoid in-place writes)
+        pre_mu_list, log_std_list, action_list = [], [], []
+        joint_list,  object_list,  logsig_list = [], [], []
 
         # Running state: start at default q, zero dq, and obs from first frame (or zeros)
         q_prev = self.decoder.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B,d]
@@ -216,17 +197,15 @@ class IntentionVAE(nn.Module):
             q_tf_prev = torch.cat([q0.unsqueeze(1), q[:, :-1, :]], dim=1)  # [B,T,d]
             dq_tf_prev = torch.cat([dq0.unsqueeze(1), dq[:, :-1, :]], dim=1)  # [B,T,d]
         else:
-            # NOTE: your original else-branch referenced joints_seq before it's defined.
-            # To keep behavior unchanged and avoid a runtime error, we keep the same structure
-            # but initialize a zero baseline here (only used when q is None).
+            # zero baseline if no teacher sequence provided
             q_tf_prev = torch.zeros(B, T, self.joint_dim, device=dev, dtype=obs_seq.dtype)
             dq_tf_prev = torch.zeros_like(q_tf_prev)
 
         for t in range(T):
-            mask_t = mask[:, t, :]  # [B,1]
-            obs_tf_n = obs_tf_n_all[:, t, :]  # [B,obs_dim]
+            mask_t = mask[:, t, :]                 # [B,1]
+            obs_tf_n = obs_tf_n_all[:, t, :]       # [B,obs_dim]
 
-            # Teacher forcing gat
+            # Teacher forcing gate
             if self.training and (q is not None):
                 tf_gate = (torch.rand(B, 1, device=dev) < tf_ratio).float()
                 q_in = tf_gate * (q[:, t - 1, :] if t > 0 else self.decoder.default_dof_pos.unsqueeze(0)) \
@@ -243,12 +222,12 @@ class IntentionVAE(nn.Module):
 
             # Surrogate dynamics step
             q_pred, dq_pred, obs_pred = self.surrogate(q_in, dq_in, obs_state, action_t)
-            q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
+            q_pred = torch.clamp(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
             # Freeze beyond padding
-            q_new = mask_t * q_pred + (1.0 - mask_t) * q_prev
+            q_new  = mask_t * q_pred + (1.0 - mask_t) * q_prev
             dq_new = mask_t * dq_pred + (1.0 - mask_t) * dq_prev
-            obs_new = mask_t * obs_pred + (1.0 - mask_t) * obs_state
+            obs_new= mask_t * obs_pred + (1.0 - mask_t) * obs_state
 
             # Action distribution (teacher-conditional)
             mean_t, log_std_t = self.decoder.action_distribution(
@@ -256,21 +235,28 @@ class IntentionVAE(nn.Module):
             )
 
             # Store step outputs
-            _store_col(pre_mu_seq, t, mean_t)
-            _store_col(log_std_seq, t, log_std_t)
-            _store_col(actions_seq, t, mask_t * action_t)
-            _store_col(joints_seq, t, q_new)
-            _store_col(objects_seq, t, mask_t * obj_t)
-            _store_col(logsig_seq, t, log_sig_t)
+            pre_mu_list.append(mean_t)
+            log_std_list.append(log_std_t)
+            action_list.append(mask_t * action_t)
+            joint_list.append(q_new)
+            object_list.append(mask_t * obj_t)
+            logsig_list.append(log_sig_t)
+
             # Advance
             q_prev, dq_prev, obs_state = q_new, dq_new, obs_new
 
-
         # ----- FK + normalization → recon_mu -----
+        pre_mu_seq  = torch.stack(pre_mu_list, dim=1)
+        log_std_seq = torch.stack(log_std_list, dim=1)
+        actions_seq = torch.stack(action_list, dim=1)
+        joints_seq  = torch.stack(joint_list,  dim=1)
+        objects_seq = torch.stack(object_list, dim=1)
+        logsig_seq  = torch.stack(logsig_list, dim=1)
+
         B, T, d = joints_seq.shape
-        joint_flat = joints_seq.reshape(B * T, d)  # keep dtype from seq (AMP-friendly)
-        pos_flat = self.decoder.fk_model(joint_flat)  # [B*T, links*3]
-        agent_traj = pos_flat.view(B, T, -1)  # [B,T, links*3]
+        joint_flat = joints_seq.reshape(B * T, d)          # keep dtype from seq (AMP-friendly)
+        pos_flat = self.decoder.fk_model(joint_flat)       # [B*T, links*3]
+        agent_traj = pos_flat.view(B, T, -1)               # [B,T, links*3]
         combined = torch.cat([agent_traj, objects_seq], dim=-1)  # [B,T,(links+1)*3]
         comb_resh = combined.view(B, T, -1, 3)
 
@@ -299,66 +285,50 @@ class IntentionVAE(nn.Module):
         lambda_kinematic: float = 1.0,
         lambda_dynamic: float = 0.2,
     ):
-        """
-        Masked sequence loss:
-          - Pose: MSE (default) or heteroscedastic NLL per-step, masked and normalized.
-          - Action: MSE per-step, masked and normalized, scaled by lambda_action.
-          - KL: per-sequence.
-        """
         # Ensure shapes
         B, T, D = recon_mu.shape
-        mask_bt = mask.squeeze(-1)                         # [B,T], float in {0,1}
-        valid = mask_bt.sum().clamp_min(1.0)               # scalar count of valid steps (across batch)
-        orig_traj=orig_traj.view(B,T,-1)
-        # -------- Pose reconstruction --------
-        #pose_step = self.hetero_nll_per_step(orig_traj, recon_mu, log_sigma)
-        # Per-step MSE averaged over feature dim: [B,T]
-        # pose loss
+        mask_bt = mask.squeeze(-1)                         # [B,T]
+        valid = mask_bt.sum().clamp_min(1.0)               # scalar count of valid steps
+        orig_traj = orig_traj.view(B, T, -1)
+
+        # Pose reconstruction (MSE)
         pose_step = ((recon_mu - orig_traj) ** 2).mean(dim=-1)  # [B,T]
-        pose_loss = (pose_step.mul(mask_bt)).sum().div(valid)  # fuse multiplications, no new tensors
+        pose_loss = (pose_step.mul(mask_bt)).sum().div(valid)
         pose_loss = lambda_kinematic * pose_loss
 
+        # Action loss (as in your current code)
         def atanh_clamped(a, eps=1e-6):
             a = torch.clamp(a, -1.0 + eps, 1.0 - eps)
             return 0.5 * (torch.log1p(a) - torch.log1p(-a))
 
-        # action NLL (factor out constant once)
         LOG_2PI = math.log(2.0 * math.pi)
 
         def _normal_nll(a, mean, log_std):
-            # a, mean, log_std: [B,T,d] in pre-tanh space
             return 0.5 * (((a - mean) ** 2) * torch.exp(-2.0 * log_std) + 2.0 * log_std + math.log(2 * math.pi))
 
-        #nll_step = _normal_nll(act_mu, pre_mu_seq, log_std_seq).sum(dim=-1)  # [B,T]
-        #action_loss = (nll_step.mul(mask_bt)).sum().div(valid)
-
-
-        act_step = ((action_seq - act_mu) ** 2).mean(dim=-1)
-        action_loss = (act_step * mask.squeeze(-1)).sum() / valid
-
+        # Your current (squashed-space) supervision:
+        act_step = ((action_seq - torch.tanh(act_mu)) ** 2).mean(dim=-1)
+        action_loss = (act_step * mask.squeeze(-1)).sum().div(valid)
         action_loss = lambda_dynamic * action_loss
+
         total_recon = pose_loss + action_loss
 
-        # -------- KL (per prior) --------
+        # KL
         if self.prior == "GMM":
             mu, logvar, pi_logits = args
-            # mu/logvar: [B,K,D], prior_mu/logvar: [K,D]
             Bk, K, Dk = mu.shape
             pi = F.softmax(pi_logits, dim=-1)  # [B,K]
 
             prior_mu = self.prior_mu.unsqueeze(0).expand(Bk, -1, -1)         # [B,K,D]
             prior_logv = self.prior_logvar.unsqueeze(0).expand(Bk, -1, -1)   # [B,K,D]
 
-            # KL of Gaussians q(z|x,c) || p(z|c), diagonal
-            # 0.5 * [ log|Σ_p| - log|Σ_q| - D + tr(Σ_p^{-1} Σ_q) + (μ_q-μ_p)^T Σ_p^{-1} (μ_q-μ_p) ]
             kl_gauss = 0.5 * torch.sum(
                 prior_logv - logvar - 1.0
                 + (logvar - prior_logv).exp()
                 + (mu - prior_mu).pow(2) / prior_logv.exp(),
-                dim=-1,  # over D
+                dim=-1,
             )  # [B,K]
 
-            # Categorical KL: q(c|x) || p(c) with uniform prior
             log_q = torch.log(pi + 1e-10)
             log_p = math.log(1.0 / K)
             kl_cat = torch.sum(pi * (log_q - log_p), dim=-1)  # [B]

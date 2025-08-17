@@ -157,5 +157,5 @@ class ImitationModule:
             robot.set_dofs_position(seq[t], dofs_idx_local=dof_indices)
             scene.step()
             cam.render()
-        cam.stop_recording(save_to_filename=save_path, fps=30)
+        cam.stop_recording(save_to_filename=save_path, fps=25)
         print(f"Saved sim video to: {save_path}")

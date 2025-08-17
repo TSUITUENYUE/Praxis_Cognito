@@ -99,11 +99,12 @@ class TrajectoryDataset(Dataset):
 
         # ---- Pass 2: write processed ----
         with h5py.File(self.source_path, 'r') as f_in, h5py.File(self.processed_path, 'w') as f_out:
-            agent_trajs = f_in['agent_trajectories']
-            obj_trajs   = f_in['obj_trajectories']
-            obs_dset    = f_in['obs']
-            act_dset    = f_in['actions']
-            joint_vel   = f_in['dof_vel']
+            agent_trajs   = f_in['agent_trajectories']
+            obj_trajs     = f_in['obj_trajectories']
+            obs_dset      = f_in['obs']
+            act_mean_dset = f_in['action_means']
+            act_std_dset  = f_in['action_stds']
+            joint_vel     = f_in['dof_vel']
             # ★ NEW: valid_length may or may not be present
             has_vlen    = 'valid_length' in f_in
             valid_len_src = f_in['valid_length'][:] if has_vlen else None
@@ -117,7 +118,8 @@ class TrajectoryDataset(Dataset):
             f_out.create_dataset('joint_trajs',  (N, T, self.n_dofs),  dtype='f4')
             f_out.create_dataset('obs',          (N, T, obs_dim),      dtype='f4')
             f_out.create_dataset('joint_vels',   (N, T, self.n_dofs),  dtype='f4')
-            f_out.create_dataset('act',          (N, T, self.n_dofs),  dtype='f4')
+            f_out.create_dataset('act_mean',     (N, T, self.n_dofs),  dtype='f4')
+            f_out.create_dataset('act_std',      (N, T, self.n_dofs),  dtype='f4')
             f_out.create_dataset('mask',         (N, T, 1),            dtype='f4')
             f_out.create_dataset('pos_mean', data=pos_mean.cpu().numpy())
             f_out.create_dataset('pos_std',  data=pos_std.cpu().numpy())
@@ -146,11 +148,11 @@ class TrajectoryDataset(Dataset):
                 graph_x = (graph_x - pos_mean) / pos_std
 
                 # raw tensors (as float32)
-                obs = torch.from_numpy(obs_dset[i:j]).float()
-                q_raw  = torch.from_numpy(q_np).float()
-                dq_raw = torch.from_numpy(joint_vel[i:j]).float()
-                act    = torch.from_numpy(act_dset[i:j]).float()
-
+                obs      = torch.from_numpy(obs_dset[i:j]).float()
+                q_raw    = torch.from_numpy(q_np).float()
+                dq_raw   = torch.from_numpy(joint_vel[i:j]).float()
+                act_mean = torch.from_numpy(act_mean_dset[i:j]).float()
+                act_std  = torch.from_numpy(act_std_dset[i:j]).float()
                 # ★ NEW: build mask from valid_length (vectorized for the block)
                 if has_vlen:
                     vlen_block = valid_len_src[i:j].astype(np.int32)  # [B]
@@ -163,5 +165,6 @@ class TrajectoryDataset(Dataset):
                 f_out['joint_trajs'][i:j]  = q_raw.cpu().numpy()
                 f_out['obs'][i:j]          = obs.cpu().numpy()
                 f_out['joint_vels'][i:j]   = dq_raw.cpu().numpy()
-                f_out['act'][i:j]          = act.cpu().numpy()
+                f_out['act_mean'][i:j]          = act_mean.cpu().numpy()
+                f_out['act_std'][i:j]          = act_std.cpu().numpy()
                 f_out['mask'][i:j]         = mask_block

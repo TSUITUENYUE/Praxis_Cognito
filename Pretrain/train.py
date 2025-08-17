@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Subset
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.cuda.amp import GradScaler, autocast
+from torch.compiler import cudagraph_mark_step_begin
+
 import os, math
 import genesis as gs
 from rsl_rl.modules import EmpiricalNormalization
@@ -43,11 +44,11 @@ class Trainer:
         self.max_episode_len = self.max_episode_seconds * self.frame_rate
 
         # model & geometry
-        #self.vae = torch.compile(model.to(self.device),mode="reduce-overhead")
+        #self.vae = torch.compile(model.to(self.device),mode="reduce-overhead",dynamic=False)
         self.vae = model.to(self.device)
-        #self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
+        self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
         #self.vae.decoder = torch.compile(self.vae.decoder,mode="reduce-overhead")
-        #self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
+        self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
@@ -71,6 +72,7 @@ class Trainer:
             source_path=self.load_path,
             agent=self.agent
         )
+
 
         if rl_config.train.empirical_normalization:
             state = torch.load(self.normalizer_path, map_location="cpu")
@@ -109,8 +111,18 @@ class Trainer:
         base_lr = config.optimizer.lr
         self.optimizer = optim.AdamW(self.vae.parameters(), lr=base_lr, weight_decay=1e-5, fused=True)
         num_total_steps = self.num_epochs * max(1, (self.episodes // self.batch_size))
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_total_steps)
+        warmup_steps = max(1, min(int(config.optimizer.warm_up), num_total_steps - 1))
+        warmup = LinearLR(self.optimizer, start_factor=1.0, end_factor=1.0, total_iters=warmup_steps)
+        cosine = CosineAnnealingLR(self.optimizer, T_max=max(1, num_total_steps - warmup_steps))
+        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
         self.scaler = GradScaler()
+
+        # Take a random 10% subset
+        N = len(self.dataset)
+        k = max(1, N // 10)
+        g = torch.Generator().manual_seed(42)
+        subset_idx = torch.randperm(N, generator=g)[:k].tolist()
+        self.dataset = Subset(self.dataset, subset_idx)
 
         # weights
         self.strategy = config.beta_anneal.strategy
@@ -118,7 +130,7 @@ class Trainer:
         self.max_beta = config.beta_anneal.max_beta
 
         self.lambda_kinematic = config.kino.lambda_kinematic
-        self.lambda_dynamic   = config.kino.lambda_dynamic / self.agent.n_dofs
+        self.lambda_dynamic   = config.kino.lambda_dynamic
 
         self.lambda_sim = config.sim.lambda_sim
         self.w_q  = config.sim.w_q
@@ -143,15 +155,17 @@ class Trainer:
 
     # ---------- training ----------
     def train(self):
-        torch.set_float32_matmul_precision('high')
         self.vae.train()
 
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            num_workers=4,
-            shuffle=True,
-            drop_last=True
+            num_workers=max(4, os.cpu_count() // 2),
+            shuffle = True,
+            drop_last = True,
+            #pin_memory = True,
+            #persistent_workers = True,
+            #prefetch_factor = 4,
         )
 
         total_steps = self.num_epochs * len(dataloader)
@@ -168,12 +182,12 @@ class Trainer:
             for i, (graph_x, obs, act, q, dq, mask) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
 
-                graph_x = graph_x.to(self.device)
-                obs     = obs.to(self.device)              # [B,T,obs_dim] (UN-normalized from dataset)
-                act     = act.to(self.device)
-                q       = q.to(self.device)
-                dq      = dq.to(self.device)
-                mask    = mask.to(self.device)[:, :, None] # [B,T,1]
+                graph_x = graph_x.to(self.device, non_blocking=True)
+                obs = obs.to(self.device, non_blocking=True)  # [B,T,obs_dim] (UN-normalized from dataset)
+                act = act.to(self.device, non_blocking=True)
+                q = q.to(self.device, non_blocking=True)
+                dq = dq.to(self.device, non_blocking=True)
+                mask = mask.to(self.device, non_blocking=True)[:, :, None]  # [B,T,1]
 
                 self.optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=True):
@@ -182,9 +196,10 @@ class Trainer:
 
                     # teacher forcing ratio: decay to 0 by midway
 
-                    tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
+                    tf_ratio = max(0.0, 1.0 - global_step / (0.99 * total_steps))
 
                     # --- forward (policy decoder returns actions) ---
+                    cudagraph_mark_step_begin()
                     recon_mu, joint_cmd, actions_seq, pre_mu_seq, log_std_seq, log_sigma, *aux = self.vae(
                         graph_x, self.edge_index, mask, self.obs_normalizer,
                         obs_seq=obs,
@@ -193,37 +208,42 @@ class Trainer:
                         tf_ratio=tf_ratio,
                     )
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
-                    with torch.no_grad():  # inference_mode would also work, but no_grad is perfectly fine here
+                    with torch.inference_mode():  # strictly no gradients through Genesis
                         reset_out = self.env.reset()
-                        obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
-                        q0 = self.env.robot.get_dofs_position(self.env.motors_dof_idx)  # [B,d]
-                        dq0 = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)  # [B,d]
+                        obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B, obs_dim]
+                        q0 = self.env.robot.get_dofs_position(self.env.motors_dof_idx)  # [B, d]
+                        dq0 = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)  # [B, d]
 
-                        obs0_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
+                        # normalize only the initial obs needed to seed the surrogate
+                        obs0_n = self.obs_normalizer(obs0_raw)
 
                         B = actions_seq.shape[0]
                         T = actions_seq.shape[1]
                         d = q0.shape[-1]
-                        # Pre-allocate on device with correct dtypes
-                        obs_sim_n_seq = torch.empty(B, T, self.obs_dim, device=self.device, dtype=obs0_n.dtype)
-                        q_sim_seq = torch.empty(B, T, d, device=self.device, dtype=q0.dtype)
-                        dq_sim_seq = torch.empty(B, T, d, device=self.device, dtype=dq0.dtype)
 
+                        actions_seq_gs = actions_seq.detach().to(dtype=gs.tc_float)
+
+                        # Collect raw sim outputs; fewer Python↔C hops and H2D copies
+                        obs_raw_list, q_list, dq_list = [], [], []
                         for t in range(T):
-                            a_t = actions_seq[:, t, :].detach()
+                            a_t = actions_seq_gs[:, t, :]
                             obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
                             q_t = self.env.robot.get_dofs_position(self.env.motors_dof_idx)
                             dq_t = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)
+                            obs_raw_list.append(obs_t_raw)
+                            q_list.append(q_t)
+                            dq_list.append(dq_t)
 
-                            obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
+                        obs_sim_raw_seq = torch.stack(obs_raw_list, dim=1)  # [B, T, obs_dim]
+                        q_sim_seq = torch.stack(q_list, dim=1) # [B, T, d]
+                        dq_sim_seq = torch.stack(dq_list, dim=1)  # [B, T, d]
 
-                            # write into preallocated buffers
-                            obs_sim_n_seq[:, t].copy_(obs_t_n)
-                            q_sim_seq[:, t].copy_(q_t.to(self.device, non_blocking=True))
-                            dq_sim_seq[:, t].copy_(dq_t.to(self.device, non_blocking=True))
+                        obs_sim_n_seq = self.obs_normalizer(
+                            obs_sim_raw_seq.view(B * T, self.obs_dim)
+                        ).view(B, T, self.obs_dim)
 
-                        q0 = q0.to(self.device, non_blocking=True)
-                        dq0 = dq0.to(self.device, non_blocking=True)
+                        #q0 = q0.to(self.device, non_blocking=True)
+                        #dq0 = dq0.to(self.device, non_blocking=True)
                     # --------------- Surrogate rollout (inside the VAE) ---------------
                     sur_obs_seq, sur_q_seq, sur_dq_seq = self.vae.predict_dynamics(
                         actions_seq.detach(),    # [B,T,d] — only surrogate learns from sim loss
@@ -265,7 +285,7 @@ class Trainer:
                 self.scaler.update()
                 self.scheduler.step()
 
-                log_every = 2
+                log_every = 1
 
                 if (global_step % log_every == 0) or (i == len(dataloader) - 1):
                     print(
