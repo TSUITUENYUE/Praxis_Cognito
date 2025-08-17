@@ -7,6 +7,18 @@ from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder
 from .sd import SurrogateDynamics
 
+import torch._dynamo as dynamo
+
+@dynamo.disable
+def _store_col(dst, t, src):
+    # identical effect to: dst[:, t].copy_(src)
+    dst[:, t].copy_(src)
+
+@dynamo.disable
+def _clamp_to_limits(x, lo, hi):
+    # identical numerics to clamp_ but out-of-place & eager
+    return torch.clamp(x, lo, hi)
+
 class IntentionVAE(nn.Module):
     def __init__(
         self,
@@ -113,6 +125,7 @@ class IntentionVAE(nn.Module):
         q_upper = self.decoder.joint_upper.to(dev)
 
         # Preallocate outputs
+
         sur_obs_seq = torch.empty(B, T, self.surrogate.obs_dim, device=dev, dtype=obs0.dtype)
         sur_q_seq = torch.empty(B, T, d, device=dev, dtype=q0.dtype)
         sur_dq_seq = torch.empty(B, T, d, device=dev, dtype=dq0.dtype)
@@ -127,7 +140,7 @@ class IntentionVAE(nn.Module):
             a_t = actions_seq[:, t, :]
 
             q_pred, dq_pred, obs_pred = self.surrogate(q_t, dq_t, obs_t, a_t)
-            torch.clamp_(q_pred, q_lower, q_upper)  # in-place to save a buffer
+            q_pred = _clamp_to_limits(q_pred, q_lower, q_upper)
 
             # Freeze beyond padding (no drift on padded frames)
             q_t = mask_t * q_pred + (1.0 - mask_t) * q_t
@@ -135,9 +148,11 @@ class IntentionVAE(nn.Module):
             obs_t = mask_t * obs_pred + (1.0 - mask_t) * obs_t
 
             # write outputs
-            sur_q_seq[:, t].copy_(q_t)
-            sur_dq_seq[:, t].copy_(dq_t)
-            sur_obs_seq[:, t].copy_(obs_t)
+
+            # sur_q_seq[:, t].copy_(q_t)  etc.
+            _store_col(sur_q_seq, t, q_t)
+            _store_col(sur_dq_seq, t, dq_t)
+            _store_col(sur_obs_seq, t, obs_t)
 
         return sur_obs_seq, sur_q_seq, sur_dq_seq
 
@@ -181,12 +196,12 @@ class IntentionVAE(nn.Module):
         obs_tf_n_all = normalizer(obs_seq)  # [B,T,obs_dim]
 
         # Preallocate output tensors (match your original dtypes/shapes)
-        pre_mu_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_seq.dtype)
-        log_std_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_seq.dtype)
-        actions_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_seq.dtype)
-        joints_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_seq.dtype)
+        pre_mu_seq  = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
+        log_std_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
+        actions_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
+        joints_seq  = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
         objects_seq = torch.empty(B, T, self.object_dim, device=dev, dtype=obs_seq.dtype)
-        logsig_seq = torch.empty(B, T, (self.agent.fk_model.num_nodes + 1) * 3, device=dev, dtype=obs_seq.dtype)
+        logsig_seq  = torch.empty(B, T, (self.agent.fk_model.num_links + 1) * 3, device=dev, dtype=obs_seq.dtype)
 
         # Running state: start at default q, zero dq, and obs from first frame (or zeros)
         q_prev = self.decoder.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B,d]
@@ -229,7 +244,7 @@ class IntentionVAE(nn.Module):
             # Surrogate dynamics step
             q_pred, dq_pred, obs_pred = self.surrogate(q_in, dq_in, obs_state, action_t)
             obs_pred = normalizer(obs_pred)
-            torch.clamp_(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
+            q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
             # Freeze beyond padding
             q_new = mask_t * q_pred + (1.0 - mask_t) * q_prev
@@ -242,13 +257,12 @@ class IntentionVAE(nn.Module):
             )
 
             # Store step outputs
-            pre_mu_seq[:, t].copy_(mean_t)
-            log_std_seq[:, t].copy_(log_std_t)
-            actions_seq[:, t].copy_(mask_t * action_t)
-            joints_seq[:, t].copy_(q_new)
-            objects_seq[:, t].copy_(mask_t * obj_t)
-            logsig_seq[:, t].copy_(log_sig_t)
-
+            _store_col(pre_mu_seq, t, mean_t)
+            _store_col(log_std_seq, t, log_std_t)
+            _store_col(actions_seq, t, mask_t * action_t)
+            _store_col(joints_seq, t, q_new)
+            _store_col(objects_seq, t, mask_t * obj_t)
+            _store_col(logsig_seq, t, log_sig_t)
             # Advance
             q_prev, dq_prev, obs_state = q_new, dq_new, obs_new
 
