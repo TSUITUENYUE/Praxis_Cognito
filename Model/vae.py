@@ -8,7 +8,7 @@ from .decoder import Decoder
 from .sd import SurrogateDynamics
 
 import torch._dynamo as dynamo
-
+from omegaconf import DictConfig, OmegaConf
 @dynamo.disable
 def _store_col(dst, t, src):
     # identical effect to: dst[:, t].copy_(src)
@@ -33,6 +33,7 @@ class IntentionVAE(nn.Module):
         hidden_dim: int,
         obs_dim: int,
         fps: int,
+        env_cfg: DictConfig,
         num_components: int = 128,
     ):
         super().__init__()
@@ -74,7 +75,7 @@ class IntentionVAE(nn.Module):
         self.dt = 1.0 / float(fps)
         self.surrogate = SurrogateDynamics(
             joint_dim=self.joint_dim,
-            obs_dim=obs_dim,
+            obj_dim=3,
             hidden_dim=hidden_dim,
             dt=self.dt,
         )
@@ -116,45 +117,48 @@ class IntentionVAE(nn.Module):
         elem = 0.5 * ((x - mu) ** 2) * inv_var + log_sigma + 0.5 * math.log(2 * math.pi)  # [B,T,D]
         return elem.mean(dim=-1)  # [B,T]
 
-    def predict_dynamics(self, actions_seq, obs0, q0, dq0, mask):
+    def predict_dynamics(self, actions_seq, q0, dq0, u0, v0, mask):
         B, T, d = actions_seq.shape
         dev = actions_seq.device
 
-        # joint limits on device (no-op if already there)
+        # joint limits (device-safe)
         q_lower = self.decoder.joint_lower.to(dev)
         q_upper = self.decoder.joint_upper.to(dev)
 
         # Preallocate outputs
+        sur_obs_seq = torch.empty(B, T, 51, device=dev, dtype=q0.dtype)
 
-        sur_obs_seq = torch.empty(B, T, self.surrogate.obs_dim, device=dev, dtype=obs0.dtype)
-        sur_q_seq = torch.empty(B, T, d, device=dev, dtype=q0.dtype)
-        sur_dq_seq = torch.empty(B, T, d, device=dev, dtype=dq0.dtype)
-
-        # Current state (already on GPU)
+        # Current state
         q_t = q0.to(dev, non_blocking=True)
         dq_t = dq0.to(dev, non_blocking=True)
-        obs_t = obs0.to(dev, non_blocking=True)
+        u_t = u0.to(dev, non_blocking=True)
+        v_t = v0.to(dev, non_blocking=True)
 
         for t in range(T):
             mask_t = mask[:, t, :]  # [B,1]
-            a_t = actions_seq[:, t, :]
+            a_t = actions_seq[:, t, :]  # [B,d]
 
-            q_pred, dq_pred, obs_pred = self.surrogate(q_t, dq_t, obs_t, a_t)
+            # Surrogate step: (q_t, dq_t, u_t, v_t, a_t) -> (q_next, dq_next, u_next, v_next)
+            q_pred, dq_pred, u_pred, v_pred = self.surrogate(q_t, dq_t, u_t, v_t, a_t)
             q_pred = _clamp_to_limits(q_pred, q_lower, q_upper)
 
-            # Freeze beyond padding (no drift on padded frames)
+            # Respect padding mask (no drift past padded frames)
             q_t = mask_t * q_pred + (1.0 - mask_t) * q_t
             dq_t = mask_t * dq_pred + (1.0 - mask_t) * dq_t
-            obs_t = mask_t * obs_pred + (1.0 - mask_t) * obs_t
+            u_t = mask_t * u_pred + (1.0 - mask_t) * u_t
+            v_t = mask_t * v_pred + (1.0 - mask_t) * v_t
 
-            # write outputs
 
-            # sur_q_seq[:, t].copy_(q_t)  etc.
-            _store_col(sur_q_seq, t, q_t)
-            _store_col(sur_dq_seq, t, dq_t)
-            _store_col(sur_obs_seq, t, obs_t)
+        #obs_t = torch.cat(
 
-        return sur_obs_seq, sur_q_seq, sur_dq_seq
+
+
+        #)
+        # Store
+        _store_col(sur_obs_seq, t, obs_t)
+
+
+        return sur_obs_seq
 
     # ---------- Forward ----------
     def forward(
@@ -166,6 +170,8 @@ class IntentionVAE(nn.Module):
             obs_seq=None,  # [B,T,obs_dim] or None
             q=None,  # [B,T,d] (teacher joints) or None
             dq=None,  # [B,T,d] (teacher vels) or None
+            u=None,   # [B,T,3]
+            v=None,   # [B,T,3]
             tf_ratio: float = 1.0,
     ):
         """
@@ -225,7 +231,6 @@ class IntentionVAE(nn.Module):
         for t in range(T):
             mask_t = mask[:, t, :]  # [B,1]
             obs_tf_n = obs_tf_n_all[:, t, :]  # [B,obs_dim]
-
             # Teacher forcing gat
             if self.training and (q is not None):
                 tf_gate = (torch.rand(B, 1, device=dev) < tf_ratio).float()
@@ -242,8 +247,8 @@ class IntentionVAE(nn.Module):
             )
 
             # Surrogate dynamics step
-            new_obs = '''TO DO OBTAINED FROM Go2Env'''
-            q_pred, dq_pred, obs_pred = self.surrogate(q_in, dq_in, obs_state, action_t)
+            q_pred, dq_pred, u_pred, v_pred = self.surrogate(q_in, dq_in, u, v, action_t)
+            #obs_pred = self.predict_dynamics(action_t, q_in, dq_in, u, v,mask_t)
             q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
             # Freeze beyond padding
@@ -318,7 +323,7 @@ class IntentionVAE(nn.Module):
         pose_step = ((recon_mu - orig_traj) ** 2).mean(dim=-1)  # [B,T]
         pose_loss = (pose_step.mul(mask_bt)).sum().div(valid)  # fuse multiplications, no new tensors
         pose_loss = lambda_kinematic * pose_loss
-
+        '''
         def atanh_clamped(a, eps=1e-6):
             a = torch.clamp(a, -1.0 + eps, 1.0 - eps)
             return 0.5 * (torch.log1p(a) - torch.log1p(-a))
@@ -332,10 +337,14 @@ class IntentionVAE(nn.Module):
 
         #nll_step = _normal_nll(act_mu, pre_mu_seq, log_std_seq).sum(dim=-1)  # [B,T]
         #action_loss = (nll_step.mul(mask_bt)).sum().div(valid)
+        '''
+        def softsign(x):
+            return x / (1 + x.abs())  # maps R -> (-1, 1)
 
-
-        act_step = ((torch.tanh(action_seq) - torch.tanh(act_mu)) ** 2).mean(dim=-1)
-        action_loss = (act_step * mask.squeeze(-1)).sum() / valid
+        a_bounded = softsign(action_seq)
+        mu_bounded = softsign(act_mu)
+        act_step = ((a_bounded - mu_bounded) ** 2).mean(dim=-1)
+        action_loss = (act_step * mask.squeeze(-1)).sum().div(valid)
 
         action_loss = lambda_dynamic * action_loss
         total_recon = pose_loss + action_loss

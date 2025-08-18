@@ -97,12 +97,19 @@ class VanillaEncoder(nn.Module):
     def __init__(self, node_features, hidden_features, num_layers, rnn_hidden, latent_dim):
         super().__init__()
         self.heads = 4
-
+        '''
         self.gnns = nn.ModuleList()
         self.gnns.append(GATConv(node_features, hidden_features, heads=self.heads, concat=True))
         for _ in range(num_layers - 2):
             self.gnns.append(GATConv(hidden_features * self.heads, hidden_features, heads=self.heads, concat=True))
         self.gnns.append(GATConv(hidden_features * self.heads, hidden_features, heads=1, concat=False))
+        '''
+
+        self.gnns = nn.ModuleList()
+        self.gnns.append(GCNConv(node_features, hidden_features,))
+        for _ in range(num_layers - 2):
+            self.gnns.append(GCNConv(hidden_features, hidden_features,))
+        self.gnns.append(GCNConv(hidden_features, hidden_features,))
 
         self.pool = NodeAttentionPool(hidden_features)
 

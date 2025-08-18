@@ -45,9 +45,9 @@ class Trainer:
         # model & geometry
         #self.vae = torch.compile(model.to(self.device),mode="reduce-overhead")
         self.vae = model.to(self.device)
-        #self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
+        self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
         #self.vae.decoder = torch.compile(self.vae.decoder,mode="reduce-overhead")
-        #self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
+        self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
@@ -81,14 +81,14 @@ class Trainer:
             self.obs_normalizer.eval()
             for p in self.obs_normalizer.parameters():
                 p.requires_grad_(False)
-            '''
+
             self.critic_obs_normalizer = EmpiricalNormalization(self.obs_dim)
             self.critic_obs_normalizer.load_state_dict(state["critic_obs_norm"])
             self.critic_obs_normalizer.to(self.device)
             self.critic_obs_normalizer.eval()
             for p in self.critic_obs_normalizer.parameters():
                 p.requires_grad_(False)
-            '''
+
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)
             for p in self.obs_normalizer.parameters():
@@ -174,6 +174,8 @@ class Trainer:
                 dq      = dq.to(self.device)
                 mask    = mask.to(self.device)[:, :, None] # [B,T,1]
 
+                u = obs[:,:,-6:-3]
+                v = obs[:,:,-3:]
                 self.optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=True):
                     beta = get_beta(global_step, total_steps, strategy=self.strategy,
@@ -189,6 +191,8 @@ class Trainer:
                         obs_seq=obs,
                         q=q,
                         dq=dq,
+                        u=u,
+                        v=v,
                         tf_ratio=tf_ratio,
                     )
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
@@ -213,7 +217,6 @@ class Trainer:
                             obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
                             q_t = self.env.robot.get_dofs_position(self.env.motors_dof_idx)
                             dq_t = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)
-
                             obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
 
                             # write into preallocated buffers
@@ -221,14 +224,17 @@ class Trainer:
                             q_sim_seq[:, t].copy_(q_t.to(self.device, non_blocking=True))
                             dq_sim_seq[:, t].copy_(dq_t.to(self.device, non_blocking=True))
 
-                        q0 = q0.to(self.device, non_blocking=True)
-                        dq0 = dq0.to(self.device, non_blocking=True)
+                        #q0 = q0.to(self.device, non_blocking=True)
+                        #dq0 = dq0.to(self.device, non_blocking=True)
+                        u0 = obs_sim_n_seq[:, :, -6:-3]
+                        v0 = obs_sim_n_seq[:, :, -3:]
                     # --------------- Surrogate rollout (inside the VAE) ---------------
-                    sur_obs_seq, sur_q_seq, sur_dq_seq = self.vae.predict_dynamics(
+                    sur_obs_seq = self.vae.predict_dynamics(
                         actions_seq.detach(),    # [B,T,d] — only surrogate learns from sim loss
-                        obs0=obs0_n.detach(),
                         q0=q0.detach(),
                         dq0=dq0.detach(),
+                        u0=u0.detach(),
+                        v0=v0.detach(),
                         mask=mask,
                     )
 
@@ -244,11 +250,11 @@ class Trainer:
                     )
 
                     # --- Sim loss (only trains surrogate via surrogate path) ---
-                    q_loss  = self.masked_mse(sur_q_seq,  q_sim_seq.detach(),  mask)
-                    dq_loss = self.masked_mse(sur_dq_seq, dq_sim_seq.detach(), mask)
+                    #q_loss  = self.masked_mse(sur_q_seq,  q_sim_seq.detach(),  mask)
+                    #dq_loss = self.masked_mse(sur_dq_seq, dq_sim_seq.detach(), mask)
                     obs_loss = self.masked_mse(sur_obs_seq, obs_sim_n_seq.detach(), mask)
-                    sim_loss = self.w_q * q_loss + self.w_dq * dq_loss + self.w_obs * obs_loss
-
+                    #sim_loss = self.w_q * q_loss + self.w_dq * dq_loss + self.w_obs * obs_loss
+                    sim_loss = obs_loss
                     total_loss = loss + self.lambda_sim * sim_loss
 
                     # --- diag: unnormalized recon MSE in world units ---

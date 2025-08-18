@@ -1,62 +1,98 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from typing import Tuple
 
-# ---------------------------------------------------------------------
-# Surrogate dynamics: one-step model f(q_t, dq_t, obs_t, a_t) → dq_{t+1}, Δobs
-# Euler integration: q_{t+1} = clamp(q_t + dt * dq_{t+1}, joint_limits)
-# ---------------------------------------------------------------------
 class SurrogateDynamics(nn.Module):
-    def __init__(self, joint_dim: int, obs_dim: int, hidden_dim: int, dt: float):
-        super().__init__()
-        self.joint_dim = joint_dim
-        self.obs_dim = obs_dim
-        self.dt = dt
+    """
+    Pure state-transition surrogate:
+        (q_t, dq_t, a_t, obj_t)  ->  (q_{t+1}, dq_{t+1}, obj_{t+1})
 
-        in_dim = joint_dim + joint_dim + obs_dim + joint_dim  # q, dq, obs, action
+    - Agent state: q_t, dq_t   (joint positions/velocities)   [B, d]
+    - Action:      a_t         (unsquashed; env should handle clipping/scales) [B, d]
+    - Object:      obj_t       (concatenated [pos, vel])       [B, o], with o even
+                               e.g., for a ball: pos(3), vel(3) -> o=6
+
+    Design:
+      * One shared trunk over [q, dq, a, obj] to learn cross-coupling.
+      * Agent head predicts Δdq (bounded residual with learned per-joint scale).
+      * Object heads predict Δv (velocity residual) and a tiny residual on position
+        after Euler integration (helps small modeling gaps).
+
+    NOTE: Joint limit clamping can be applied outside this module.
+    """
+    def __init__(self, joint_dim: int, obj_dim: int, hidden_dim: int, dt: float):
+        super().__init__()
+        assert obj_dim % 2 == 0, "obj_dim must be even: concat of [pos, vel]"
+        self.d = joint_dim
+        self.o = obj_dim
+        self.dt = float(dt)
+
+        in_dim = (3 * joint_dim) + obj_dim  # [q, dq, a] + [obj_pos, obj_vel]
         h = hidden_dim
 
-        self.net = nn.Sequential(
+        # Shared interaction trunk
+        self.trunk = nn.Sequential(
             nn.Linear(in_dim, h),
             nn.LayerNorm(h),
             nn.ReLU(),
             nn.Linear(h, h),
             nn.ReLU(),
         )
-        # Δdq head (tanh + learned per-joint scale)
-        self.dq_head = nn.Linear(h, joint_dim)
-        # Δobs head (unconstrained; we scale small at init)
-        self.obs_head = nn.Linear(h, obs_dim)
 
-        # Per-joint learned scale for Δdq, initialized small for stability
+        # ---------- Agent head: Δdq ----------
+        self.dq_head = nn.Linear(h, joint_dim)
+        # Per-joint learned scale (small at init)
         self.log_dq_scale = nn.Parameter(torch.full((joint_dim,), math.log(0.1)))
-        # Small init so first predictions are near-zero deltas
         nn.init.zeros_(self.dq_head.weight)
         nn.init.zeros_(self.dq_head.bias)
-        nn.init.zeros_(self.obs_head.weight)
-        nn.init.zeros_(self.obs_head.bias)
 
-    def forward(self, q_t, dq_t, obs_t, a_t):
+        # ---------- Object heads: Δv and residual Δp ----------
+        self.dv_head   = nn.Linear(h, self.o)  # residual on velocity
+        self.dp_res_head = nn.Linear(h, self.o)  # small residual on position after Euler
+        self.log_dv_scale   = nn.Parameter(torch.full((self.o,), math.log(0.1)))
+        self.log_dp_res_scale = nn.Parameter(torch.full((self.o,), math.log(0.01)))
+
+        nn.init.zeros_(self.dv_head.weight)
+        nn.init.zeros_(self.dv_head.bias)
+        nn.init.zeros_(self.dp_res_head.weight)
+        nn.init.zeros_(self.dp_res_head.bias)
+
+    def forward(
+        self,
+        q_t: torch.Tensor,     # [B, d]
+        dq_t: torch.Tensor,    # [B, d]
+        u_t: torch.Tensor,     # [B, 3]
+        v_t: torch.Tensor,     # [B, 3]
+        a_t: torch.Tensor,     # [B, d]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        q_t, dq_t: [B, d]
-        obs_t:    [B, obs_dim]
-        a_t:      [B, d]
         Returns:
-          q_next, dq_next, obs_next
+            q_next   : [B, d]
+            dq_next  : [B, d]
+            obj_next : [B, o]  (concat of [pos_next, vel_next])
         """
-        x = torch.cat([q_t, dq_t, obs_t, a_t], dim=-1)
-        h = self.net(x)
+        B, d = q_t.shape
+        assert d == self.d, "joint_dim mismatch"
 
-        # Δdq with bounded magnitude (tanh) and learned scale
-        dq_delta = torch.tanh(self.dq_head(h)) * torch.exp(self.log_dq_scale)  # [B, d]
-        dq_next = dq_t + dq_delta
 
-        # Euler step for q
-        q_next = q_t + self.dt * dq_next  # clamp happens outside with known limits
+        # Shared features
+        x = torch.cat([q_t, dq_t, u_t, v_t, a_t], dim=-1)
+        h = self.trunk(x)
 
-        # Δobs with small magnitude at init (weights are zero by init)
-        obs_delta = self.obs_head(h)
-        obs_next = obs_t + obs_delta
+        # ----- Agent update -----
+        # Δdq bounded via tanh, scaled per-joint (stable small residual dynamics)
+        dq_delta = torch.tanh(self.dq_head(h)) * torch.exp(self.log_dq_scale)   # [B, d]
+        dq_next  = dq_t + dq_delta
+        q_next   = q_t + self.dt * dq_next  # clamp to joint limits outside if desired
 
-        return q_next, dq_next, obs_next
+        # ----- Object update -----
+        # Velocity residual (learned)
+        dv = torch.tanh(self.dv_head(h)) * torch.exp(self.log_dv_scale)          # [B, o/2]
+        v_next = v_t + dv
+
+        # Euler step for position + tiny residual to absorb modeling errors
+        dp_res = torch.tanh(self.dp_res_head(h)) * torch.exp(self.log_dp_res_scale)  # [B, o/2]
+        u_next = u_t + self.dt * v_next + dp_res
+
+        return q_next, dq_next, u_next, v_next

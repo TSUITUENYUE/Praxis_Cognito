@@ -129,7 +129,7 @@ class Go2Env:
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), gs.device)
 
     def step(self, actions):
-        self.actions = torch.tanh(actions)
+        #actions = torch.tanh(actions)
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
@@ -153,8 +153,8 @@ class Go2Env:
         ball_pos = self.ball.get_pos()
         ball_vel = self.ball.get_vel()
         # express in base frame
-        relative_ball_pos = transform_by_quat(ball_pos - self.base_pos, inv_base_quat)
-        relative_ball_vel = transform_by_quat(ball_vel - self.base_lin_vel, inv_base_quat)
+        self.relative_ball_pos = transform_by_quat(ball_pos - self.base_pos, inv_base_quat)
+        self.relative_ball_vel = transform_by_quat(ball_vel - self.base_lin_vel, inv_base_quat)
         # resample commands
         envs_idx = (
             (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
@@ -189,9 +189,9 @@ class Go2Env:
                 self.commands * self.commands_scale,  # 3
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
                 self.dof_vel * self.obs_scales["dof_vel"],  # 12
-                self.actions,  # 12
-                relative_ball_pos,  # 3 <-- ADDED
-                relative_ball_vel# 3 <-- ADDED
+                exec_actions,  # 12
+                self.relative_ball_pos,  # 3 <-- ADDED
+                self.relative_ball_vel# 3 <-- ADDED
             ],
             axis=-1,
         )

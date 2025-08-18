@@ -218,8 +218,7 @@ def generate(cfg: DictConfig):
                 dq_now = env.robot.get_dofs_velocity(env.motors_dof_idx)
                 agent_traj_buffer[t]   = q_now
                 dof_vel_traj_buffer[t] = dq_now
-                if hasattr(env, "ball"):
-                    obj_traj_buffer[t] = env.ball.get_pos()
+                obj_traj_buffer[t] = env.relative_ball_pos
 
                 # curiosity plumbing
                 state_normalizer.update(obs)
@@ -266,7 +265,7 @@ def generate(cfg: DictConfig):
                         norm_batch_next_states = state_normalizer.normalize(batch_next_states)
 
                         f_loss, i_loss = icm(norm_batch_states, norm_batch_actions, norm_batch_next_states)
-                        icm_loss = f_loss.mean() + i_loss.mean()
+                        icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
                         icm_optimizer.zero_grad()
                         icm_loss.backward()
                         icm_optimizer.step()

@@ -21,7 +21,7 @@ class Runner:
         self.config = config
         self.agent = Agent(**config.agent)
         if self.mode != "generate":
-            self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, **config.model.vae)
+            self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, env_cfg=config.rl, **config.model.vae)
 
             if self.mode == "train":
                 self.trainer = Trainer(self.model, config.rl, config.trainer)
