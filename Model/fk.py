@@ -147,15 +147,6 @@ class FKModel(nn.Module):
         self._pos_link_indices_py = list(range(self.num_links))
         self.register_buffer("order_axes_buf", self.order_axes)
         self.register_buffer("order_Torigin_buf", self.order_Torigin)
-        # Pre-split T_origin into rotation and translation (faster per-step math)
-        order_Ro = self.order_Torigin[:, :3, :3].contiguous()
-        order_to = self.order_Torigin[:, :3, 3].contiguous()
-        self.register_buffer("order_Ro_buf", order_Ro)  # [E,3,3]
-        self.register_buffer("order_to_buf", order_to)  # [E,3]
-
-        # Base link index and a 3x3 identity buffer
-        self.base_idx = self.link_names.index('base') if 'base' in self.link_names else 0
-        self.register_buffer('eye_3', torch.eye(3, device=self.device, dtype=torch.float32))
 
     def parse_urdf_file(self, filename):
         tree = ET.parse(filename)
@@ -185,8 +176,7 @@ class FKModel(nn.Module):
                                     'xyz': xyz, 'rpy': rpy, 'axis': axis}
 
     def forward(self, joint_angles: torch.Tensor):
-        # Honor outer autocast setting (keeps your numerical choice); if you want pure FP32, pass enabled=False.
-        with autocast(enabled=torch.is_autocast_enabled()):
+        with autocast(False):
             if joint_angles.dim() == 1:
                 joint_angles = joint_angles.unsqueeze(0)
 
@@ -194,47 +184,41 @@ class FKModel(nn.Module):
             q = joint_angles.to(dtype=torch.float32, device=dev)
             B = q.shape[0]
 
-            # Preallocate per-link rotation and translation on device
-            # We only need base initialized; others will be filled as we traverse.
-            link_R = self.eye_3.unsqueeze(0).unsqueeze(0).expand(B, self.num_links, 3, 3).clone()
-            link_t = torch.zeros(B, self.num_links, 3, device=dev, dtype=torch.float32)
+            # list of transforms instead of a [B,L,4,4] tensor
+            link_T = [self.eye_4.view(1, 4, 4).expand(B, 4, 4).clone() for _ in range(self.num_links)]
 
-            # Shortcuts to constant per-edge data
-            order_axes = getattr(self, "order_axes_buf", self.order_axes)  # [E,3]
-            order_Ro = getattr(self, "order_Ro_buf", self.order_Torigin[:, :3, :3])  # [E,3,3]
-            order_to = getattr(self, "order_to_buf", self.order_Torigin[:, :3, 3])  # [E,3]
+            # choose constants
+            order_axes = getattr(self, "order_axes_buf", self.order_axes)
+            order_Torig = getattr(self, "order_Torigin_buf", self.order_Torigin)
 
             for e in range(self.E):
                 p_idx = self.order_parent_idx_py[e]
                 c_idx = self.order_child_idx_py[e]
-
-                Rp = link_R[:, p_idx]  # [B,3,3]
-                tp = link_t[:, p_idx]  # [B,3]
-
-                Ro = order_Ro[e].unsqueeze(0).expand(B, 3, 3)  # [B,3,3]
-                to = order_to[e].unsqueeze(0).expand(B, 3)  # [B,3]
-
-                # Parent * origin (note: translation is independent of joint rotation)
-                Rpo = torch.bmm(Rp, Ro)  # [B,3,3]
-                tpo = torch.bmm(Rp, to.unsqueeze(-1)).squeeze(-1) + tp  # [B,3]
+                T_p = link_T[p_idx]  # [B,4,4]
+                T_origin_b = order_Torig[e].unsqueeze(0).expand(B, 4, 4)
 
                 if self.order_is_rev_py[e]:
                     dof_idx = self.order_dof_idx_py[e]
                     angle = q[:, dof_idx]  # [B]
                     axis = order_axes[e].unsqueeze(0).expand(B, 3)  # [B,3]
-                    # Stable axis-angle → rotation (your original implementation)
                     Rj = rotmat_axis_angle_stable(axis * angle.unsqueeze(1))  # [B,3,3]
-                    Rchild = torch.bmm(Rpo, Rj)  # [B,3,3]
+
+                    # build 4x4 without in-place writes
+                    zero_col = torch.zeros(B, 3, 1, device=dev, dtype=torch.float32)
+                    top = torch.cat([Rj, zero_col], dim=2)  # [B,3,4]
+                    last_row = torch.tensor([0., 0., 0., 1.], device=dev, dtype=torch.float32).view(1, 1, 4).expand(B,
+                                                                                                                    1,
+                                                                                                                    4)
+                    T_joint = torch.cat([top, last_row], dim=1)  # [B,4,4]
+
+                    T_child = torch.bmm(torch.bmm(T_p, T_origin_b), T_joint)
                 else:
-                    Rchild = Rpo
+                    T_child = torch.bmm(T_p, T_origin_b)
 
-                # Write child transform
-                link_R[:, c_idx] = Rchild
-                link_t[:, c_idx] = tpo
+                # replace list entry (no slice copy)
+                link_T[c_idx] = T_child
 
-            # Concatenate positions in link_names order
-            positions = link_t.reshape(B, -1)  # [B, num_links*3]
+            positions = torch.cat([link_T[i][:, :3, 3] for i in range(self.num_links)], dim=1)
             return positions
-
 
 

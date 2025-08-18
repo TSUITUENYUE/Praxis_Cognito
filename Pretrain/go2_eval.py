@@ -64,7 +64,7 @@ def main():
         obs_cfg=rl_config.obs,
         reward_cfg=rl_config.reward,
         command_cfg=rl_config.command,
-        show_viewer=True,
+        show_viewer=args.viewer,
         agent=agent,
     )
 
@@ -80,7 +80,7 @@ def main():
     # ---- Output dataset path (match generator naming) ----
     EPISODES = int(args.episodes)
     AGENT = getattr(agent, "name", "go2")
-    base_dir = f"./Pretrain/data/{AGENT}/demo"
+    base_dir = f"./Pretrain/data/demo"
     os.makedirs(base_dir, exist_ok=True)
     SAVE_FILENAME = f"{base_dir}/walk.h5"
 

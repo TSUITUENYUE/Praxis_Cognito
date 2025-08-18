@@ -59,7 +59,4 @@ class SurrogateDynamics(nn.Module):
         obs_delta = self.obs_head(h)
         obs_next = obs_t + obs_delta
 
-        q_next = q_next.clone()
-        dq_next = dq_next.clone()
-        obs_next = obs_next.clone()
         return q_next, dq_next, obs_next
