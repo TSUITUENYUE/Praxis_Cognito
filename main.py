@@ -10,9 +10,11 @@ from Pretrain.go2_env import Go2Env
 import argparse
 import os
 import genesis as gs
-from Pretrain.rl_config import load_configs
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+
 class Runner:
     def __init__(self, mode, config: DictConfig):
         self.mode = mode

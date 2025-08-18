@@ -38,7 +38,7 @@ class ICMModule(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super(ICMModule, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2)
@@ -54,13 +54,12 @@ class ICMModule(nn.Module):
             nn.Linear(hidden_dim, action_dim)
         )
     def forward(self, state, action, next_state):
-        state_action = torch.cat([state, action], dim=-1)
-        phi = self.encoder(state_action)
+        phi = self.encoder(state)
+        phi_next_with_grad = self.encoder(next_state)
         with torch.no_grad():
-            phi_next = self.encoder(torch.cat([next_state, action], dim=-1))
+            phi_next = phi_next_with_grad.detach()
         pred_phi_next = self.forward_model(torch.cat([phi, action], dim=-1))
         forward_loss = F.mse_loss(pred_phi_next, phi_next, reduction='none').mean(dim=-1)
-        phi_next_with_grad = self.encoder(torch.cat([next_state, action], dim=-1))
         pred_action = self.inverse_model(torch.cat([phi, phi_next_with_grad], dim=-1))
         inverse_loss = F.mse_loss(pred_action, action, reduction='none').mean(dim=-1)
         return forward_loss, inverse_loss

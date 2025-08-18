@@ -64,7 +64,7 @@ def main():
         obs_cfg=rl_config.obs,
         reward_cfg=rl_config.reward,
         command_cfg=rl_config.command,
-        show_viewer=args.viewer,
+        show_viewer=True,
         agent=agent,
     )
 

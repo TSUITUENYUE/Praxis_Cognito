@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATConv, GCNConv
 from torch_geometric.utils import softmax as pyg_softmax
 from torch_scatter import scatter_add
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence

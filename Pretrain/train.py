@@ -143,7 +143,6 @@ class Trainer:
 
     # ---------- training ----------
     def train(self):
-        torch.set_float32_matmul_precision('high')
         self.vae.train()
 
         dataloader = DataLoader(
@@ -265,7 +264,7 @@ class Trainer:
                 self.scaler.update()
                 self.scheduler.step()
 
-                log_every = 2
+                log_every = 1
 
                 if (global_step % log_every == 0) or (i == len(dataloader) - 1):
                     print(

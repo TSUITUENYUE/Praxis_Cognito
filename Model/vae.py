@@ -238,10 +238,11 @@ class IntentionVAE(nn.Module):
 
             # Policy step
             action_t, obj_t, log_sig_t, _ = self.decoder(
-                z, q_in, dq_in, obs_t=obs_state, mask_t=mask_t
+                z, obs_t=obs_state, mask_t=mask_t
             )
 
             # Surrogate dynamics step
+            new_obs = '''TO DO OBTAINED FROM Go2Env'''
             q_pred, dq_pred, obs_pred = self.surrogate(q_in, dq_in, obs_state, action_t)
             q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
@@ -252,7 +253,7 @@ class IntentionVAE(nn.Module):
 
             # Action distribution (teacher-conditional)
             mean_t, log_std_t = self.decoder.action_distribution(
-                z, q_tf_prev[:, t, :], dq_tf_prev[:, t, :], obs_tf_n, mask_t=mask_t
+                z, obs_tf_n, mask_t=mask_t
             )
 
             # Store step outputs
@@ -333,7 +334,7 @@ class IntentionVAE(nn.Module):
         #action_loss = (nll_step.mul(mask_bt)).sum().div(valid)
 
 
-        act_step = ((action_seq - act_mu) ** 2).mean(dim=-1)
+        act_step = ((torch.tanh(action_seq) - torch.tanh(act_mu)) ** 2).mean(dim=-1)
         action_loss = (act_step * mask.squeeze(-1)).sum() / valid
 
         action_loss = lambda_dynamic * action_loss

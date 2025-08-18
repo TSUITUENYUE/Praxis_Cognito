@@ -57,7 +57,7 @@ class Decoder(nn.Module):
         self.action_scale = getattr(self.agent, "action_scale", 0.25)
 
         # One-step policy features
-        policy_input_dim = (2 * self.joint_dim) + self.obs_dim + self.latent_dim
+        policy_input_dim = self.obs_dim + self.latent_dim
         self.feature_net = nn.Sequential(
             nn.Linear(policy_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -118,8 +118,6 @@ class Decoder(nn.Module):
     def _compute_features(
         self,
         z: torch.Tensor,
-        q_prev: torch.Tensor,
-        dq_prev: torch.Tensor,
         obs_t: Optional[torch.Tensor],
         mask_t: Optional[torch.Tensor],
     ) -> torch.Tensor:
@@ -128,9 +126,7 @@ class Decoder(nn.Module):
         if obs_t is None:
             obs_t = torch.zeros(B, self.obs_dim, device=device)
 
-        # Normalize joints for network input (NOT for FK)
-        q_norm = (q_prev - self.joint_mean) / self.joint_range
-        feats = self.feature_net(torch.cat([q_norm, dq_prev, obs_t, z], dim=-1))
+        feats = self.feature_net(torch.cat([obs_t, z], dim=-1))
         if mask_t is not None:
             feats = feats * mask_t  # preserve your padded-step gating
         return feats
@@ -169,25 +165,21 @@ class Decoder(nn.Module):
     def action_distribution(
         self,
         z: torch.Tensor,
-        q_prev: torch.Tensor,
-        dq_prev: torch.Tensor,
-        obs_t: Optional[torch.Tensor] = None,
+        obs_t: torch.Tensor,
         mask_t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns (mean, log_std) for the pre-tanh Normal.
         Use `sample_action` or `log_prob_squashed` for PPO plumbing.
         """
-        feats = self._compute_features(z, q_prev, dq_prev, obs_t, mask_t)
+        feats = self._compute_features(z, obs_t, mask_t)
         mean, log_std = self._dist_params_from_feats(feats)
         return mean, log_std
 
     def sample_action(
         self,
         z: torch.Tensor,
-        q_prev: torch.Tensor,
-        dq_prev: torch.Tensor,
-        obs_t: Optional[torch.Tensor] = None,
+        obs_t: torch.Tensor,
         mask_t: Optional[torch.Tensor] = None,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -195,7 +187,7 @@ class Decoder(nn.Module):
         Returns (a_squashed, u_pre_tanh, log_prob_squashed)
         - If deterministic, u_pre_tanh = mean.
         """
-        mean, log_std = self.action_distribution(z, q_prev, dq_prev, obs_t, mask_t)
+        mean, log_std = self.action_distribution(z, obs_t, mask_t)
         if deterministic:
             u = mean
         else:
@@ -217,9 +209,7 @@ class Decoder(nn.Module):
     def forward(
         self,
         z: torch.Tensor,           # [B, Z]
-        q_prev: torch.Tensor,      # [B, d]
-        dq_prev: torch.Tensor,     # [B, d]
-        obs_t: Optional[torch.Tensor] = None,  # [B, obs_dim]
+        obs_t: torch.Tensor,       # [B, obs_dim]
         mask_t: Optional[torch.Tensor] = None  # [B, 1] float {0,1} for stats/regularization
     ):
         """
@@ -230,11 +220,11 @@ class Decoder(nn.Module):
             log_sigma_pos_t,
             feats
         """
-        feats = self._compute_features(z, q_prev, dq_prev, obs_t, mask_t)
+        feats = self._compute_features(z, obs_t, mask_t)
         mean, log_std = self._dist_params_from_feats(feats)
         # mean, log_std = self.action_distribution(z, q_prev, dq_prev, obs_t, mask_t)
         # Deterministic action for your existing rollout:
-        action_t = torch.tanh(mean)                    # [-1, 1]
+        action_t = mean               # [-1, 1]
         object_t = self.object_head(feats)             # [B, obj]
         sigma_raw = self.var_head(feats)               # [B, pos_dim]
         sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * torch.sigmoid(sigma_raw)
