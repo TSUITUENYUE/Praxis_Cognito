@@ -2,13 +2,17 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import genesis
+from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
 from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder
 from .sd import SurrogateDynamics
 
+
 import torch._dynamo as dynamo
 from omegaconf import DictConfig, OmegaConf
+
 @dynamo.disable
 def _store_col(dst, t, src):
     # identical effect to: dst[:, t].copy_(src)
@@ -46,7 +50,7 @@ class IntentionVAE(nn.Module):
         self.object_dim = agent.object_dim
         self.joint_dim = agent.n_dofs
         self.urdf = agent.urdf
-
+        self.env_cfg = env_cfg
         # NOTE: replace these with dataset stats (pos_mean/std) before training.
         self.register_buffer("pos_mean", torch.zeros(3))
         self.register_buffer("pos_std", torch.ones(3))
@@ -67,18 +71,10 @@ class IntentionVAE(nn.Module):
             )
 
         # --- Decoder ---
-        self.decoder = Decoder(
-            latent_dim, seq_len, self.object_dim, self.joint_dim,
-            self.agent, hidden_dim, obs_dim, fps
-        )
+        self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim,self.agent, hidden_dim, obs_dim, fps)
 
         self.dt = 1.0 / float(fps)
-        self.surrogate = SurrogateDynamics(
-            joint_dim=self.joint_dim,
-            obj_dim=3,
-            hidden_dim=hidden_dim,
-            dt=self.dt,
-        )
+        self.surrogate = SurrogateDynamics(self.joint_dim,self.object_dim,hidden_dim,self.dt)
 
 
     # ---------- Latent sampling ----------
@@ -117,49 +113,53 @@ class IntentionVAE(nn.Module):
         elem = 0.5 * ((x - mu) ** 2) * inv_var + log_sigma + 0.5 * math.log(2 * math.pi)  # [B,T,D]
         return elem.mean(dim=-1)  # [B,T]
 
-    def predict_dynamics(self, actions_seq, q0, dq0, u0, v0, mask):
-        B, T, d = actions_seq.shape
-        dev = actions_seq.device
-
+    def predict_dynamics(self, a_t, q_t, dq_t, w_t, u_t, v_t, mask_t):
+        B, d = a_t.shape
+        dev = a_t.device
+        self.actions = torch.clip(a_t, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        exec_actions = self.last_actions if self.simulate_action_latency else self.actions
+        target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
         # joint limits (device-safe)
         q_lower = self.decoder.joint_lower.to(dev)
         q_upper = self.decoder.joint_upper.to(dev)
 
-        # Preallocate outputs
-        sur_obs_seq = torch.empty(B, T, 51, device=dev, dtype=q0.dtype)
-
-        # Current state
-        q_t = q0.to(dev, non_blocking=True)
-        dq_t = dq0.to(dev, non_blocking=True)
-        u_t = u0.to(dev, non_blocking=True)
-        v_t = v0.to(dev, non_blocking=True)
-
-        for t in range(T):
-            mask_t = mask[:, t, :]  # [B,1]
-            a_t = actions_seq[:, t, :]  # [B,d]
-
-            # Surrogate step: (q_t, dq_t, u_t, v_t, a_t) -> (q_next, dq_next, u_next, v_next)
-            q_pred, dq_pred, u_pred, v_pred = self.surrogate(q_t, dq_t, u_t, v_t, a_t)
-            q_pred = _clamp_to_limits(q_pred, q_lower, q_upper)
-
-            # Respect padding mask (no drift past padded frames)
-            q_t = mask_t * q_pred + (1.0 - mask_t) * q_t
-            dq_t = mask_t * dq_pred + (1.0 - mask_t) * dq_t
-            u_t = mask_t * u_pred + (1.0 - mask_t) * u_t
-            v_t = mask_t * v_pred + (1.0 - mask_t) * v_t
+        # Surrogate step: (q_t, dq_t, u_t, v_t, a_t) -> (q_next, dq_next, u_next, v_next)
+        q_pred, dq_pred, u_pred, v_pred = self.surrogate(q_t, dq_t, w_t, u_t, v_t, a_t)
+        q_pred = _clamp_to_limits(q_pred, q_lower, q_upper)
+        self.base_pos[:] = self.robot.get_pos()
+        self.base_quat[:] = self.robot.get_quat()
+        self.base_euler = quat_to_xyz(
+            transform_quat_by_quat(torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat),
+        )
+        inv_base_quat = inv_quat(self.base_quat)
+        self.base_lin_vel[:] = transform_by_quat(dq_t, inv_base_quat)
+        self.base_ang_vel[:] = transform_by_quat(w_t, inv_base_quat)
+        self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
 
 
-        #obs_t = torch.cat(
+        # Respect padding mask (no drift past padded frames)
+        q_t = mask_t * q_pred + (1.0 - mask_t) * q_t
+        dq_t = mask_t * dq_pred + (1.0 - mask_t) * dq_t
+        u_t = mask_t * u_pred + (1.0 - mask_t) * u_t
+        v_t = mask_t * v_pred + (1.0 - mask_t) * v_t
 
-
-
-        #)
-        # Store
-        _store_col(sur_obs_seq, t, obs_t)
-
-
-        return sur_obs_seq
-
+        # compute observations
+        obs_pred = torch.cat(
+            [
+                self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
+                self.projected_gravity,  # 3
+                self.commands * self.commands_scale,  # 3
+                (q_t - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
+                dq_t * self.obs_scales["dof_vel"],  # 12
+                exec_actions,  # 12
+                u_t,  # 3 <-- ADDED
+                v_t  # 3 <-- ADDED
+            ],
+            axis=-1,
+        )
+        self.last_actions[:] = self.actions[:]
+        self.last_dof_vel[:] = self.dof_vel[:]
+        return obs_pred, q_pred, dq_pred
     # ---------- Forward ----------
     def forward(
             self,
@@ -167,11 +167,9 @@ class IntentionVAE(nn.Module):
             edge_index,
             mask,  # [B,T,1] float {0,1}
             normalizer,
-            obs_seq=None,  # [B,T,obs_dim] or None
-            q=None,  # [B,T,d] (teacher joints) or None
-            dq=None,  # [B,T,d] (teacher vels) or None
-            u=None,   # [B,T,3]
-            v=None,   # [B,T,3]
+            obs_seq,  # [B,T,obs_dim] or None
+            q,  # [B,T,d] (teacher joints) or None
+            dq,  # [B,T,d] (teacher vels) or None
             tf_ratio: float = 1.0,
     ):
         """
@@ -184,8 +182,7 @@ class IntentionVAE(nn.Module):
         """
         B, T = mask.shape[0], mask.shape[1]
         dev = x.device
-        d = self.joint_dim
-        obj_dim = self.object_dim
+        self.obs_dim = obs_seq.shape[-1]
 
         # ----- encode -> z -----
         if self.prior == "GMM":
@@ -195,25 +192,23 @@ class IntentionVAE(nn.Module):
             mu, logvar = self.encoder(x, edge_index, mask)  # [B,D]
             z = self.reparameterize_gaussian(mu, logvar)  # [B,D]
 
-        if obs_seq is None:
-            obs_seq = torch.zeros(B, T, self.decoder.obs_dim, device=dev)
-
         # Pre-normalize teacher observations ONCE (used for the action distribution head)
         obs_tf_n_all = normalizer(obs_seq)  # [B,T,obs_dim]
 
         # Preallocate output tensors (match your original dtypes/shapes)
-        pre_mu_seq  = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
-        log_std_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
         actions_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
+        mu_seq      = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
+        log_std_seq = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
         joints_seq  = torch.empty(B, T, self.joint_dim,  device=dev, dtype=obs_seq.dtype)
+        obs_seq     = torch.empty(B, T, self.obs_dim,    device=dev, dtype=obs_seq.dtype)
         objects_seq = torch.empty(B, T, self.object_dim, device=dev, dtype=obs_seq.dtype)
-        logsig_seq  = torch.empty(B, T, (self.agent.fk_model.num_links + 1) * 3, device=dev, dtype=obs_seq.dtype)
+        log_sig_seq = torch.empty(B, T, (self.agent.fk_model.num_links + 1) * 3, device=dev, dtype=obs_seq.dtype)
 
         # Running state: start at default q, zero dq, and obs from first frame (or zeros)
         q_prev = self.decoder.default_dof_pos.unsqueeze(0).expand(B, -1)  # [B,d]
         dq_prev = torch.zeros(B, self.joint_dim, device=dev, dtype=obs_seq.dtype)
-        obs_state = obs_seq[:, 0, :]
-        obs_state = normalizer(obs_state)
+        obs_prev = obs_seq[:, 0, :]
+        obs_prev = normalizer(obs_prev)
 
         # Teacher-forcing previous states
         if q is not None:
@@ -238,38 +233,38 @@ class IntentionVAE(nn.Module):
                        + (1.0 - tf_gate) * q_prev
                 dq_in = tf_gate * (dq[:, t - 1, :] if (t > 0 and dq is not None) else 0.0) \
                         + (1.0 - tf_gate) * dq_prev
+                obs_in = tf_gate * (obs)
             else:
                 q_in, dq_in = q_prev, dq_prev
 
             # Policy step
-            action_t, obj_t, log_sig_t, _ = self.decoder(
-                z, obs_t=obs_state, mask_t=mask_t
+            action_t, mu_t, log_std_t, log_sig_t, _ = self.decoder(
+                z, obs_t=obs_prev, mask_t=mask_t
             )
 
             # Surrogate dynamics step
-            q_pred, dq_pred, u_pred, v_pred = self.surrogate(q_in, dq_in, u, v, action_t)
-            #obs_pred = self.predict_dynamics(action_t, q_in, dq_in, u, v,mask_t)
+            u_in = obs_in[:,:,-6:-3]
+            v_in = obs_in[:,:,-3:]
+            obs_pred, q_pred, dq_pred= self.predict_dynamics(action_t, q_in, dq_in,u_in,v_in, mask_t)
             q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
             # Freeze beyond padding
             q_new = mask_t * q_pred + (1.0 - mask_t) * q_prev
             dq_new = mask_t * dq_pred + (1.0 - mask_t) * dq_prev
-            obs_new = mask_t * obs_pred + (1.0 - mask_t) * obs_state
+            obs_new = mask_t * obs_pred + (1.0 - mask_t) * obs_prev
 
-            # Action distribution (teacher-conditional)
-            mean_t, log_std_t = self.decoder.action_distribution(
-                z, obs_tf_n, mask_t=mask_t
-            )
-
+            
+            obj_t = obs_new[:,:,-6:-3]
             # Store step outputs
-            _store_col(pre_mu_seq, t, mean_t)
-            _store_col(log_std_seq, t, log_std_t)
             _store_col(actions_seq, t, mask_t * action_t)
+            _store_col(mu_seq, t, mu_t)
+            _store_col(log_std_seq, t, log_std_t)
             _store_col(joints_seq, t, q_new)
             _store_col(objects_seq, t, mask_t * obj_t)
-            _store_col(logsig_seq, t, log_sig_t)
+            _store_col(obs_seq, t, obs_new)
+            _store_col(log_sig_seq, t, log_sig_t)
             # Advance
-            q_prev, dq_prev, obs_state = q_new, dq_new, obs_new
+            q_prev, dq_prev, obs_prev = q_new, dq_new, obs_new
 
 
         # ----- FK + normalization → recon_mu -----
@@ -281,13 +276,43 @@ class IntentionVAE(nn.Module):
         comb_resh = combined.view(B, T, -1, 3)
 
         # Use buffers pos_mean/pos_std (broadcasted)
-        recon_mu = ((comb_resh - self.pos_mean) / self.pos_std).reshape(B, T, -1)
+        graph_recon = ((comb_resh - self.pos_mean) / self.pos_std).reshape(B, T, -1)
 
         # ----- return tuple consistent with your trainer -----
         if self.prior == "GMM":
-            return recon_mu, joints_seq, actions_seq, pre_mu_seq, log_std_seq, logsig_seq, mu, logvar, pi_logits
+            return {"traj":
+                        {"graph":graph_recon},
+                    "state":
+                        {"q":joints_seq,
+                        "dq":dq_seq,
+                        "w": w_seq},
+                    "act":
+                        {"act":action_seq,
+                         "mu":mu_seq,
+                         "log_std":log_std_seq,
+                         "log_sigma":log_std_seq},
+                    "obs":
+                        {"obs":obs_seq},
+                    "aux":
+                        [z, mu, logvar, pi_logits]
+                    }
         else:
-            return recon_mu, joints_seq, actions_seq, pre_mu_seq, log_std_seq, logsig_seq, z, mu, logvar
+            return {"traj":
+                        {"graph":graph_recon},
+                    "state":
+                        {"q":joints_seq,
+                        "dq":dq_seq,
+                        "w": w_seq},
+                    "act":
+                        {"act":action_seq,
+                         "mu":mu_seq,
+                         "log_std":log_std_seq,
+                         "log_sigma":log_std_seq},
+                    "obs":
+                        {"obs":obs_seq},
+                    "aux":
+                        [z, mu, logvar]
+                    }
 
     # ---------- Loss (masked, correct normalization) ----------
     def loss(
@@ -297,7 +322,7 @@ class IntentionVAE(nn.Module):
         orig_traj,         # [B,T,D] normalized FK positions (target)
         act_mu,            # [B,T,A] teacher actions (target)
         action_seq,        # [B,T,A] decoder actions (prediction)
-        pre_mu_seq,           # [B,T,d]  (decoder mean, pre-tanh)
+        mu_seq,           # [B,T,d]  (decoder mean, pre-tanh)
         log_std_seq,          # [B,T,d]  (decoder log-std)
         mask,              # [B,T,1] float {0,1}
         *args,             # latent tuples per prior
@@ -335,7 +360,7 @@ class IntentionVAE(nn.Module):
             # a, mean, log_std: [B,T,d] in pre-tanh space
             return 0.5 * (((a - mean) ** 2) * torch.exp(-2.0 * log_std) + 2.0 * log_std + math.log(2 * math.pi))
 
-        #nll_step = _normal_nll(act_mu, pre_mu_seq, log_std_seq).sum(dim=-1)  # [B,T]
+        #nll_step = _normal_nll(act_mu, mu_seq, log_std_seq).sum(dim=-1)  # [B,T]
         #action_loss = (nll_step.mul(mask_bt)).sum().div(valid)
         '''
         def softsign(x):

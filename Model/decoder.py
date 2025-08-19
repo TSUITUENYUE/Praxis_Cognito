@@ -88,7 +88,7 @@ class Decoder(nn.Module):
             self.action_logstd = nn.Parameter(torch.full((self.joint_dim,), log_std_init))
 
         # Object head (unchanged)
-        self.object_head = nn.Linear(hidden_dim, self.object_dim)
+        # self.object_head = nn.Linear(hidden_dim, self.object_dim)
 
         # Per-step variance over FK position vector (links+object)*3
         self.pos_dim = (len(self.fk_model.link_names) + 1) * 3
@@ -198,23 +198,22 @@ class Decoder(nn.Module):
         self,
         z: torch.Tensor,           # [B, Z]
         obs_t: torch.Tensor,       # [B, obs_dim]
-        mask_t: Optional[torch.Tensor] = None  # [B, 1] float {0,1} for stats/regularization
+        mask_t: torch.Tensor       # [B, 1] float {0,1} for stats/regularization
     ):
         """
         Stateless one-step policy. Returns step-level predictions:
             action_t (deterministic) = mean (no squashing),
-            object_t,
             log_sigma_pos_t,
             feats
         """
         feats = self._compute_features(z, obs_t, mask_t)
         mean, log_std = self._dist_params_from_feats(feats)
         action_t = mean
-        object_t = self.object_head(feats)             # [B, obj]
+        # object_t = self.object_head(feats)             # [B, obj]
         sigma_raw = self.var_head(feats)               # [B, pos_dim]
         sigma = self.sigma_min + (self.sigma_max - self.sigma_min) * torch.sigmoid(sigma_raw)
         log_sigma_pos_t = torch.log(sigma)             # [B, pos_dim]
 
         self._last_mean = mean
         self._last_log_std = log_std
-        return action_t, object_t, log_sigma_pos_t, feats
+        return action_t, mean, log_std, log_sigma_pos_t, feats

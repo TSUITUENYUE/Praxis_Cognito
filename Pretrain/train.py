@@ -174,8 +174,6 @@ class Trainer:
                 dq      = dq.to(self.device)
                 mask    = mask.to(self.device)[:, :, None] # [B,T,1]
 
-                u = obs[:,:,-6:-3]
-                v = obs[:,:,-3:]
                 self.optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=True):
                     beta = get_beta(global_step, total_steps, strategy=self.strategy,
@@ -186,75 +184,81 @@ class Trainer:
                     tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
 
                     # --- forward (policy decoder returns actions) ---
-                    recon_mu, joint_cmd, actions_seq, pre_mu_seq, log_std_seq, log_sigma, *aux = self.vae(
+                   traj, state, act, obs, aux = self.vae(
                         graph_x, self.edge_index, mask, self.obs_normalizer,
                         obs_seq=obs,
                         q=q,
                         dq=dq,
-                        u=u,
-                        v=v,
                         tf_ratio=tf_ratio,
                     )
+
+                    recon_mu = traj['graph']
+
+                    q_seq = state['q']
+                    dq_seq = state['dq']
+                    w_seq = state['w']
+
+                    actions_seq = act['act']
+                    mu_seq = act['mu']
+                    log_std_seq = act['log_std']
+                    log_sigma = act['log_sigma']
+
+                    obs_seq = obs['obs']
+
+                    z = aux[0]
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
                     with torch.no_grad():  # inference_mode would also work, but no_grad is perfectly fine here
                         reset_out = self.env.reset()
                         obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
-                        q0 = self.env.robot.get_dofs_position(self.env.motors_dof_idx)  # [B,d]
-                        dq0 = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)  # [B,d]
-
-                        obs0_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
+                        obs_t_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
 
                         B = actions_seq.shape[0]
                         T = actions_seq.shape[1]
-                        d = q0.shape[-1]
                         # Pre-allocate on device with correct dtypes
-                        obs_sim_n_seq = torch.empty(B, T, self.obs_dim, device=self.device, dtype=obs0_n.dtype)
-                        q_sim_seq = torch.empty(B, T, d, device=self.device, dtype=q0.dtype)
-                        dq_sim_seq = torch.empty(B, T, d, device=self.device, dtype=dq0.dtype)
+                        q_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                        dq_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                        w_sim_seq = torch.empty(size=w_seq.shape,device=self.device, dtype=obs_t_n.dtype)
+                        obs_sim_seq = torch.empty(size=obs_seq.shape, device=self.device, dtype=obs_t_n.dtype)
 
                         for t in range(T):
-                            a_t = actions_seq[:, t, :].detach()
+                            mask_t = mask[:, t, :]
+                            a_t, _, _ = self.vae.decoder(z, obs_t_n, mask_t)
                             obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
-                            q_t = self.env.robot.get_dofs_position(self.env.motors_dof_idx)
-                            dq_t = self.env.robot.get_dofs_velocity(self.env.motors_dof_idx)
+                            q_t = self.env.dof_pos
+                            dq_t = self.env.dof_vel
+                            w_t = self.env.base_ang_vel
+
                             obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
 
-                            # write into preallocated buffers
-                            obs_sim_n_seq[:, t].copy_(obs_t_n)
-                            q_sim_seq[:, t].copy_(q_t.to(self.device, non_blocking=True))
-                            dq_sim_seq[:, t].copy_(dq_t.to(self.device, non_blocking=True))
+                            q_sim_seq[:,t].copy_(q_t)
+                            dq_sim_seq[:,t].copy_(dq_t)
+                            w_sim_seq[:,t].copy_(w_t)
+                            obs_sim_seq[:, t].copy_(obs_t_n)
 
-                        #q0 = q0.to(self.device, non_blocking=True)
-                        #dq0 = dq0.to(self.device, non_blocking=True)
-                        u0 = obs_sim_n_seq[:, :, -6:-3]
-                        v0 = obs_sim_n_seq[:, :, -3:]
-                    # --------------- Surrogate rollout (inside the VAE) ---------------
-                    sur_obs_seq = self.vae.predict_dynamics(
-                        actions_seq.detach(),    # [B,T,d] — only surrogate learns from sim loss
-                        q0=q0.detach(),
-                        dq0=dq0.detach(),
-                        u0=u0.detach(),
-                        v0=v0.detach(),
-                        mask=mask,
-                    )
 
+                    u_sim_seq = obs_sim_seq[:, :, -6:-3]
+                    v_sim_seq = obs_sim_seq[:, :, -3:]
                     # --- VAE loss (pose + action + KL) ---
                     loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
                         recon_mu, log_sigma, graph_x,
                         act, actions_seq,
-                        pre_mu_seq, log_std_seq,
+                        mu_seq, log_std_seq,
                         mask, *aux,
                         beta=beta,
                         lambda_kinematic=self.lambda_kinematic,
                         lambda_dynamic=self.lambda_dynamic
                     )
 
+
                     # --- Sim loss (only trains surrogate via surrogate path) ---
-                    #q_loss  = self.masked_mse(sur_q_seq,  q_sim_seq.detach(),  mask)
-                    #dq_loss = self.masked_mse(sur_dq_seq, dq_sim_seq.detach(), mask)
-                    obs_loss = self.masked_mse(sur_obs_seq, obs_sim_n_seq.detach(), mask)
-                    #sim_loss = self.w_q * q_loss + self.w_dq * dq_loss + self.w_obs * obs_loss
-                    sim_loss = obs_loss
+                    q_loss  = self.masked_mse(q_seq,  q_sim_seq.detach(),  mask)
+                    dq_loss = self.masked_mse(dq_seq, dq_sim_seq.detach(), mask)
+                    w_loss  = self.masked_mse(w_seq, w_sim_seq.detach(), mask)
+
+                    u_loss  = self.masked_mse(u_seq, u_sim_seq.detach(), mask)
+                    v_loss  = self.masked_mse(v_seq, v_sim_seq.detach(), mask)
+                    #obs_loss = self.masked_mse(obs_sim_n_seq.detach(), obs_seq.detach(), mask)
+                    sim_loss = self.w_q * q_loss + self.w_dq * dq_loss + self.w_w * w_loss + self.w_u * u_loss + self.w_v * v_loss
                     total_loss = loss + self.lambda_sim * sim_loss
 
                     # --- diag: unnormalized recon MSE in world units ---
@@ -278,7 +282,7 @@ class Trainer:
                         f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
                         f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss.item():.4f} "
                         f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
-                        f"| Sim:{sim_loss.item():.4f} (q={q_loss.item():.4f}, dq={dq_loss.item():.4f}, obs={obs_loss.item():.4f}) "
+                        f"| Sim:{sim_loss.item():.4f}"
                         f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
                     )
 
