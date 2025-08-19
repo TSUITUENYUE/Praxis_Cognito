@@ -5,23 +5,27 @@ from torch.utils.data import Dataset
 class TrajectoryDataset(Dataset):
     """
     Raw HDF5 must contain:
-      - agent_trajectories: [N, T, n_dofs]
+      - dof_pos:            [N, T, n_dofs]
       - dof_vel:            [N, T, n_dofs]
-      - obj_trajectories:   [N, T, 3]
+      - base_pos:           [N, T, 3]
+      - base_vel:           [N, T, 3]
+      - base_ang:           [N, T, 3]
       - obs:                [N, T, obs_dim]
       - actions:            [N, T, n_dofs]
-      - (optional) valid_length: [N]   # first 'done' step per clip; if missing, assumes T
+      - valid_length: [N]   # first 'done' step per clip; if missing, assumes T
 
     We write processed:
       - graph_x:      z-scored positions of [links + object]   -> [N, T, num_nodes, 3]
       - joint_trajs:  raw joint angles                         -> [N, T, n_dofs]
       - joint_vels:   raw dq                                   -> [N, T, n_dofs]
+      - base_pos:     raw                                      -> [N, T, 3]
+      - base_vel:     raw                                      -> [N, T, 3]
+      - base_ang:     raw                                      -> [N, T, 3]
       - obs:          raw                                      -> [N, T, obs_dim]
       - act:          raw post-tanh actions                    -> [N, T, n_dofs]
       - mask:         time mask (t < valid_length)             -> [N, T, 1] (bool)
-      - valid_length: copied through for convenience           -> [N]
       - pos_mean/std: [3]
-    __getitem__ returns (graph_x, obs, act, q, dq, mask)
+    __getitem__ returns (graph_x, q, dq, p, dp, w, obs, act, mask)
     """
     def __init__(self, processed_path: str, source_path: str, agent, force_reprocess: bool = False):
         super().__init__()
@@ -50,12 +54,19 @@ class TrajectoryDataset(Dataset):
         if self.h5_file is None:
             self.h5_file = h5py.File(self.processed_path, 'r', libver='latest', swmr=True)
         gx   = torch.from_numpy(self.h5_file['graph_x'][idx]).float()       # [T, nodes, 3] (normalized)
+
+        q = torch.from_numpy(self.h5_file['joint_trajs'][idx]).float()  # [T, n_dofs]  (raw)
+        dq = torch.from_numpy(self.h5_file['joint_vels'][idx]).float()  # [T, n_dofs]  (raw rad/s)
+
+        p = torch.from_numpy(self.h5_file['base_pos'][idx]).float()     # [T, 3]  (raw)
+        dp = torch.from_numpy(self.h5_file['base_vel'][idx]).float()    # [T, 3]  (raw)
+        w = torch.from_numpy(self.h5_file['base_ang'][idx]).float()     # [T, 3]  (raw)
+
         obs  = torch.from_numpy(self.h5_file['obs'][idx]).float()           # [T, obs_dim] (raw)
         act  = torch.from_numpy(self.h5_file['act'][idx]).float()           # [T, n_dofs]
-        q    = torch.from_numpy(self.h5_file['joint_trajs'][idx]).float()   # [T, n_dofs]  (raw)
-        dq   = torch.from_numpy(self.h5_file['joint_vels'][idx]).float()    # [T, n_dofs]  (raw rad/s)
+
         mask = torch.from_numpy(self.h5_file['mask'][idx]).squeeze(-1).float()  # [T] ★ NEW
-        return gx, obs, act, q, dq, mask
+        return gx, q, dq, p, dp, w, obs, act, mask
 
     @property
     def pos_mean(self): return self._pos_mean
@@ -70,9 +81,9 @@ class TrajectoryDataset(Dataset):
 
         # ---- Pass 1: position stats (links + object) ----
         with h5py.File(self.source_path, 'r') as f_in:
-            agent_trajs = f_in['agent_trajectories']  # [N,T,D]
-            obj_trajs   = f_in['obj_trajectories']    # [N,T,3]
-            N, T, _ = agent_trajs.shape
+            dof_pos = f_in['dof_pos']  # [N,T,D]
+            obj_trajs = f_in['obs'][:,:,-6:-3]    # [N,T,3]
+            N, T, _ = dof_pos.shape
             num_links = len(fk.link_names)
 
             sum_pos = torch.zeros(3, device=device)
@@ -82,7 +93,7 @@ class TrajectoryDataset(Dataset):
             chunk = 1024
             for i in tqdm(range(0, N, chunk), desc="Stats pass"):
                 j = min(i+chunk, N)
-                q   = torch.from_numpy(agent_trajs[i:j]).to(device)     # [B,T,D]
+                q   = torch.from_numpy(dof_pos[i:j]).to(device)     # [B,T,D]
                 obj = torch.from_numpy(obj_trajs[i:j]).to(device)       # [B,T,3]
                 B = q.shape[0]
                 qf = q.reshape(B*T, self.n_dofs)
@@ -99,30 +110,38 @@ class TrajectoryDataset(Dataset):
 
         # ---- Pass 2: write processed ----
         with h5py.File(self.source_path, 'r') as f_in, h5py.File(self.processed_path, 'w') as f_out:
-            agent_trajs = f_in['agent_trajectories']
-            obj_trajs   = f_in['obj_trajectories']
-            obs_dset    = f_in['obs']
-            act_dset    = f_in['actions']
-            joint_vel   = f_in['dof_vel']
-            # ★ NEW: valid_length may or may not be present
-            has_vlen    = 'valid_length' in f_in
-            valid_len_src = f_in['valid_length'][:] if has_vlen else None
+            dof_pos = f_in['dof_pos']
+            dof_vel = f_in['dof_vel']
 
-            N, T, _ = agent_trajs.shape
+            base_pos = f_in['base_pos']
+            base_vel = f_in['base_vel']
+            base_ang = f_in['base_ang']
+
+            obs_dset    = f_in['obs']
+            act_dset    = f_in['act']
+
+            valid_len_src = f_in['valid_length'][:]
+
+            N, T, _ = dof_pos.shape
             num_links = len(fk.link_names)
             num_nodes = num_links + 1
             obs_dim   = obs_dset.shape[-1]
 
             f_out.create_dataset('graph_x',      (N, T, num_nodes, 3), dtype='f4')
             f_out.create_dataset('joint_trajs',  (N, T, self.n_dofs),  dtype='f4')
-            f_out.create_dataset('obs',          (N, T, obs_dim),      dtype='f4')
             f_out.create_dataset('joint_vels',   (N, T, self.n_dofs),  dtype='f4')
+
+            f_out.create_dataset('base_pos',          (N, T, 3),      dtype='f4')
+            f_out.create_dataset('base_vel',          (N, T, 3),      dtype='f4')
+            f_out.create_dataset('base_ang',          (N, T, 3),      dtype='f4')
+
+            f_out.create_dataset('obs',          (N, T, obs_dim),      dtype='f4')
             f_out.create_dataset('act',          (N, T, self.n_dofs),  dtype='f4')
+
             f_out.create_dataset('mask',         (N, T, 1),            dtype='f4')
+
             f_out.create_dataset('pos_mean', data=pos_mean.cpu().numpy())
             f_out.create_dataset('pos_std',  data=pos_std.cpu().numpy())
-            #f_out.create_dataset('valid_length', data=(valid_len_src if has_vlen else np.full((N,), T, dtype=np.int32)))  # ★ NEW
-
             # Precompute time index for mask building
             t_index = np.arange(T, dtype=np.int32)[None, :]  # [1, T] ★ NEW
 
@@ -131,7 +150,7 @@ class TrajectoryDataset(Dataset):
                 j = min(i+chunk, N)
 
                 # FK -> positions
-                q_np   = agent_trajs[i:j]                          # numpy view
+                q_np   = dof_pos[i:j]                          # numpy view
                 obj_np = obj_trajs[i:j]
                 q      = torch.from_numpy(q_np).to(device)         # [B,T,D]
                 obj    = torch.from_numpy(obj_np).to(device)       # [B,T,3]
@@ -142,26 +161,34 @@ class TrajectoryDataset(Dataset):
                 obj = obj.unsqueeze(2)                             # [B,T,1,3]
                 graph_x = torch.cat([links, obj], dim=2)           # [B,T,num_nodes,3]
 
-                # normalize ONLY positions for loss
+                # normalize positions for loss
                 graph_x = (graph_x - pos_mean) / pos_std
-
+                # base_pos = (base_pos - pos_mean) / pos_std
                 # raw tensors (as float32)
-                obs = torch.from_numpy(obs_dset[i:j]).float()
                 q_raw  = torch.from_numpy(q_np).float()
-                dq_raw = torch.from_numpy(joint_vel[i:j]).float()
-                act    = torch.from_numpy(act_dset[i:j]).float()
+                dq_raw = torch.from_numpy(dof_vel[i:j]).float()
 
+                #unnorm for surrogate dynamics
+                base_pos = torch.from_numpy(base_pos[i:j]).float()
+                base_vel = torch.from_numpy(base_vel[i:j]).float()
+                base_ang = torch.from_numpy(base_ang[i:j]).float()
+
+                act    = torch.from_numpy(act_dset[i:j]).float()
+                obs    = torch.from_numpy(obs_dset[i:j]).float()
                 # ★ NEW: build mask from valid_length (vectorized for the block)
-                if has_vlen:
-                    vlen_block = valid_len_src[i:j].astype(np.int32)  # [B]
-                else:
-                    vlen_block = np.full((j - i,), T, dtype=np.int32)
+                vlen_block = valid_len_src[i:j].astype(np.int32)  # [B]
                 mask_block = (t_index < vlen_block[:, None])[:,:, None].astype(np.float32)  # [B, T, 1] bool
 
                 # write
                 f_out['graph_x'][i:j]      = graph_x.cpu().numpy()
+
                 f_out['joint_trajs'][i:j]  = q_raw.cpu().numpy()
-                f_out['obs'][i:j]          = obs.cpu().numpy()
                 f_out['joint_vels'][i:j]   = dq_raw.cpu().numpy()
+
+                f_out['base_pos'][i:j]     = base_pos.cpu().numpy()
+                f_out['base_vel'][i:j]     = base_vel.cpu().numpy()
+                f_out['base_ang'][i:j]     = base_ang.cpu().numpy()
+
+                f_out['obs'][i:j]          = obs.cpu().numpy()
                 f_out['act'][i:j]          = act.cpu().numpy()
                 f_out['mask'][i:j]         = mask_block

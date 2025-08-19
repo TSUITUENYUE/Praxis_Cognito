@@ -96,8 +96,8 @@ class IntentionVAE(nn.Module):
         B = mu.shape[0]
         idx = torch.arange(B, device=mu.device)
         mu_sel = mu[idx, comp]        # [B,D]
-        logv_sel = logvar[idx, comp]  # [B,D]
-        std = torch.exp(0.5 * logv_sel)
+        logdu_sel = logvar[idx, comp]  # [B,D]
+        std = torch.exp(0.5 * logdu_sel)
         eps = torch.randn_like(std)
         return mu_sel + eps * std
 
@@ -113,7 +113,7 @@ class IntentionVAE(nn.Module):
         elem = 0.5 * ((x - mu) ** 2) * inv_var + log_sigma + 0.5 * math.log(2 * math.pi)  # [B,T,D]
         return elem.mean(dim=-1)  # [B,T]
 
-    def predict_dynamics(self, a_t, q_t, dq_t, w_t, u_t, v_t, mask_t):
+    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, mask_t):
         B, d = a_t.shape
         dev = a_t.device
         self.actions = torch.clip(a_t, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
@@ -123,17 +123,17 @@ class IntentionVAE(nn.Module):
         q_lower = self.decoder.joint_lower.to(dev)
         q_upper = self.decoder.joint_upper.to(dev)
 
-        # Surrogate step: (q_t, dq_t, u_t, v_t, a_t) -> (q_next, dq_next, u_next, v_next)
-        q_pred, dq_pred, u_pred, v_pred = self.surrogate(q_t, dq_t, w_t, u_t, v_t, a_t)
+        # Surrogate step: (q_t, dq_t, u_t, du_t, a_t) -> (q_next, dq_next, u_next, du_next)
+        q_pred, dq_pred, p_pred,dp_pred,w_pred,dw_pred, u_pred, du_pred = self.surrogate(q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, a_t)
         q_pred = _clamp_to_limits(q_pred, q_lower, q_upper)
-        self.base_pos[:] = self.robot.get_pos()
-        self.base_quat[:] = self.robot.get_quat()
+        self.base_pos = p_t
+        self.base_quat = w_t
         self.base_euler = quat_to_xyz(
             transform_quat_by_quat(torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat),
         )
         inv_base_quat = inv_quat(self.base_quat)
-        self.base_lin_vel[:] = transform_by_quat(dq_t, inv_base_quat)
-        self.base_ang_vel[:] = transform_by_quat(w_t, inv_base_quat)
+        self.base_lin_vel = transform_by_quat(dp_t, inv_base_quat)
+        self.base_ang_vel = transform_by_quat(dw_t, inv_base_quat)
         self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
 
 
@@ -141,25 +141,25 @@ class IntentionVAE(nn.Module):
         q_t = mask_t * q_pred + (1.0 - mask_t) * q_t
         dq_t = mask_t * dq_pred + (1.0 - mask_t) * dq_t
         u_t = mask_t * u_pred + (1.0 - mask_t) * u_t
-        v_t = mask_t * v_pred + (1.0 - mask_t) * v_t
+        du_t = mask_t * du_pred + (1.0 - mask_t) * du_t
 
         # compute observations
         obs_pred = torch.cat(
             [
+                self.base_lin_vel * self.obs_scales["lin_vel"],  # 3
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
                 self.projected_gravity,  # 3
-                self.commands * self.commands_scale,  # 3
                 (q_t - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
                 dq_t * self.obs_scales["dof_vel"],  # 12
                 exec_actions,  # 12
                 u_t,  # 3 <-- ADDED
-                v_t  # 3 <-- ADDED
+                du_t  # 3 <-- ADDED
             ],
             axis=-1,
         )
-        self.last_actions[:] = self.actions[:]
-        self.last_dof_vel[:] = self.dof_vel[:]
-        return obs_pred, q_pred, dq_pred
+        self.last_actions = self.actions
+        self.last_dof_vel = self.dof_vel
+        return obs_pred, q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred
     # ---------- Forward ----------
     def forward(
             self,
@@ -244,8 +244,8 @@ class IntentionVAE(nn.Module):
 
             # Surrogate dynamics step
             u_in = obs_in[:,:,-6:-3]
-            v_in = obs_in[:,:,-3:]
-            obs_pred, q_pred, dq_pred= self.predict_dynamics(action_t, q_in, dq_in,u_in,v_in, mask_t)
+            du_in = obs_in[:,:,-3:]
+            obs_pred, q_pred, dq_pred= self.predict_dynamics(action_t, q_in, dq_in,u_in,du_in, mask_t)
             q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
             # Freeze beyond padding

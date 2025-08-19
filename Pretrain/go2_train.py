@@ -7,15 +7,6 @@ from omegaconf import DictConfig, OmegaConf
 from importlib import metadata
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    try:
-        if metadata.version("rsl-rl"):
-            raise ImportError
-    except metadata.PackageNotFoundError:
-        if metadata.version("rsl-rl-lib") != "2.2.4":
-            raise ImportError
-except (metadata.PackageNotFoundError, ImportError) as e:
-    raise ImportError("Please uninstall 'rsl_rl' and install 'rsl-rl-lib==2.2.4'.") from e
 
 from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
@@ -26,7 +17,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="go2-walking")
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
-    parser.add_argument("--max_iterations", type=int, default=200)
+    parser.add_argument("--max_iterations", type=int, default=201)
     parser.add_argument("--config", type=str, default="../conf/go2.yaml")
     args = parser.parse_args()
 

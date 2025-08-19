@@ -1,11 +1,11 @@
-import pickle
+
 import genesis as gs
 import numpy as np
 import time
 import torch
 import h5py
 import os
-from omegaconf import DictConfig
+from omegaconf import OmegaConf,DictConfig
 import torch.nn as nn
 import torch.nn.functional as F
 from rsl_rl.runners import OnPolicyRunner
@@ -82,24 +82,25 @@ def generate(cfg: DictConfig):
     WRITE_BUFFER_SIZE = 5000
 
     log_dir = cfg.dataset.log_dir
-    env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"{log_dir}/cfgs.pkl", "rb"))
+
+    #env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = cfg.rl
 
     # original_entropy = train_cfg['algorithm'].get('entropy_coef', 0.0)
-    train_cfg['algorithm']['entropy_coef'] = 0.02
+    cfg.rl.train.algorithm.entropy_coef = 0.02
 
     gs.init(logging_level='warning')
 
-    reward_cfg["reward_scales"] = {"survive": 1.0, "termination": -200.0}
+    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0}
     agent = Agent(**cfg.agent)
     env = Go2Env(
         num_envs=NUM_ENVS,
-        env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg,
+        env_cfg=cfg.rl.env, obs_cfg=cfg.rl.obs, reward_cfg=cfg.rl.reward, command_cfg=cfg.rl.command,
         show_viewer=NUM_ENVS < 128,
         agent=agent
     )
-
+    train_cfg = OmegaConf.to_container(cfg.rl.train, resolve=True)
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
-    primitives = os.path.join(log_dir, "model_199.pt")
+    primitives = os.path.join(log_dir, "model_200.pt")
     runner.load(primitives)
     policy_alg = runner.alg
 
@@ -120,23 +121,30 @@ def generate(cfg: DictConfig):
     max_episode_len = int(MAX_EPISODE_SECONDS * FRAME_RATE)
 
     # --- Buffers (GPU) ---
-    agent_traj_buffer   = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
-    obj_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
+    dof_pos_traj_buffer   = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
+    dof_vel_traj_buffer = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
+
+    base_pos_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
+    base_vel_buffer = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)
+    base_ang_buffer = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)
+
     obs_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, env.num_obs), device=gs.device)
     act_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, env.num_actions), device=gs.device)
-    dof_vel_traj_buffer = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
+
     done_traj_buffer    = torch.zeros((max_episode_len, NUM_ENVS), dtype=torch.bool, device=gs.device)
 
     # >>> DEDUP EMBEDDING BACK TO JOINTS-ONLY <<<
-    embedding_dim = (max_episode_len // DOWNSAMPLE_FACTOR) * n_dofs
+    embedding_dim = (max_episode_len // DOWNSAMPLE_FACTOR) * (n_dofs + 2 * 3)
     res = faiss.StandardGpuResources()
     faiss_index = faiss.GpuIndexFlatIP(res, embedding_dim)
 
     total_episodes_saved = 0
     mean_surrogate_loss = 0
     icm_loss = torch.tensor(0.0)
-    agent_save_buffer, obj_save_buffer = [], []
-    obs_save_buffer, act_save_buffer, vel_save_buffer = [], [], []
+
+    dof_pos_save_buffer,dof_vel_save_buffer, = [], []
+    base_pos_save_buffer,base_vel_save_buffer,base_ang_save_buffer = [], [], []
+    obs_save_buffer, act_save_buffer= [], []
     valid_len_save_buffer = []
 
     print(f"Starting curiosity-driven data generation. Target: {EPISODES_TO_COLLECT} episodes.")
@@ -162,21 +170,30 @@ def generate(cfg: DictConfig):
     print(f"Saved normalizer state to {norm_state_path}")
 
     with h5py.File(SAVE_FILENAME, 'w') as f:
-        agent_ds = f.create_dataset('agent_trajectories',
+        dof_pos_ds = f.create_dataset('dof_pos',
                                     shape=(EPISODES_TO_COLLECT, max_episode_len, n_dofs),
                                     dtype='float32', compression="gzip")
-        obj_ds   = f.create_dataset('obj_trajectories',
-                                    shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
-                                    dtype='float32', compression="gzip")
-        obs_ds   = f.create_dataset('obs',
-                                    shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_obs),
-                                    dtype='float32', compression="gzip")
-        actions_ds = f.create_dataset('actions',
-                                      shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_actions),
-                                      dtype='float32', compression="gzip")
         dof_vel_ds = f.create_dataset('dof_vel',
                                       shape=(EPISODES_TO_COLLECT, max_episode_len, n_dofs),
                                       dtype='float32', compression="gzip")
+
+        base_pos_ds = f.create_dataset('base_pos',
+                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
+                                       dtype='float32', compression="gzip")
+        base_vel_ds = f.create_dataset('base_vel',
+                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
+                                       dtype='float32', compression="gzip")
+        base_ang_ds = f.create_dataset('base_ang',
+                                         shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
+                                         dtype='float32', compression="gzip")
+
+        obs_ds   = f.create_dataset('obs',
+                                    shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_obs),
+                                    dtype='float32', compression="gzip")
+        act_ds = f.create_dataset('act',
+                                      shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_actions),
+                                      dtype='float32', compression="gzip")
+
         valid_len_ds = f.create_dataset('valid_length',
                                         shape=(EPISODES_TO_COLLECT,), dtype='int32', compression="gzip")
 
@@ -188,7 +205,7 @@ def generate(cfg: DictConfig):
             meta.create_dataset('action_scale', data=np.asarray(act_scale, dtype=np.float32))
         else:
             meta.attrs['action_scale'] = float(act_scale)
-        meta.create_dataset('default_dof_pos', data=np.asarray(env.default_dof_pos.cpu(), dtype=np.float32))
+        meta.create_dataset('default_dof_pos_', data=np.asarray(env.default_dof_pos.cpu(), dtype=np.float32))
         meta.attrs['normalizer_pt'] = os.path.abspath(norm_state_path)
         meta.attrs['faiss_threshold'] = float(SIMILARITY_THRESHOLD)
         meta.attrs['downsample_factor'] = int(DOWNSAMPLE_FACTOR)
@@ -206,31 +223,34 @@ def generate(cfg: DictConfig):
                 obs_traj_buffer[t] = obs
 
                 # act with normalized obs like training
-                actions = policy_alg.act(obs_n, critic_obs_n)
-                act_traj_buffer[t] = actions
+                act = policy_alg.act(obs_n, critic_obs_n)
+                act_traj_buffer[t] = act
 
                 # env step
-                next_obs, rews, dones, infos = env.step(actions)
+                next_obs, rews, dones, infos = env.step(act)
                 done_traj_buffer[t] = (dones.squeeze(-1) > 0) if dones.ndim == 2 else (dones > 0)
 
                 # record kinematics AFTER step
                 q_now  = env.robot.get_dofs_position(env.motors_dof_idx)
                 dq_now = env.robot.get_dofs_velocity(env.motors_dof_idx)
-                agent_traj_buffer[t]   = q_now
+                dof_pos_traj_buffer[t]   = q_now
                 dof_vel_traj_buffer[t] = dq_now
-                obj_traj_buffer[t] = env.relative_ball_pos
+
+                base_pos_buffer[t] = env.base_pos
+                base_vel_buffer[t] = env.base_lin_vel
+                base_ang_buffer[t] = env.base_ang_vel
 
                 # curiosity plumbing
                 state_normalizer.update(obs)
-                action_normalizer.update(actions)
+                action_normalizer.update(act)
                 state_normalizer.update(next_obs)
-                norm_obs, norm_actions, norm_next_obs = (
+                norm_obs, norm_act, norm_next_obs = (
                     state_normalizer.normalize(obs),
-                    action_normalizer.normalize(actions),
+                    action_normalizer.normalize(act),
                     state_normalizer.normalize(next_obs),
                 )
                 with torch.no_grad():
-                    intrinsic_reward, _ = icm(norm_obs, norm_actions, norm_next_obs)
+                    intrinsic_reward, _ = icm(norm_obs, norm_act, norm_next_obs)
                 reward_normalizer.update(intrinsic_reward.unsqueeze(-1))
                 intrinsic_reward /= torch.sqrt(reward_normalizer.var + reward_normalizer.epsilon)
                 total_reward = rews + intrinsic_reward * CURIOSITY_BETA
@@ -254,17 +274,17 @@ def generate(cfg: DictConfig):
                     num_transitions = policy_alg.storage.step
                     if num_transitions > 1:
                         all_states  = policy_alg.storage.observations.view(-1, input_dim)
-                        all_actions = policy_alg.storage.actions.view(-1, output_dim)
+                        all_act = policy_alg.storage.actions.view(-1, output_dim)
                         end_idx = (num_transitions - 1) * policy_alg.storage.num_envs
-                        batch_states, batch_actions = all_states[:end_idx], all_actions[:end_idx]
+                        batch_states, batch_act = all_states[:end_idx], all_act[:end_idx]
                         start_idx_next, end_idx_next = policy_alg.storage.num_envs, num_transitions * policy_alg.storage.num_envs
                         batch_next_states = all_states[start_idx_next:end_idx_next]
 
                         norm_batch_states      = state_normalizer.normalize(batch_states)
-                        norm_batch_actions     = action_normalizer.normalize(batch_actions)
+                        norm_batch_act     = action_normalizer.normalize(batch_act)
                         norm_batch_next_states = state_normalizer.normalize(batch_next_states)
 
-                        f_loss, i_loss = icm(norm_batch_states, norm_batch_actions, norm_batch_next_states)
+                        f_loss, i_loss = icm(norm_batch_states, norm_batch_act, norm_batch_next_states)
                         icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
                         icm_optimizer.zero_grad()
                         icm_loss.backward()
@@ -273,41 +293,66 @@ def generate(cfg: DictConfig):
                     policy_alg.compute_returns(critic_obs_n)
                     mean_value_loss, mean_surrogate_loss, _, _, _ = policy_alg.update()
 
-            action_mean = torch.mean(actions).item()
-            action_std  = torch.std(actions).item()
+            action_mean = torch.mean(act).item()
+            action_std  = torch.std(act).item()
 
             # ---- Build dedup embeddings (JOINTS ONLY, NO Z-SCORE) ----
-            agent_np = agent_traj_buffer.cpu().numpy()    # [T, E, DoF]
-            obj_np   = obj_traj_buffer.cpu().numpy()      # [T, E, 3]
+            dof_pos_np  = dof_pos_traj_buffer.cpu().numpy()    # [T, E, DoF]
+            dof_vel_np  = dof_vel_traj_buffer.cpu().numpy()
+
+            base_pos_np = base_pos_buffer.cpu().numpy()      # [T, E, 3]
+            base_vel_np = base_vel_buffer.cpu().numpy()  # [T, E, 3]
+            base_ang_np = base_ang_buffer.cpu().numpy()  # [T, E, 3]
+
             obs_np   = obs_traj_buffer.cpu().numpy()
             act_np   = act_traj_buffer.cpu().numpy()
-            vel_np   = dof_vel_traj_buffer.cpu().numpy()
+
             valid_len_np = np.where(first_done_seen.cpu().numpy() == max_episode_len,
                                     max_episode_len,
                                     first_done_seen.cpu().numpy())
 
             # [E, T, ...]
-            agent_batch = np.transpose(agent_np, (1, 0, 2))
-            obj_batch   = np.transpose(obj_np,   (1, 0, 2))
-            obs_batch   = np.transpose(obs_np,   (1, 0, 2))
-            act_batch   = np.transpose(act_np,   (1, 0, 2))
-            vel_batch   = np.transpose(vel_np,   (1, 0, 2))
+            dof_pos_batch  = np.transpose(dof_pos_np, (1, 0, 2))
+            dof_vel_batch  = np.transpose(dof_vel_np, (1, 0, 2))
+
+            base_pos_batch = np.transpose(base_pos_np,(1, 0, 2))
+            base_vel_batch = np.transpose(base_vel_np,(1, 0, 2))
+            base_ang_batch = np.transpose(base_ang_np,(1, 0, 2))
+
+            obs_batch      = np.transpose(obs_np,     (1, 0, 2))
+            act_batch      = np.transpose(act_np,     (1, 0, 2))
+
 
             # zero invalid tail (matches written data)
             for e in range(NUM_ENVS):
                 L = valid_len_np[e]
                 if L < max_episode_len:
-                    agent_batch[e, L:] = 0.0
-                    vel_batch[e,   L:] = 0.0
-                    obj_batch[e,   L:] = 0.0
+                    dof_pos_batch[e, L:] = 0.0
+                    dof_vel_batch[e, L:] = 0.0
+
+                    base_pos_batch[e,   L:] = 0.0
+                    base_vel_batch[e, L:] = 0.0
+                    base_ang_batch[e, L:] = 0.0
+
                     obs_batch[e,   L:] = 0.0
                     act_batch[e,   L:] = 0.0
 
-            # Downsample joints ONLY for dedup
-            agent_dsmp = agent_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, DoF]
+            # Downsampled blocks (these are NumPy already in your code)
+            dof_pos_dsmp  = dof_pos_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, DoF]
+            base_vel_dsmp = base_vel_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, 3]
+            base_ang_dsmp = base_ang_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, 3]
 
-            new_embeddings = agent_dsmp.reshape(NUM_ENVS, -1).astype(np.float32)
-            faiss.normalize_L2(new_embeddings)  # cosine via IP
+            # Flatten per episode
+            J = dof_pos_dsmp.reshape(NUM_ENVS, -1)
+            V = base_vel_dsmp.reshape(NUM_ENVS, -1)
+            W = base_ang_dsmp.reshape(NUM_ENVS, -1)
+
+            #per-block L2 to balance contributions
+            faiss.normalize_L2(J)
+            faiss.normalize_L2(V)
+            faiss.normalize_L2(W)
+
+            new_embeddings = np.concatenate([J, V, W],axis=1)
 
             if faiss_index.ntotal == 0:
                 unique_indices = np.arange(len(new_embeddings))
@@ -317,41 +362,58 @@ def generate(cfg: DictConfig):
                 unique_indices = np.where(is_unique_mask)[0]
 
             if unique_indices.size > 0:
-                agent_save_buffer.append(agent_batch[unique_indices])
-                obj_save_buffer.append(obj_batch[unique_indices])
+                dof_pos_save_buffer.append(dof_pos_batch[unique_indices])
+                dof_vel_save_buffer.append(dof_vel_batch[unique_indices])
+
+                base_pos_save_buffer.append(base_pos_batch[unique_indices])
+                base_vel_save_buffer.append(base_vel_batch[unique_indices])
+                base_ang_save_buffer.append(base_ang_batch[unique_indices])
+
                 obs_save_buffer.append(obs_batch[unique_indices])
                 act_save_buffer.append(act_batch[unique_indices])
-                vel_save_buffer.append(vel_batch[unique_indices])
+
                 valid_len_save_buffer.append(valid_len_np[unique_indices])
+
                 faiss_index.add(x=new_embeddings[unique_indices])
                 episodes_since_last_save += len(unique_indices)
 
             # Write in blocks
             if episodes_since_last_save >= WRITE_BUFFER_SIZE or total_episodes_saved + episodes_since_last_save >= EPISODES_TO_COLLECT:
-                if agent_save_buffer:
-                    agent_block = np.concatenate(agent_save_buffer, axis=0)
-                    obj_block   = np.concatenate(obj_save_buffer,   axis=0)
-                    obs_block   = np.concatenate(obs_save_buffer,   axis=0)
-                    act_block   = np.concatenate(act_save_buffer,   axis=0)
-                    vel_block   = np.concatenate(vel_save_buffer,   axis=0)
-                    vlen_block  = np.concatenate(valid_len_save_buffer, axis=0)
+                if dof_pos_save_buffer:
+                    dof_pos_block  = np.concatenate(dof_pos_save_buffer,  axis=0)
+                    dof_vel_block  = np.concatenate(dof_vel_save_buffer,  axis=0)
 
-                    num_in_block = agent_block.shape[0]
+                    base_pos_block = np.concatenate(base_pos_save_buffer, axis=0)
+                    base_vel_block = np.concatenate(base_vel_save_buffer, axis=0)
+                    base_ang_block = np.concatenate(base_ang_save_buffer, axis=0)
+
+                    obs_block  = np.concatenate(obs_save_buffer,      axis=0)
+                    act_block  = np.concatenate(act_save_buffer,      axis=0)
+
+                    vlen_block = np.concatenate(valid_len_save_buffer,axis=0)
+
+                    num_in_block = dof_pos_block.shape[0]
                     start_idx = total_episodes_saved
                     end_idx = min(total_episodes_saved + num_in_block, EPISODES_TO_COLLECT)
                     num_to_write = end_idx - start_idx
                     if num_to_write > 0:
                         print(f"  ...Writing {num_to_write} episodes to disk...")
-                        agent_ds[start_idx:end_idx]   = agent_block[:num_to_write]
-                        obj_ds[start_idx:end_idx]     = obj_block[:num_to_write]
-                        obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
-                        actions_ds[start_idx:end_idx] = act_block[:num_to_write]
-                        dof_vel_ds[start_idx:end_idx] = vel_block[:num_to_write]
+                        dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
+                        dof_vel_ds[start_idx:end_idx]   = dof_vel_block[:num_to_write]
+
+                        base_pos_ds[start_idx:end_idx]  = base_pos_block[:num_to_write]
+                        base_vel_ds[start_idx:end_idx]  = base_vel_block[:num_to_write]
+                        base_ang_ds[start_idx:end_idx]  = base_ang_block[:num_to_write]
+
+                        obs_ds[start_idx:end_idx]       = obs_block[:num_to_write]
+                        act_ds[start_idx:end_idx]       = act_block[:num_to_write]
+
                         valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
                         total_episodes_saved = end_idx
 
-                    agent_save_buffer, obj_save_buffer = [], []
-                    obs_save_buffer, act_save_buffer, vel_save_buffer = [], [], []
+                    dof_pos_save_buffer, dof_vel_save_buffer, = [], []
+                    base_pos_save_buffer, base_vel_save_buffer, base_ang_save_buffer = [], [], []
+                    obs_save_buffer, act_save_buffer = [], []
                     valid_len_save_buffer = []
                     episodes_since_last_save = 0
 
@@ -360,25 +422,35 @@ def generate(cfg: DictConfig):
                   f"| Action Mean: {action_mean:.3f} | Action Std: {action_std:.3f}")
 
         # Final flush if remaining
-        if agent_save_buffer:
-            agent_block = np.concatenate(agent_save_buffer, axis=0)
-            obj_block   = np.concatenate(obj_save_buffer,   axis=0)
+        if dof_pos_save_buffer:
+            dof_pos_block = np.concatenate(dof_pos_save_buffer, axis=0)
+            dof_vel_block   = np.concatenate(dof_vel_save_buffer,   axis=0)
+
+            base_pos_block   = np.concatenate(base_pos_save_buffer,   axis=0)
+            base_vel_block   = np.concatenate(base_vel_save_buffer,   axis=0)
+            base_ang_block   = np.concatenate(base_ang_save_buffer,   axis=0)
+
             obs_block   = np.concatenate(obs_save_buffer,   axis=0)
             act_block   = np.concatenate(act_save_buffer,   axis=0)
-            vel_block   = np.concatenate(vel_save_buffer,   axis=0)
+
             vlen_block  = np.concatenate(valid_len_save_buffer, axis=0)
 
-            num_in_block = agent_block.shape[0]
+            num_in_block = dof_pos_block.shape[0]
             start_idx = total_episodes_saved
             end_idx = min(total_episodes_saved + num_in_block, EPISODES_TO_COLLECT)
             num_to_write = end_idx - start_idx
             if num_to_write > 0:
                 print(f"  ...Writing final {num_to_write} episodes to disk...")
-                agent_ds[start_idx:end_idx]   = agent_block[:num_to_write]
-                obj_ds[start_idx:end_idx]     = obj_block[:num_to_write]
+                dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
+                dof_vel_ds[start_idx:end_idx] = dof_vel_block[:num_to_write]
+
+                base_pos_ds[start_idx:end_idx]     = base_pos_block[:num_to_write]
+                base_vel_ds[start_idx:end_idx]     = base_vel_block[:num_to_write]
+                base_ang_ds[start_idx:end_idx]     = base_ang_block[:num_to_write]
+
                 obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
-                actions_ds[start_idx:end_idx] = act_block[:num_to_write]
-                dof_vel_ds[start_idx:end_idx] = vel_block[:num_to_write]
+                act_ds[start_idx:end_idx] = act_block[:num_to_write]
+
                 valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
                 total_episodes_saved = end_idx
 
