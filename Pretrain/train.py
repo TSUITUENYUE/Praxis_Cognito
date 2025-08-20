@@ -24,6 +24,21 @@ def get_beta(epoch, total_epochs, strategy='cyclical', num_cycles=4, max_beta=1.
     else:
         return max_beta
 
+def masked_quat_geodesic(pred_w, tgt_w, mask, eps=1e-8):
+    # pred_w, tgt_w: [B,T,4] (wxyz, normalized)
+    # mask: [B,T,1] or [B,T]
+    # geodesic distance: 2*acos(|<q1,q2>|); we can use (1 - dot^2) as a smooth proxy
+    pred = pred_w / (pred_w.norm(dim=-1, keepdim=True) + eps)
+    tgt  = tgt_w  / (tgt_w.norm(dim=-1, keepdim=True) + eps)
+    dot  = (pred * tgt).sum(dim=-1).abs().clamp(max=1.0)       # [B,T]
+    # proxy loss (smooth, scale ~ angle^2 near 0)
+    loss = 1.0 - dot**2
+    if mask.dim() == 3: mask = mask.squeeze(-1)
+    # average over unmasked
+    denom = mask.sum().clamp_min(1.0)
+    return (loss * mask).sum() / denom
+
+
 class Trainer:
     def __init__(self, model, rl_config, config):
         self.load_path   = config.load_path
@@ -54,7 +69,7 @@ class Trainer:
         gs.init(logging_level="warning")
         self.env = Go2Env(
             num_envs=self.batch_size,
-            endu_cfg=rl_config.env,
+            env_cfg=rl_config.env,
             obs_cfg=rl_config.obs,
             reward_cfg=rl_config.reward,
             command_cfg=rl_config.command,
@@ -164,7 +179,7 @@ class Trainer:
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
-            for i, (x, q, dq, p, dp, w, obs, act, mask) in enumerate(dataloader):
+            for i, (x, q, dq, p, dp, dw, obs, act, mask) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
 
                 x      = x.to(self.device)
@@ -174,7 +189,7 @@ class Trainer:
 
                 p_gt   = p.to(self.device)
                 dp_gt  = dp.to(self.device)
-                w_gt   = w.to(self.device)
+                dw_gt   = dw.to(self.device)
 
                 obs_gt = obs.to(self.device)              # [B,T,obs_dim] (UN-normalized from dataset)
                 act_gt = act.to(self.device)
@@ -196,7 +211,7 @@ class Trainer:
                          self.obs_normalizer,                # normalizer for obs
                          obs_seq=obs_gt,                     # for decoder teacher forcing
                          q=q_gt, dq=dq_gt,
-                         p=p_gt, dp=dp_gt, w_gt=w_gt,
+                         p=p_gt, dp=dp_gt, dw=dw_gt,
                          tf_ratio=tf_ratio,
                     )
 
@@ -208,6 +223,7 @@ class Trainer:
                     p_seq = state_pred['p']
                     dp_seq = state_pred['dp']
                     w_seq = state_pred['w']
+                    dw_seq = state_pred['dw']
 
                     act_seq = act_pred['act']
                     mu_seq = act_pred['mu']
@@ -221,48 +237,56 @@ class Trainer:
                     z = aux[0]
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
                     with torch.inference_mode():
-                        reset_out = self.env.reset()
-                        obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
-                        obs_t_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
+                        was_training = self.vae.decoder.training
+                        self.vae.decoder.eval()
+                        try:
+                            reset_out = self.env.reset()
+                            obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
+                            obs_t_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
 
-                        B = act_seq.shape[0]
-                        T = act_seq.shape[1]
-                        # Pre-allocate on device with correct dtypes
-                        q_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-                        dq_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            B = act_seq.shape[0]
+                            T = act_seq.shape[1]
+                            # Pre-allocate on device with correct dtypes
+                            q_sim_seq  = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            dq_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
 
-                        p_sim_seq = torch.empty(size=p_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-                        dp_sim_seq = torch.empty(size=dp_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            p_sim_seq  = torch.empty(size=p_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            dp_sim_seq = torch.empty(size=dp_seq.shape, device=self.device, dtype=obs_t_n.dtype)
 
-                        w_sim_seq = torch.empty(size=w_seq.shape,device=self.device, dtype=obs_t_n.dtype)
+                            w_sim_seq  = torch.empty(size=w_seq.shape,device=self.device, dtype=obs_t_n.dtype)
+                            dw_sim_seq = torch.empty(size=dw_seq.shape, device=self.device, dtype=obs_t_n.dtype)
 
-                        obs_sim_seq = torch.empty(size=obs_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            obs_sim_seq = torch.empty(size=obs_seq.shape, device=self.device, dtype=obs_t_n.dtype)
 
-                        for t in range(T):
-                            mask_t = mask[:, t, :]
-                            a_t, _, _ = self.vae.decoder(z, obs_t_n, mask_t)
-                            obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
+                            for t in range(T):
+                                mask_t = mask[:, t, :]
+                                a_t, _, _ = self.vae.decoder(z, obs_t_n, mask_t)
+                                obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
 
-                            q_t = self.env.dof_pos
-                            dq_t = self.env.dof_vel
-                            p_t = self.env.base_pos
-                            dp_t = self.env.base_lin_vel
-                            w_t = self.env.base_ang_vel
+                                q_t = self.env.dof_pos
+                                dq_t = self.env.dof_vel
+                                p_t = self.env.base_pos
+                                dp_t = self.env.base_lin_vel
+                                w_t = self.env.base_quat
+                                dw_t = self.env.base_ang_vel
 
-                            obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
+                                obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
 
-                            q_sim_seq[:,t].copy_(q_t)
-                            dq_sim_seq[:,t].copy_(dq_t)
+                                q_sim_seq[:,t].copy_(q_t)
+                                dq_sim_seq[:,t].copy_(dq_t)
 
-                            p_sim_seq[:,t].copy_(p_t)
-                            dp_sim_seq[:,t].copy_(dp_t)
-                            w_sim_seq[:,t].copy_(w_t)
+                                p_sim_seq[:,t].copy_(p_t)
+                                dp_sim_seq[:,t].copy_(dp_t)
+                                w_sim_seq[:,t].copy_(w_t)
+                                dw_sim_seq[:, t].copy_(dw_t)
 
-                            obs_sim_seq[:, t].copy_(obs_t_n)
+                                obs_sim_seq[:, t].copy_(obs_t_n)
 
 
-                    u_sim_seq = obs_sim_seq[:, :, -6:-3]
-                    du_sim_seq = obs_sim_seq[:, :, -3:]
+                            u_sim_seq = obs_sim_seq[:, :, -6:-3]
+                            du_sim_seq = obs_sim_seq[:, :, -3:]
+                        finally:
+                            self.vae.decoder.train(was_training)
                     # --- VAE loss (pose + action + KL) ---
                     loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
                         x_recon, log_sigma, x,
@@ -274,16 +298,33 @@ class Trainer:
                         lambda_dynamic=self.lambda_dynamic
                     )
 
-
-                    # --- Sim loss (only trains surrogate via surrogate path) ---
-                    q_loss  = self.masked_mse(q_seq,  q_sim_seq.detach(),  mask)
+                    # state-space losses (detach sim targets)
+                    q_loss = self.masked_mse(q_seq, q_sim_seq.detach(), mask)
                     dq_loss = self.masked_mse(dq_seq, dq_sim_seq.detach(), mask)
-                    w_loss  = self.masked_mse(w_seq,  w_sim_seq.detach(), mask)
+                    p_loss = self.masked_mse(p_seq, p_sim_seq.detach(), mask)
+                    dp_loss = self.masked_mse(dp_seq, dp_sim_seq.detach(), mask)
+                    dw_loss = self.masked_mse(dw_seq, dw_sim_seq.detach(), mask)
+                    w_loss = masked_quat_geodesic(w_seq, w_sim_seq.detach(), mask)
 
-                    u_loss  = self.masked_mse(u_seq, u_sim_seq.detach(), mask)
-                    du_loss  = self.masked_mse(du_seq, du_sim_seq.detach(), mask)
-                    #obs_loss = self.masked_mse(obs_sim_n_seq.detach(), obs_seq.detach(), mask)
-                    sim_loss = self.w_q * q_loss + self.w_dq * dq_loss + self.w_w * w_loss + self.w_u * u_loss + self.w_v * du_loss
+                    u_loss = self.masked_mse(u_seq, u_sim_seq.detach(), mask)
+                    du_loss = self.masked_mse(du_seq, du_sim_seq.detach(), mask)
+
+                    state_loss = (
+                            self.w_q * q_loss +
+                            self.w_dq * dq_loss +
+                            self.w_p * p_loss +
+                            self.w_dp * dp_loss +
+                            self.w_w * w_loss +
+                            self.w_dw * dw_loss +
+                            self.w_u * u_loss +
+                            self.w_du * du_loss
+                    )
+
+                    # optional: obs regularizer (use your exact normalized obs on both sides)
+                    # obs_pred_n is from surrogate’s predict_dynamics; obs_sim_n_seq from Genesis → normalized
+                    obs_reg = self.masked_mse(obs_seq, obs_sim_seq.detach(), mask)
+                    sim_loss = state_loss + self.w_obs * obs_reg  # choose small self.w_obs, e.g., 0.1 * (avg state weight)
+
                     total_loss = loss + self.lambda_sim * sim_loss
 
                     # --- diag: unnormalized recon MSE in world units ---
