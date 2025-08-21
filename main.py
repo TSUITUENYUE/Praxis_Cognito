@@ -19,7 +19,8 @@ class Runner:
     def __init__(self, mode, config: DictConfig):
         self.mode = mode
         self.config = config
-        self.agent = Agent(**config.agent)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.agent = Agent(**config.agent).to(self.device)
         if self.mode != "generate":
             self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, cfg=config.rl, **config.model.vae)
 

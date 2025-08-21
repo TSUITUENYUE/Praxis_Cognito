@@ -110,85 +110,77 @@ class TrajectoryDataset(Dataset):
 
         # ---- Pass 2: write processed ----
         with h5py.File(self.source_path, 'r') as f_in, h5py.File(self.processed_path, 'w') as f_out:
-            dof_pos = f_in['dof_pos']
-            dof_vel = f_in['dof_vel']
+            dof_pos = f_in['dof_pos']  # [N,T,D]
+            dof_vel = f_in['dof_vel']  # [N,T,D]
+            base_pos_ds = f_in['base_pos']  # [N,T,3]
+            base_vel_ds = f_in['base_vel']  # [N,T,3]
+            base_ang_ds = f_in['base_ang']  # [N,T,3]
 
-            base_pos = f_in['base_pos']
-            base_vel = f_in['base_vel']
-            base_ang = f_in['base_ang']
-
-            obs_dset    = f_in['obs']
-            act_dset    = f_in['act']
-
-            valid_len_src = f_in['valid_length'][:]
+            obs_ds = f_in['obs']  # [N,T,obs_dim]
+            act_key = 'act' if 'act' in f_in else 'actions'
+            act_ds = f_in[act_key]  # [N,T,n_dofs]
 
             N, T, _ = dof_pos.shape
             num_links = len(fk.link_names)
             num_nodes = num_links + 1
-            obs_dim   = obs_dset.shape[-1]
+            obs_dim = obs_ds.shape[-1]
 
-            f_out.create_dataset('graph_x',      (N, T, num_nodes, 3), dtype='f4')
-            f_out.create_dataset('joint_trajs',  (N, T, self.n_dofs),  dtype='f4')
-            f_out.create_dataset('joint_vels',   (N, T, self.n_dofs),  dtype='f4')
+            # valid_length is optional
+            if 'valid_length' in f_in:
+                valid_len = f_in['valid_length'][:].astype(np.int32)
+            else:
+                valid_len = np.full((N,), T, dtype=np.int32)
 
-            f_out.create_dataset('base_pos',          (N, T, 3),      dtype='f4')
-            f_out.create_dataset('base_vel',          (N, T, 3),      dtype='f4')
-            f_out.create_dataset('base_ang',          (N, T, 3),      dtype='f4')
+            # Create empty datasets; we'll fill them in chunks
+            f_out.create_dataset('graph_x', (N, T, num_nodes, 3), dtype='f4')
+            f_out.create_dataset('joint_trajs', (N, T, self.n_dofs), dtype='f4')
+            f_out.create_dataset('joint_vels', (N, T, self.n_dofs), dtype='f4')
 
-            f_out.create_dataset('obs',          (N, T, obs_dim),      dtype='f4')
-            f_out.create_dataset('act',          (N, T, self.n_dofs),  dtype='f4')
+            f_out.create_dataset('base_pos', (N, T, 3), dtype='f4')
+            f_out.create_dataset('base_vel', (N, T, 3), dtype='f4')
+            f_out.create_dataset('base_ang', (N, T, 3), dtype='f4')
 
-            f_out.create_dataset('mask',         (N, T, 1),            dtype='f4')
+            f_out.create_dataset('obs', (N, T, obs_dim), dtype='f4')
+            f_out.create_dataset('act', (N, T, self.n_dofs), dtype='f4')
+            f_out.create_dataset('mask', (N, T, 1), dtype='f4')
 
             f_out.create_dataset('pos_mean', data=pos_mean.cpu().numpy())
-            f_out.create_dataset('pos_std',  data=pos_std.cpu().numpy())
-            # Precompute time index for mask building
-            t_index = np.arange(T, dtype=np.int32)[None, :]  # [1, T] ★ NEW
+            f_out.create_dataset('pos_std', data=pos_std.cpu().numpy())
+
+            t_index = np.arange(T, dtype=np.int32)[None, :]  # [1,T]
 
             chunk = 512
             for i in tqdm(range(0, N, chunk), desc="Writing processed"):
-                j = min(i+chunk, N)
+                j = min(i + chunk, N)
 
-                # FK -> positions
-                q_np   = dof_pos[i:j]                          # numpy view
-                obj_np = obj_trajs[i:j]
-                q      = torch.from_numpy(q_np).to(device)         # [B,T,D]
-                obj    = torch.from_numpy(obj_np).to(device)       # [B,T,3]
+                # --- FK -> link positions (torch) ---
+                q_np = dof_pos[i:j]  # (B,T,D) numpy
+                q = torch.from_numpy(q_np).to(device)  # torch
                 B = q.shape[0]
-                qf = q.reshape(B*T, self.n_dofs)
-                links_flat = fk(qf)                                # [B*T, links*3]
+                qf = q.reshape(B * T, self.n_dofs)
+                links_flat = fk(qf)  # (B*T, links*3)
                 links = links_flat.view(B, T, num_links, 3)
-                obj = obj.unsqueeze(2)                             # [B,T,1,3]
-                graph_x = torch.cat([links, obj], dim=2)           # [B,T,num_nodes,3]
 
-                # normalize positions for loss
-                graph_x = (graph_x - pos_mean) / pos_std
-                # base_pos = (base_pos - pos_mean) / pos_std
-                # raw tensors (as float32)
-                q_raw  = torch.from_numpy(q_np).float()
-                dq_raw = torch.from_numpy(dof_vel[i:j]).float()
+                # Object positions from obs, streamed per chunk
+                obj_np = obs_ds[i:j, :, -6:-3]  # (B,T,3) numpy
+                obj = torch.from_numpy(obj_np).to(device).unsqueeze(2)  # (B,T,1,3)
 
-                #unnorm for surrogate dynamics
-                base_pos = torch.from_numpy(base_pos[i:j]).float()
-                base_vel = torch.from_numpy(base_vel[i:j]).float()
-                base_ang = torch.from_numpy(base_ang[i:j]).float()
+                # Concatenate and normalize
+                graph_x = torch.cat([links, obj], dim=2)  # (B,T,num_nodes,3)
+                graph_x = ((graph_x - pos_mean) / pos_std).cpu().numpy().astype('f4')
 
-                act    = torch.from_numpy(act_dset[i:j]).float()
-                obs    = torch.from_numpy(obs_dset[i:j]).float()
-                # ★ NEW: build mask from valid_length (vectorized for the block)
-                vlen_block = valid_len_src[i:j].astype(np.int32)  # [B]
-                mask_block = (t_index < vlen_block[:, None])[:,:, None].astype(np.float32)  # [B, T, 1] bool
+                # --- Write outputs (numpy needed; h5py will cast) ---
+                f_out['graph_x'][i:j] = graph_x
+                f_out['joint_trajs'][i:j] = q_np.astype('f4')
+                f_out['joint_vels'][i:j] = dof_vel[i:j].astype('f4')
 
-                # write
-                f_out['graph_x'][i:j]      = graph_x.cpu().numpy()
+                f_out['base_pos'][i:j] = base_pos_ds[i:j].astype('f4')
+                f_out['base_vel'][i:j] = base_vel_ds[i:j].astype('f4')
+                f_out['base_ang'][i:j] = base_ang_ds[i:j].astype('f4')
 
-                f_out['joint_trajs'][i:j]  = q_raw.cpu().numpy()
-                f_out['joint_vels'][i:j]   = dq_raw.cpu().numpy()
+                f_out['obs'][i:j] = obs_ds[i:j].astype('f4')
+                f_out['act'][i:j] = act_ds[i:j].astype('f4')
 
-                f_out['base_pos'][i:j]     = base_pos.cpu().numpy()
-                f_out['base_vel'][i:j]     = base_vel.cpu().numpy()
-                f_out['base_ang'][i:j]     = base_ang.cpu().numpy()
-
-                f_out['obs'][i:j]          = obs.cpu().numpy()
-                f_out['act'][i:j]          = act.cpu().numpy()
-                f_out['mask'][i:j]         = mask_block
+                vlen_block = valid_len[i:j]  # (B,)
+                mask_block = (t_index < vlen_block[:, None])[:, :, None].astype('f4')  # (B,T,1)
+                f_out['mask'][i:j] = mask_block
