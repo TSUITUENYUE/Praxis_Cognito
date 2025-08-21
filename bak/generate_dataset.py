@@ -1,179 +1,463 @@
+
 import genesis as gs
-import taichi as ti
 import numpy as np
 import time
 import torch
 import h5py
 import os
-import hydra
-from omegaconf import DictConfig
+from omegaconf import OmegaConf,DictConfig
+import torch.nn as nn
+import torch.nn.functional as F
+from rsl_rl.runners import OnPolicyRunner
+from .go2_env import Go2Env
+from Model.agent import Agent
+import faiss
 
+class RunningMeanStd:
+    def __init__(self, shape, epsilon=1e-4, device='cuda'):
+        self.mean = torch.zeros(shape, device=device)
+        self.var = torch.ones(shape, device=device)
+        self.count = epsilon
+        self.epsilon = epsilon
+    def update(self, x):
+        batch_mean = torch.mean(x, dim=0)
+        batch_var = torch.var(x, dim=0, unbiased=False)
+        batch_count = x.shape[0]
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + torch.square(delta) * self.count * batch_count / tot_count
+        self.var = M2 / tot_count
+        self.count = tot_count
+    def normalize(self, x):
+        return (x - self.mean) / torch.sqrt(self.var + self.epsilon)
+
+class ICMModule(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(ICMModule, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2)
+        )
+        self.forward_model = nn.Sequential(
+            nn.Linear(hidden_dim // 2 + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2)
+        )
+        self.inverse_model = nn.Sequential(
+            nn.Linear(hidden_dim // 2 * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+    def forward(self, state, action, next_state):
+        phi = self.encoder(state)
+        phi_next_with_grad = self.encoder(next_state)
+        with torch.no_grad():
+            phi_next = phi_next_with_grad.detach()
+        pred_phi_next = self.forward_model(torch.cat([phi, action], dim=-1))
+        forward_loss = F.mse_loss(pred_phi_next, phi_next, reduction='none').mean(dim=-1)
+        pred_action = self.inverse_model(torch.cat([phi, phi_next_with_grad], dim=-1))
+        inverse_loss = F.mse_loss(pred_action, action, reduction='none').mean(dim=-1)
+        return forward_loss, inverse_loss
 
 def generate(cfg: DictConfig):
-    # --- Configuration for Training ---
-    NUM_ENVS = cfg.dataset.num_envs  # Increase for more parallel data generation
-    EPISODES_TO_COLLECT = cfg.dataset.episodes  # The number of episodes to generate
+    # --- Config ---
+    NUM_ENVS = cfg.dataset.num_envs
+    EPISODES_TO_COLLECT = cfg.dataset.episodes
     MAX_EPISODE_SECONDS = cfg.dataset.max_episode_seconds
     FRAME_RATE = cfg.dataset.frame_rate
     AGENT = cfg.agent.name
     path = f"./Pretrain/data/{AGENT}/{NUM_ENVS} {EPISODES_TO_COLLECT} {MAX_EPISODE_SECONDS} {FRAME_RATE}"
-    if not os.path.exists(path): os.makedirs(path)
+    os.makedirs(path, exist_ok=True)
     SAVE_FILENAME = f"{path}/{NUM_ENVS} {EPISODES_TO_COLLECT} {MAX_EPISODE_SECONDS} {FRAME_RATE}.h5"
 
-    # --- Initialize Genesis Simulator ---
-    gs.init(theme="light", logging_level='warning')
+    CURIOSITY_BETA = cfg.dataset.curiosity_beta
+    POLICY_HIDDEN_DIM = cfg.dataset.policy_hidden_dim
+    SIMILARITY_THRESHOLD = cfg.dataset.similarity_threshold
+    DOWNSAMPLE_FACTOR = 5
+    WRITE_BUFFER_SIZE = 5000
 
-    scene = gs.Scene(
+    log_dir = cfg.dataset.log_dir
+
+    #env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = cfg.rl
+
+    # original_entropy = train_cfg['algorithm'].get('entropy_coef', 0.0)
+    cfg.rl.train.algorithm.entropy_coef = 0.02
+
+    gs.init(logging_level='warning')
+
+    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0}
+    agent = Agent(**cfg.agent)
+    env = Go2Env(
+        num_envs=NUM_ENVS,
+        env_cfg=cfg.rl.env, obs_cfg=cfg.rl.obs, reward_cfg=cfg.rl.reward, command_cfg=cfg.rl.command,
         show_viewer=NUM_ENVS < 128,
-        viewer_options=gs.options.ViewerOptions(
-            res=(1280, 960),
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
-            max_FPS=60,
-        ),
-        vis_options=gs.options.VisOptions(
-            show_world_frame=True,
-            world_frame_size=1.0,
-            show_link_frame=False,
-            show_cameras=False,
-            plane_reflection=True,
-            ambient_light=(0.1, 0.1, 0.1),
-        ),
-        renderer=gs.renderers.Rasterizer(),
+        agent=agent
     )
+    train_cfg = OmegaConf.to_container(cfg.rl.train, resolve=True)
+    runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    primitives = os.path.join(log_dir, "model_200.pt")
+    runner.load(primitives)
+    policy_alg = runner.alg
 
-    # --- Add Entities ---
-    plane = scene.add_entity(
-        gs.morphs.Plane()
-    )
-    agent = scene.add_entity(
-        gs.morphs.URDF(file=cfg.agent.urdf, collision=True),
-    )
-    obj = scene.add_entity(
-        gs.morphs.Sphere(radius=0.05, collision=True),
-    )
-    obj.fixed = False
-    # --- Build the Scene ---
-    scene.build(n_envs=NUM_ENVS, env_spacing=(5.0, 5.0))
+    # ICM (curiosity)
+    icm = ICMModule(state_dim=env.num_obs, action_dim=env.num_actions, hidden_dim=POLICY_HIDDEN_DIM).to(gs.device)
+    icm_optimizer = torch.optim.Adam(icm.parameters(), lr=1e-4)
 
-    # --- Joint and DOF Setup ---
-    joint_names = cfg.agent.joint_name
-    dof_indices = np.array([agent.get_joint(name).dof_idx_local for name in joint_names])
-    n_dofs = len(dof_indices)
+    # RMS for ICM
+    state_dim = env.num_obs
+    action_dim = env.num_actions
+    state_normalizer = RunningMeanStd((state_dim,), device=gs.device)
+    action_normalizer = RunningMeanStd((action_dim,), device=gs.device)
+    reward_normalizer = RunningMeanStd((1,), device=gs.device)
 
-    # --- Stratified Sampling Logic ---
-    # This part of the logic remains the same
-    joint_limits = np.array([agent.get_joint(name).dofs_limit[0] for name in joint_names])
-    STRATIFICATION_BINS = cfg.dataset.stratification_bins
-    stratified_grid = np.array([
-        np.linspace(limit[0], limit[1], STRATIFICATION_BINS) for limit in joint_limits
-    ])
-
-
-    def sample_random_poses():
-        bin_indices = np.random.randint(0, STRATIFICATION_BINS, size=(NUM_ENVS, n_dofs))
-        target_poses = stratified_grid[np.arange(n_dofs)[:, np.newaxis], bin_indices.T].T
-        return target_poses
-
-    # --- Reset Functions ---
-    def reset_agent_and_object():
-        """Resets the agent and object state for all environments."""
-        # Reset agent
-        initial_pos_agent = np.tile(np.array(cfg.dataset.agent_pos), (NUM_ENVS, 1))
-        agent.set_pos(initial_pos_agent)
-
-        initial_joint_angles = np.tile(np.array(cfg.agent.init_angles), (NUM_ENVS, 1))
-        agent.set_dofs_position(initial_joint_angles, dofs_idx_local=dof_indices)
-
-        initial_vel_agent = np.zeros((NUM_ENVS, n_dofs))
-        agent.set_dofs_velocity(initial_vel_agent, dofs_idx_local=dof_indices)
-
-
-        # Reset object randomly
-        pos_low = np.array(cfg.dataset.obj_pos_low)
-        pos_high = np.array(cfg.dataset.obj_pos_high)
-        random_pos = np.random.uniform(low=pos_low, high=pos_high, size=(NUM_ENVS, 3))
-        obj.set_pos(random_pos)
-
-        vel_low = np.array(cfg.dataset.obj_vel_low)
-        vel_high = np.array(cfg.dataset.obj_vel_high)
-        random_vel = np.random.uniform(low=vel_low, high=vel_high, size=(NUM_ENVS, 3))
-        obj.set_dofs_velocity(random_vel, [0, 1, 2])
-
-
-    # --- Main Continuous Simulation Loop ---
+    n_dofs = len(env.motors_dof_idx)
+    input_dim = env.num_obs
+    output_dim = env.num_actions
     max_episode_len = int(MAX_EPISODE_SECONDS * FRAME_RATE)
+
+    # --- Buffers (GPU) ---
+    dof_pos_traj_buffer   = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
+    dof_vel_traj_buffer = torch.zeros((max_episode_len, NUM_ENVS, n_dofs),      device=gs.device)
+
+    base_pos_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
+    base_vel_buffer = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)
+    base_ang_buffer = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)
+
+    obs_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, env.num_obs), device=gs.device)
+    act_traj_buffer     = torch.zeros((max_episode_len, NUM_ENVS, env.num_actions), device=gs.device)
+
+    done_traj_buffer    = torch.zeros((max_episode_len, NUM_ENVS), dtype=torch.bool, device=gs.device)
+
+    # >>> DEDUP EMBEDDING BACK TO JOINTS-ONLY <<<
+    embedding_dim = (max_episode_len // DOWNSAMPLE_FACTOR) * (n_dofs + 2 * 3)
+    res = faiss.StandardGpuResources()
+    faiss_index = faiss.GpuIndexFlatIP(res, embedding_dim)
+
     total_episodes_saved = 0
+    mean_surrogate_loss = 0
+    icm_loss = torch.tensor(0.0)
 
-    # Pre-allocate trajectory buffers on the GPU
-    agent_traj_buffer = torch.zeros((max_episode_len, NUM_ENVS, n_dofs), device='cuda')
-    obj_traj_buffer = torch.zeros((max_episode_len, NUM_ENVS, 3), device='cuda')  # x,y,z pos
+    dof_pos_save_buffer,dof_vel_save_buffer, = [], []
+    base_pos_save_buffer,base_vel_save_buffer,base_ang_save_buffer = [], [], []
+    obs_save_buffer, act_save_buffer= [], []
+    valid_len_save_buffer = []
 
-    print(f"Starting data generation. Target: {EPISODES_TO_COLLECT} episodes.")
+    print(f"Starting curiosity-driven data generation. Target: {EPISODES_TO_COLLECT} episodes.")
+
     if os.path.exists(SAVE_FILENAME):
         os.remove(SAVE_FILENAME)
         print(f"Removed existing file: '{SAVE_FILENAME}'")
 
     start_time = time.time()
 
-    # Open HDF5 file once with a 'with' statement to ensure it's properly closed
+    # Reset with extras; normalize like OnPolicyRunner
+    obs, extras = env.reset()
+    critic_obs = extras['observations'].get("critic", obs)
+    obs_n        = runner.obs_normalizer(obs)
+    critic_obs_n = runner.critic_obs_normalizer(critic_obs)
+
+    # Save normalizers for downstream reuse
+    norm_state_path = os.path.join(path, "normalizers.pt")
+    torch.save({
+        "obs_norm": runner.obs_normalizer.state_dict(),
+        "critic_obs_norm": runner.critic_obs_normalizer.state_dict(),
+    }, norm_state_path)
+    print(f"Saved normalizer state to {norm_state_path}")
+
     with h5py.File(SAVE_FILENAME, 'w') as f:
-        print(f"Opened HDF5 file '{SAVE_FILENAME}' for writing.")
+        dof_pos_ds = f.create_dataset('dof_pos',
+                                    shape=(EPISODES_TO_COLLECT, max_episode_len, n_dofs),
+                                    dtype='float32', compression="gzip")
+        dof_vel_ds = f.create_dataset('dof_vel',
+                                      shape=(EPISODES_TO_COLLECT, max_episode_len, n_dofs),
+                                      dtype='float32', compression="gzip")
 
-        # Create large datasets for all episodes (improvement for I/O speed)
-        agent_ds = f.create_dataset('agent_trajectories', shape=(EPISODES_TO_COLLECT, max_episode_len, n_dofs), dtype='float32', compression="gzip")
-        obj_ds = f.create_dataset('obj_trajectories', shape=(EPISODES_TO_COLLECT, max_episode_len, 3), dtype='float32', compression="gzip")
+        base_pos_ds = f.create_dataset('base_pos',
+                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
+                                       dtype='float32', compression="gzip")
+        base_vel_ds = f.create_dataset('base_vel',
+                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
+                                       dtype='float32', compression="gzip")
+        base_ang_ds = f.create_dataset('base_ang',
+                                         shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
+                                         dtype='float32', compression="gzip")
 
-        # Initial full reset for all environments
-        scene.reset()
-        reset_agent_and_object()
+        obs_ds   = f.create_dataset('obs',
+                                    shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_obs),
+                                    dtype='float32', compression="gzip")
+        act_ds = f.create_dataset('act',
+                                      shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_actions),
+                                      dtype='float32', compression="gzip")
 
+        valid_len_ds = f.create_dataset('valid_length',
+                                        shape=(EPISODES_TO_COLLECT,), dtype='int32', compression="gzip")
+
+        # Metadata
+        meta = f.create_group('meta')
+        meta.attrs['dt'] = float(env.dt)
+        act_scale = env.env_cfg.get('action_scale', 0.25)
+        if isinstance(act_scale, (list, tuple, np.ndarray, torch.Tensor)):
+            meta.create_dataset('action_scale', data=np.asarray(act_scale, dtype=np.float32))
+        else:
+            meta.attrs['action_scale'] = float(act_scale)
+        meta.create_dataset('default_dof_pos_', data=np.asarray(env.default_dof_pos.cpu(), dtype=np.float32))
+        meta.attrs['normalizer_pt'] = os.path.abspath(norm_state_path)
+        meta.attrs['faiss_threshold'] = float(SIMILARITY_THRESHOLD)
+        meta.attrs['downsample_factor'] = int(DOWNSAMPLE_FACTOR)
+
+        episodes_since_last_save = 0
         while total_episodes_saved < EPISODES_TO_COLLECT:
-            # --- BATCH COLLECTION LOOP ---
-            # Precompute all bin indices and poses for the entire batch (improvement for loop speed)
-            all_bin_indices = np.random.randint(0, STRATIFICATION_BINS, size=(max_episode_len, NUM_ENVS, n_dofs))
-            all_target_poses = stratified_grid[np.arange(n_dofs)[None, None, :], all_bin_indices]
+            f_loss = torch.tensor(0.0, device=gs.device)
+            i_loss = torch.tensor(0.0, device=gs.device)
+            action_mean = 0.0
+            action_std = 0.0
 
-            all_targets = torch.from_numpy(all_target_poses).to('cuda')
-
-            # Run one full batch of episodes for max_episode_len steps
+            first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)
             for t in range(max_episode_len):
-                # Store data directly into the GPU buffer at the current timestep
-                agent_traj_buffer[t] = agent.get_dofs_position(dof_indices)
-                obj_traj_buffer[t] = obj.get_pos()
+                # store raw obs
+                obs_traj_buffer[t] = obs
 
-                # Control and Simulation Step
-                agent.control_dofs_position(all_targets[t], dof_indices)
-                scene.step()
+                # act with normalized obs like training
+                act = policy_alg.act(obs_n, critic_obs_n)
+                act_traj_buffer[t] = act
 
-            # --- BATCH PROCESSING AND SAVING ---
-            # Transfer the entire batch of trajectories from GPU to CPU
-            agent_data_batch_np = agent_traj_buffer.cpu().numpy()
-            obj_data_batch_np = obj_traj_buffer.cpu().numpy()
+                # env step
+                next_obs, rews, dones, infos = env.step(act)
+                done_traj_buffer[t] = (dones.squeeze(-1) > 0) if dones.ndim == 2 else (dones > 0)
 
-            # Write batch as slices to the large datasets
+                # record kinematics AFTER step
+                q_now  = env.robot.get_dofs_position(env.motors_dof_idx)
+                dq_now = env.robot.get_dofs_velocity(env.motors_dof_idx)
+                dof_pos_traj_buffer[t]   = q_now
+                dof_vel_traj_buffer[t] = dq_now
+
+                base_pos_buffer[t] = env.base_pos
+                base_vel_buffer[t] = env.base_lin_vel
+                base_ang_buffer[t] = env.base_ang_vel
+
+                # curiosity plumbing
+                state_normalizer.update(obs)
+                action_normalizer.update(act)
+                state_normalizer.update(next_obs)
+                norm_obs, norm_act, norm_next_obs = (
+                    state_normalizer.normalize(obs),
+                    action_normalizer.normalize(act),
+                    state_normalizer.normalize(next_obs),
+                )
+                with torch.no_grad():
+                    intrinsic_reward, _ = icm(norm_obs, norm_act, norm_next_obs)
+                reward_normalizer.update(intrinsic_reward.unsqueeze(-1))
+                intrinsic_reward /= torch.sqrt(reward_normalizer.var + reward_normalizer.epsilon)
+                total_reward = rews + intrinsic_reward * CURIOSITY_BETA
+
+                # PPO store & update cadence
+                policy_alg.process_env_step(total_reward, dones, infos)
+
+                # advance obs and recompute normalized views
+                obs = next_obs
+                critic_obs = infos["observations"]["critic"] if ("observations" in infos and "critic" in infos["observations"]) else obs
+                obs_n        = runner.obs_normalizer(obs)
+                critic_obs_n = runner.critic_obs_normalizer(critic_obs)
+
+                # first done per env
+                freshly_done = (done_traj_buffer[t] & (first_done_seen == max_episode_len))
+                if freshly_done.any():
+                    idxs = torch.nonzero(freshly_done, as_tuple=False).squeeze(-1)
+                    first_done_seen[idxs] = t + 1  # inclusive
+
+                if policy_alg.storage.step >= runner.num_steps_per_env:
+                    num_transitions = policy_alg.storage.step
+                    if num_transitions > 1:
+                        all_states  = policy_alg.storage.observations.view(-1, input_dim)
+                        all_act = policy_alg.storage.actions.view(-1, output_dim)
+                        end_idx = (num_transitions - 1) * policy_alg.storage.num_envs
+                        batch_states, batch_act = all_states[:end_idx], all_act[:end_idx]
+                        start_idx_next, end_idx_next = policy_alg.storage.num_envs, num_transitions * policy_alg.storage.num_envs
+                        batch_next_states = all_states[start_idx_next:end_idx_next]
+
+                        norm_batch_states      = state_normalizer.normalize(batch_states)
+                        norm_batch_act     = action_normalizer.normalize(batch_act)
+                        norm_batch_next_states = state_normalizer.normalize(batch_next_states)
+
+                        f_loss, i_loss = icm(norm_batch_states, norm_batch_act, norm_batch_next_states)
+                        icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
+                        icm_optimizer.zero_grad()
+                        icm_loss.backward()
+                        icm_optimizer.step()
+
+                    policy_alg.compute_returns(critic_obs_n)
+                    mean_value_loss, mean_surrogate_loss, _, _, _ = policy_alg.update()
+
+            action_mean = torch.mean(act).item()
+            action_std  = torch.std(act).item()
+
+            # ---- Build dedup embeddings (JOINTS ONLY, NO Z-SCORE) ----
+            dof_pos_np  = dof_pos_traj_buffer.cpu().numpy()    # [T, E, DoF]
+            dof_vel_np  = dof_vel_traj_buffer.cpu().numpy()
+
+            base_pos_np = base_pos_buffer.cpu().numpy()      # [T, E, 3]
+            base_vel_np = base_vel_buffer.cpu().numpy()  # [T, E, 3]
+            base_ang_np = base_ang_buffer.cpu().numpy()  # [T, E, 3]
+
+            obs_np   = obs_traj_buffer.cpu().numpy()
+            act_np   = act_traj_buffer.cpu().numpy()
+
+            valid_len_np = np.where(first_done_seen.cpu().numpy() == max_episode_len,
+                                    max_episode_len,
+                                    first_done_seen.cpu().numpy())
+
+            # [E, T, ...]
+            dof_pos_batch  = np.transpose(dof_pos_np, (1, 0, 2))
+            dof_vel_batch  = np.transpose(dof_vel_np, (1, 0, 2))
+
+            base_pos_batch = np.transpose(base_pos_np,(1, 0, 2))
+            base_vel_batch = np.transpose(base_vel_np,(1, 0, 2))
+            base_ang_batch = np.transpose(base_ang_np,(1, 0, 2))
+
+            obs_batch      = np.transpose(obs_np,     (1, 0, 2))
+            act_batch      = np.transpose(act_np,     (1, 0, 2))
+
+
+            # zero invalid tail (matches written data)
+            for e in range(NUM_ENVS):
+                L = valid_len_np[e]
+                if L < max_episode_len:
+                    dof_pos_batch[e, L:] = 0.0
+                    dof_vel_batch[e, L:] = 0.0
+
+                    base_pos_batch[e,   L:] = 0.0
+                    base_vel_batch[e, L:] = 0.0
+                    base_ang_batch[e, L:] = 0.0
+
+                    obs_batch[e,   L:] = 0.0
+                    act_batch[e,   L:] = 0.0
+
+            # Downsampled blocks (these are NumPy already in your code)
+            dof_pos_dsmp  = dof_pos_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, DoF]
+            base_vel_dsmp = base_vel_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, 3]
+            base_ang_dsmp = base_ang_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, 3]
+
+            # Flatten per episode
+            J = dof_pos_dsmp.reshape(NUM_ENVS, -1)
+            V = base_vel_dsmp.reshape(NUM_ENVS, -1)
+            W = base_ang_dsmp.reshape(NUM_ENVS, -1)
+
+            #per-block L2 to balance contributions
+            faiss.normalize_L2(J)
+            faiss.normalize_L2(V)
+            faiss.normalize_L2(W)
+
+            new_embeddings = np.concatenate([J, V, W],axis=1)
+
+            if faiss_index.ntotal == 0:
+                unique_indices = np.arange(len(new_embeddings))
+            else:
+                D, I = faiss_index.search(x=new_embeddings, k=1)
+                is_unique_mask = D[:, 0] < SIMILARITY_THRESHOLD
+                unique_indices = np.where(is_unique_mask)[0]
+
+            if unique_indices.size > 0:
+                dof_pos_save_buffer.append(dof_pos_batch[unique_indices])
+                dof_vel_save_buffer.append(dof_vel_batch[unique_indices])
+
+                base_pos_save_buffer.append(base_pos_batch[unique_indices])
+                base_vel_save_buffer.append(base_vel_batch[unique_indices])
+                base_ang_save_buffer.append(base_ang_batch[unique_indices])
+
+                obs_save_buffer.append(obs_batch[unique_indices])
+                act_save_buffer.append(act_batch[unique_indices])
+
+                valid_len_save_buffer.append(valid_len_np[unique_indices])
+
+                faiss_index.add(x=new_embeddings[unique_indices])
+                episodes_since_last_save += len(unique_indices)
+
+            # Write in blocks
+            if episodes_since_last_save >= WRITE_BUFFER_SIZE or total_episodes_saved + episodes_since_last_save >= EPISODES_TO_COLLECT:
+                if dof_pos_save_buffer:
+                    dof_pos_block  = np.concatenate(dof_pos_save_buffer,  axis=0)
+                    dof_vel_block  = np.concatenate(dof_vel_save_buffer,  axis=0)
+
+                    base_pos_block = np.concatenate(base_pos_save_buffer, axis=0)
+                    base_vel_block = np.concatenate(base_vel_save_buffer, axis=0)
+                    base_ang_block = np.concatenate(base_ang_save_buffer, axis=0)
+
+                    obs_block  = np.concatenate(obs_save_buffer,      axis=0)
+                    act_block  = np.concatenate(act_save_buffer,      axis=0)
+
+                    vlen_block = np.concatenate(valid_len_save_buffer,axis=0)
+
+                    num_in_block = dof_pos_block.shape[0]
+                    start_idx = total_episodes_saved
+                    end_idx = min(total_episodes_saved + num_in_block, EPISODES_TO_COLLECT)
+                    num_to_write = end_idx - start_idx
+                    if num_to_write > 0:
+                        print(f"  ...Writing {num_to_write} episodes to disk...")
+                        dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
+                        dof_vel_ds[start_idx:end_idx]   = dof_vel_block[:num_to_write]
+
+                        base_pos_ds[start_idx:end_idx]  = base_pos_block[:num_to_write]
+                        base_vel_ds[start_idx:end_idx]  = base_vel_block[:num_to_write]
+                        base_ang_ds[start_idx:end_idx]  = base_ang_block[:num_to_write]
+
+                        obs_ds[start_idx:end_idx]       = obs_block[:num_to_write]
+                        act_ds[start_idx:end_idx]       = act_block[:num_to_write]
+
+                        valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
+                        total_episodes_saved = end_idx
+
+                    dof_pos_save_buffer, dof_vel_save_buffer, = [], []
+                    base_pos_save_buffer, base_vel_save_buffer, base_ang_save_buffer = [], [], []
+                    obs_save_buffer, act_save_buffer = [], []
+                    valid_len_save_buffer = []
+                    episodes_since_last_save = 0
+
+            print(f"  ...Collected: {total_episodes_saved}/{EPISODES_TO_COLLECT} | PPO Loss: {mean_surrogate_loss:.3f} "
+                  f"| Fwd Loss: {f_loss.mean().item():.3f} | Inv Loss: {i_loss.mean().item():.3f} "
+                  f"| Action Mean: {action_mean:.3f} | Action Std: {action_std:.3f}")
+
+        # Final flush if remaining
+        if dof_pos_save_buffer:
+            dof_pos_block = np.concatenate(dof_pos_save_buffer, axis=0)
+            dof_vel_block   = np.concatenate(dof_vel_save_buffer,   axis=0)
+
+            base_pos_block   = np.concatenate(base_pos_save_buffer,   axis=0)
+            base_vel_block   = np.concatenate(base_vel_save_buffer,   axis=0)
+            base_ang_block   = np.concatenate(base_ang_save_buffer,   axis=0)
+
+            obs_block   = np.concatenate(obs_save_buffer,   axis=0)
+            act_block   = np.concatenate(act_save_buffer,   axis=0)
+
+            vlen_block  = np.concatenate(valid_len_save_buffer, axis=0)
+
+            num_in_block = dof_pos_block.shape[0]
             start_idx = total_episodes_saved
-            end_idx = min(start_idx + NUM_ENVS, EPISODES_TO_COLLECT)
-            num_this_batch = end_idx - start_idx
+            end_idx = min(total_episodes_saved + num_in_block, EPISODES_TO_COLLECT)
+            num_to_write = end_idx - start_idx
+            if num_to_write > 0:
+                print(f"  ...Writing final {num_to_write} episodes to disk...")
+                dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
+                dof_vel_ds[start_idx:end_idx] = dof_vel_block[:num_to_write]
 
-            agent_ds[start_idx:end_idx] = np.transpose(agent_data_batch_np[:, :num_this_batch, :], (1, 0, 2))
-            obj_ds[start_idx:end_idx] = np.transpose(obj_data_batch_np[:, :num_this_batch, :], (1, 0, 2))
+                base_pos_ds[start_idx:end_idx]     = base_pos_block[:num_to_write]
+                base_vel_ds[start_idx:end_idx]     = base_vel_block[:num_to_write]
+                base_ang_ds[start_idx:end_idx]     = base_ang_block[:num_to_write]
 
-            total_episodes_saved += num_this_batch
+                obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
+                act_ds[start_idx:end_idx] = act_block[:num_to_write]
 
-            print(f"  ...Collected and saved episodes up to {total_episodes_saved}/{EPISODES_TO_COLLECT}")
+                valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
+                total_episodes_saved = end_idx
 
-            # --- RESET FOR NEXT BATCH ---
-            if total_episodes_saved < EPISODES_TO_COLLECT:
-                scene.reset()
-                reset_agent_and_object()
-
-    # --- Finalize ---
     end_time = time.time()
     duration = end_time - start_time
     print("\nData generation complete.")
     print(f"Collected {total_episodes_saved} episodes across {NUM_ENVS} parallel environments.")
     print(f"Dataset saved to '{SAVE_FILENAME}'")
+    print(f"Normalizers saved to '{norm_state_path}'")
     print(f"Total WALL-CLOCK time taken: {duration:.2f} seconds.")
-
