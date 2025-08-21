@@ -11,6 +11,7 @@ from rsl_rl.runners import OnPolicyRunner
 from .go2_env import Go2Env
 from Model.agent import Agent
 import faiss
+from torch.cuda.amp import autocast, GradScaler  # <-- AMP
 
 class RunningMeanStd:
     def __init__(self, shape, epsilon=1e-4, device='cuda'):
@@ -105,7 +106,12 @@ def generate(cfg: DictConfig):
 
     # ICM (curiosity)
     icm = ICMModule(state_dim=env.num_obs, action_dim=env.num_actions, hidden_dim=POLICY_HIDDEN_DIM).to(gs.device)
+
+    icm = torch.compile(icm)  # torch 2.x
     icm_optimizer = torch.optim.Adam(icm.parameters(), lr=1e-4)
+
+    # AMP scaler (ICM only; PPO uses library's internal optimizers)
+    scaler = GradScaler(enabled=torch.cuda.is_available())
 
     # RMS for ICM
     state_dim = env.num_obs
@@ -218,21 +224,17 @@ def generate(cfg: DictConfig):
 
             first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)
             for t in range(max_episode_len):
-                # === ROLLOUT (no autograd) =====================================
-                with torch.no_grad():  # CHANGED: fast collection without disabling later grads
-                    # store raw obs
+                # ================== ROLLOUT (no autograd, AMP for speed) ==================
+                with torch.no_grad():
                     obs_traj_buffer[t] = obs
 
-                    # act with normalized obs like training
-                    raw_act = policy_alg.act(obs_n, critic_obs_n)          # CHANGED: keep raw
-                    act = torch.clamp(raw_act, -1.0, 1.0)                  # CHANGED: executed action
+                    raw_act = policy_alg.act(obs_n, critic_obs_n)
+                    act = torch.clamp(raw_act, -100.0, 100.0)   # executed action
                     act_traj_buffer[t] = act
 
-                    # env step
                     next_obs, rews, dones, infos = env.step(act)
                     done_traj_buffer[t] = (dones.squeeze(-1) > 0) if dones.ndim == 2 else (dones > 0)
 
-                    # record kinematics AFTER step
                     q_now  = env.robot.get_dofs_position(env.motors_dof_idx)
                     dq_now = env.robot.get_dofs_velocity(env.motors_dof_idx)
                     dof_pos_traj_buffer[t]   = q_now
@@ -242,42 +244,41 @@ def generate(cfg: DictConfig):
                     base_vel_buffer[t] = env.base_lin_vel
                     base_ang_buffer[t] = env.base_ang_vel
 
-                    # curiosity plumbing
                     state_normalizer.update(obs)
-                    action_normalizer.update(act)                          # CHANGED: executed action
+                    action_normalizer.update(act)
                     state_normalizer.update(next_obs)
                     norm_obs, norm_act, norm_next_obs = (
                         state_normalizer.normalize(obs),
-                        action_normalizer.normalize(act),                  # CHANGED
+                        action_normalizer.normalize(act),
                         state_normalizer.normalize(next_obs),
                     )
-                    # forward error as intrinsic reward (already per-sample)
-                    intrinsic_reward, _ = icm(norm_obs, norm_act, norm_next_obs)
+
+                    # AMP autocast for ICM forward (no grad)
+                    with autocast(enabled=torch.cuda.is_available()):
+                        intrinsic_reward, _ = icm(norm_obs, norm_act, norm_next_obs)
+
                     reward_normalizer.update(intrinsic_reward.unsqueeze(-1))
                     intrinsic_reward /= torch.sqrt(reward_normalizer.var + reward_normalizer.epsilon)
                     total_reward = rews + intrinsic_reward * CURIOSITY_BETA
 
-                    # PPO store
                     policy_alg.process_env_step(total_reward, dones, infos)
 
-                    # advance obs and recompute normalized views
                     obs = next_obs
                     critic_obs = infos["observations"]["critic"] if ("observations" in infos and "critic" in infos["observations"]) else obs
                     obs_n        = runner.obs_normalizer(obs)
                     critic_obs_n = runner.critic_obs_normalizer(critic_obs)
 
-                    # first done per env
                     freshly_done = (done_traj_buffer[t] & (first_done_seen == max_episode_len))
                     if freshly_done.any():
                         idxs = torch.nonzero(freshly_done, as_tuple=False).squeeze(-1)
-                        first_done_seen[idxs] = t + 1  # inclusive
-                # ===============================================================
+                        first_done_seen[idxs] = t + 1
+                # ==========================================================================
 
-                # === UPDATE (grads enabled) ====================================
+                # ================== UPDATES (enable grads; AMP for ICM & PPO) =============
                 if policy_alg.storage.step >= runner.num_steps_per_env:
                     num_transitions = policy_alg.storage.step
                     if num_transitions > 1:
-                        with torch.enable_grad():  # CHANGED: grads only here
+                        with torch.enable_grad():
                             all_states  = policy_alg.storage.observations.view(-1, input_dim)
                             all_act     = policy_alg.storage.actions.view(-1, output_dim)
                             end_idx = (num_transitions - 1) * policy_alg.storage.num_envs
@@ -287,30 +288,35 @@ def generate(cfg: DictConfig):
                             batch_act = all_act[:end_idx]
 
                             norm_batch_states      = state_normalizer.normalize(batch_states)
-                            norm_batch_act         = action_normalizer.normalize(torch.clamp(batch_act, -1.0, 1.0))  # CHANGED
+                            norm_batch_act         = action_normalizer.normalize(torch.clamp(batch_act, -1.0, 1.0))
                             norm_batch_next_states = state_normalizer.normalize(batch_next_states)
 
-                            f_loss, i_loss = icm(norm_batch_states, norm_batch_act, norm_batch_next_states)
-                            icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
-                            icm_optimizer.zero_grad()
-                            icm_loss.backward()
-                            icm_optimizer.step()
+                            # AMP-scaled ICM update
+                            with autocast(enabled=torch.cuda.is_available()):
+                                f_loss, i_loss = icm(norm_batch_states, norm_batch_act, norm_batch_next_states)
+                                icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
+                            icm_optimizer.zero_grad(set_to_none=True)
+                            scaler.scale(icm_loss).backward()
+                            scaler.step(icm_optimizer)
+                            scaler.update()
 
-                        with torch.enable_grad():
+                    with torch.enable_grad():
+                        # Autocast PPO update (no external scaler since optimizer lives inside lib)
+                        with autocast(enabled=torch.cuda.is_available()):
                             policy_alg.compute_returns(critic_obs_n)
                             mean_value_loss, mean_surrogate_loss, _, _, _ = policy_alg.update()
-                # ===============================================================
+                # ==========================================================================
 
             action_mean = torch.mean(act).item()
             action_std  = torch.std(act).item()
 
             # ---- Build dedup embeddings (JOINTS ONLY, NO Z-SCORE) ----
-            dof_pos_np  = dof_pos_traj_buffer.cpu().numpy()    # [T, E, DoF]
+            dof_pos_np  = dof_pos_traj_buffer.cpu().numpy()
             dof_vel_np  = dof_vel_traj_buffer.cpu().numpy()
 
-            base_pos_np = base_pos_buffer.cpu().numpy()      # [T, E, 3]
-            base_vel_np = base_vel_buffer.cpu().numpy()      # [T, E, 3]
-            base_ang_np = base_ang_buffer.cpu().numpy()      # [T, E, 3]
+            base_pos_np = base_pos_buffer.cpu().numpy()
+            base_vel_np = base_vel_buffer.cpu().numpy()
+            base_ang_np = base_ang_buffer.cpu().numpy()
 
             obs_np   = obs_traj_buffer.cpu().numpy()
             act_np   = act_traj_buffer.cpu().numpy()
@@ -336,29 +342,30 @@ def generate(cfg: DictConfig):
                 if L < max_episode_len:
                     dof_pos_batch[e, L:] = 0.0
                     dof_vel_batch[e, L:] = 0.0
+
                     base_pos_batch[e,   L:] = 0.0
                     base_vel_batch[e, L:] = 0.0
                     base_ang_batch[e, L:] = 0.0
+
                     obs_batch[e,   L:] = 0.0
                     act_batch[e,   L:] = 0.0
 
-            # Downsampled blocks
-            dof_pos_dsmp  = dof_pos_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, DoF]
-            base_vel_dsmp = base_vel_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, 3]
-            base_ang_dsmp = base_ang_batch[:, ::DOWNSAMPLE_FACTOR, :]  # [E, Td, 3]
+            # Downsampled blocks (these are NumPy already in your code)
+            dof_pos_dsmp  = dof_pos_batch[:, ::DOWNSAMPLE_FACTOR, :]
+            base_vel_dsmp = base_vel_batch[:, ::DOWNSAMPLE_FACTOR, :]
+            base_ang_dsmp = base_ang_batch[:, ::DOWNSAMPLE_FACTOR, :]
 
             # Flatten per episode
             J = dof_pos_dsmp.reshape(NUM_ENVS, -1)
             V = base_vel_dsmp.reshape(NUM_ENVS, -1)
             W = base_ang_dsmp.reshape(NUM_ENVS, -1)
 
-            # per-block L2
             faiss.normalize_L2(J)
             faiss.normalize_L2(V)
             faiss.normalize_L2(W)
 
-            new_embeddings = np.concatenate([J, V, W], axis=1)
-            faiss.normalize_L2(new_embeddings)  # CHANGED: normalize after concat for sane IP
+            new_embeddings = np.concatenate([J, V, W],axis=1)
+            faiss.normalize_L2(new_embeddings)  # IMPORTANT: normalize after concat
 
             if faiss_index.ntotal == 0:
                 unique_indices = np.arange(len(new_embeddings))
@@ -406,11 +413,14 @@ def generate(cfg: DictConfig):
                         print(f"  ...Writing {num_to_write} episodes to disk...")
                         dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
                         dof_vel_ds[start_idx:end_idx]   = dof_vel_block[:num_to_write]
+
                         base_pos_ds[start_idx:end_idx]  = base_pos_block[:num_to_write]
                         base_vel_ds[start_idx:end_idx]  = base_vel_block[:num_to_write]
                         base_ang_ds[start_idx:end_idx]  = base_ang_block[:num_to_write]
+
                         obs_ds[start_idx:end_idx]       = obs_block[:num_to_write]
                         act_ds[start_idx:end_idx]       = act_block[:num_to_write]
+
                         valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
                         total_episodes_saved = end_idx
 
@@ -446,11 +456,14 @@ def generate(cfg: DictConfig):
                 print(f"  ...Writing final {num_to_write} episodes to disk...")
                 dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
                 dof_vel_ds[start_idx:end_idx] = dof_vel_block[:num_to_write]
+
                 base_pos_ds[start_idx:end_idx]     = base_pos_block[:num_to_write]
                 base_vel_ds[start_idx:end_idx]     = base_vel_block[:num_to_write]
                 base_ang_ds[start_idx:end_idx]     = base_ang_block[:num_to_write]
+
                 obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
                 act_ds[start_idx:end_idx] = act_block[:num_to_write]
+
                 valid_len_ds[start_idx:end_idx] = vlen_block[:num_to_write]
                 total_episodes_saved = end_idx
 
