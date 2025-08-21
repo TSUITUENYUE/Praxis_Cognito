@@ -60,9 +60,9 @@ class Trainer:
         # model & geometry
         #self.vae = torch.compile(model.to(self.device),mode="reduce-overhead")
         self.vae = model.to(self.device)
-        self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
+        #self.vae.encoder = torch.compile(self.vae.encoder,mode="reduce-overhead")
         #self.vae.decoder = torch.compile(self.vae.decoder,mode="reduce-overhead")
-        self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
+        #self.vae.surrogate = torch.compile(self.vae.surrogate,mode="reduce-overhead")
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
@@ -122,7 +122,7 @@ class Trainer:
 
         # optimizer & schedulers
         base_lr = config.optimizer.lr
-        self.optimizer = optim.AdamW(self.vae.parameters(), lr=base_lr, weight_decay=1e-5, fused=True)
+        self.optimizer = optim.Adam(self.vae.parameters(), lr=base_lr, weight_decay=0, fused=True)
         num_total_steps = self.num_epochs * max(1, (self.episodes // self.batch_size))
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_total_steps)
         self.scaler = GradScaler()
@@ -133,11 +133,17 @@ class Trainer:
         self.max_beta = config.beta_anneal.max_beta
 
         self.lambda_kinematic = config.kino.lambda_kinematic
-        self.lambda_dynamic   = config.kino.lambda_dynamic / self.agent.n_dofs
+        self.lambda_dynamic   = config.kino.lambda_dynamic
 
         self.lambda_sim = config.sim.lambda_sim
         self.w_q  = config.sim.w_q
         self.w_dq = config.sim.w_dq
+        self.w_p = config.sim.w_p
+        self.w_dp = config.sim.w_dp
+        self.w_w = config.sim.w_w
+        self.w_dw = config.sim.w_dw
+        self.w_u = config.sim.w_u
+        self.w_du = config.sim.w_du
         self.w_obs= config.sim.w_obs
 
     # ---------- helpers ----------
@@ -195,48 +201,59 @@ class Trainer:
                 act_gt = act.to(self.device)
 
                 mask   = mask.to(self.device)[:, :, None] # [B,T,1]
-
+                u_gt = obs_gt[:,:,-6:-3]
+                du_gt = obs_gt[:,:,-3:]
                 self.optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=True):
+                with autocast(enabled=False):
                     beta = get_beta(global_step, total_steps, strategy=self.strategy,
                                     warmup_epochs=self.warm_up, max_beta=self.max_beta)
 
                     # teacher forcing ratio: decay to 0 by midway
 
                     tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
-
+                    tf_ratio = 0
                     # --- forward (policy decoder returns actions) ---
-                    traj_pred, state_pred, act_pred, obs_pred, *aux = self.vae(
-                         x, self.edge_index, mask,           # encoder_input
-                         self.obs_normalizer,                # normalizer for obs
-                         obs_seq=obs_gt,                     # for decoder teacher forcing
-                         q=q_gt, dq=dq_gt,
-                         p=p_gt, dp=dp_gt, dw=dw_gt,
-                         tf_ratio=tf_ratio,
+                    out = self.vae(
+                        x, self.edge_index, mask,
+                        self.obs_normalizer,
+                        obs_seq=obs_gt,
+                        q=q_gt, dq=dq_gt,
+                        p=p_gt, dp=dp_gt, dw=dw_gt,
+                        u=u_gt, du=du_gt,
+                        tf_ratio=tf_ratio,
                     )
 
-                    x_recon = traj_pred['graph']
+                    # ---- trajectory
+                    x_recon = out["traj"]["graph"]
 
-                    q_seq = state_pred['q']
-                    dq_seq = state_pred['dq']
+                    # ---- state
+                    state = out["state"]
+                    q_seq = state.get("q")
+                    dq_seq = state.get("dq")
+                    w_seq = state.get("w")
+                    dw_seq = state.get("dw")
+                    p_seq = state.get("p")
+                    dp_seq = state.get("dp")
 
-                    p_seq = state_pred['p']
-                    dp_seq = state_pred['dp']
-                    w_seq = state_pred['w']
-                    dw_seq = state_pred['dw']
+                    # ---- actions
+                    act = out["act"]
+                    act_seq = act.get("act")
+                    mu_seq = act.get("mu")
+                    log_std_seq = act.get("log_std")
+                    log_sigma = act.get("log_sigma")
 
-                    act_seq = act_pred['act']
-                    mu_seq = act_pred['mu']
-                    log_std_seq = act_pred['log_std']
-                    log_sigma = act_pred['log_sigma']
+                    # ---- obs
+                    obs_seq = out["obs"]["obs"]
+                    u_seq = obs_seq[:, :, -6:-3]
+                    du_seq = obs_seq[:, :, -3:]
 
-                    obs_seq = obs_pred['obs']
-                    u_seq = obs_seq[:,:,-6:-3]
-                    du_seq = obs_seq[:,:,-3:]
-
+                    # ---- aux latents/posterior
+                    aux = out.get("aux", [])
                     z = aux[0]
+
+                    z_detached = z.detach()
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         was_training = self.vae.decoder.training
                         self.vae.decoder.eval()
                         try:
@@ -260,7 +277,7 @@ class Trainer:
 
                             for t in range(T):
                                 mask_t = mask[:, t, :]
-                                a_t, _, _ = self.vae.decoder(z, obs_t_n, mask_t)
+                                a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
                                 obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
 
                                 q_t = self.env.dof_pos
@@ -307,8 +324,9 @@ class Trainer:
                     w_loss = masked_quat_geodesic(w_seq, w_sim_seq.detach(), mask)
 
                     u_loss = self.masked_mse(u_seq, u_sim_seq.detach(), mask)
+                    #print(u_loss)
                     du_loss = self.masked_mse(du_seq, du_sim_seq.detach(), mask)
-
+                    # print(du_loss)
                     state_loss = (
                             self.w_q * q_loss +
                             self.w_dq * dq_loss +
@@ -327,14 +345,53 @@ class Trainer:
 
                     total_loss = loss + self.lambda_sim * sim_loss
 
-                    # --- diag: unnormalized recon MSE in world units ---
-                    unnormalized_recon_mu = _denorm_positions(x_recon, self.pos_mean_d, self.pos_std_d)
-                    unnormalized_graph_x  = _denorm_positions(x.reshape(x_recon.shape), self.pos_mean_d, self.pos_std_d)
-                    unnormalized_loss = self.masked_mse(unnormalized_recon_mu, unnormalized_graph_x, mask)
+                    with torch.no_grad():
+                        unnormalized_recon_mu = _denorm_positions(x_recon.detach(), self.pos_mean_d, self.pos_std_d)
+                        unnormalized_graph_x = _denorm_positions(x.reshape(x_recon.shape).detach(), self.pos_mean_d,
+                                                                 self.pos_std_d)
+                        unnormalized_loss = self.masked_mse(unnormalized_recon_mu, unnormalized_graph_x, mask).item()
 
                 # Backprop THROUGH total_loss so surrogate learns from sim_loss
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
+
+                # Calculate the total gradient norm for the entire model
+                total_norm = 0.0
+                for p in self.vae.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+
+                # Log the total gradient norm
+                print(f"Total gradient norm: {total_norm}")
+
+                # Additionally, you can log gradients for specific parts of the model, e.g., encoder and decoder
+                encoder_norm = 0.0
+                for name, p in self.vae.encoder.named_parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        encoder_norm += param_norm.item() ** 2
+                encoder_norm = encoder_norm ** 0.5
+                print(f"Encoder gradient norm: {encoder_norm}")
+
+                surrogate_norm = 0.0
+                for name, p in self.vae.surrogate.named_parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        surrogate_norm += param_norm.item() ** 2
+                surrogate_norm = surrogate_norm ** 0.5
+                print(f"Surrogate gradient norm: {surrogate_norm}")
+
+                decoder_norm = 0.0
+                for name, p in self.vae.decoder.named_parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        decoder_norm += param_norm.item() ** 2
+                decoder_norm = decoder_norm ** 0.5
+                print(f"Decoder gradient norm: {decoder_norm}")
+
+
                 nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_clip_value)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -346,12 +403,21 @@ class Trainer:
                     print(
                         f"Batch {i + 1}/{len(dataloader)}, "
                         f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
-                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss.item():.4f} "
+                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss:.4f} "
                         f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
                         f"| Sim:{sim_loss.item():.4f}"
                         f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
                     )
-
+                    '''
+                    print(self.w_q * q_loss.item(),
+                    self.w_dq * dq_loss.item() ,
+                    self.w_p * p_loss.item() ,
+                    self.w_dp * dp_loss.item() ,
+                    self.w_w * w_loss.item() ,
+                    self.w_dw * dw_loss.item() ,
+                    self.w_u * u_loss.item() ,
+                    self.w_du * du_loss.item() ,)
+                    '''
             os.makedirs(self.save_path, exist_ok=True)
             save_path = os.path.join(self.save_path, f"vae_checkpoint_epoch_{epoch + 1}.pth")
             torch.save(self.vae.state_dict(), save_path)

@@ -288,7 +288,7 @@ def generate(cfg: DictConfig):
                             batch_act = all_act[:end_idx]
 
                             norm_batch_states      = state_normalizer.normalize(batch_states)
-                            norm_batch_act         = action_normalizer.normalize(torch.clamp(batch_act, -1.0, 1.0))
+                            norm_batch_act         = action_normalizer.normalize(torch.clamp(batch_act, -100, 100))
                             norm_batch_next_states = state_normalizer.normalize(batch_next_states)
 
                             # AMP-scaled ICM update
@@ -302,9 +302,8 @@ def generate(cfg: DictConfig):
 
                     with torch.enable_grad():
                         # Autocast PPO update (no external scaler since optimizer lives inside lib)
-                        with autocast(enabled=torch.cuda.is_available()):
-                            policy_alg.compute_returns(critic_obs_n)
-                            mean_value_loss, mean_surrogate_loss, _, _, _ = policy_alg.update()
+                        policy_alg.compute_returns(critic_obs_n)
+                        mean_value_loss, mean_surrogate_loss, _, _, _ = policy_alg.update()
                 # ==========================================================================
 
             action_mean = torch.mean(act).item()

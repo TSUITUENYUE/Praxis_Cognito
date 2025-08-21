@@ -45,24 +45,22 @@ class IntentionVAE(nn.Module):
         self.prior = prior
         self.num_components = num_components if prior == "GMM" else None
         self.latent_dim = latent_dim
-
         self.agent = agent
         self.object_dim = agent.object_dim
         self.joint_dim = agent.n_dofs
         self.urdf = agent.urdf
 
         self.cfg = cfg
-        self.env_cfg = cfg.env
+        #self.env_cfg = cfg.env
         self.obs_scale = cfg.obs.obs_scales
         self.default_dof_pos = agent.init_angles
         self.simulate_action_latency = self.cfg.env.simulate_action_latency
 
-        self.base_init_pos = self.env.base_init_pos
-        self.base_init_quat = self.env.base_init_quat
-        self.kp = self.env.kp
-        self.kd = self.env.kd
-
-
+        self.base_init_pos = self.cfg.env.base_init_pos
+        self.base_init_quat = self.cfg.env.base_init_quat
+        self.kp = self.cfg.env.kp
+        self.kd = self.cfg.env.kd
+        self.last_actions = None
         # NOTE: replace these with dataset stats (pos_mean/std) before training.
         self.register_buffer("pos_mean", torch.zeros(3))
         self.register_buffer("pos_std", torch.ones(3))
@@ -159,11 +157,10 @@ class IntentionVAE(nn.Module):
 
         if dq_des is None:
             dq_des = torch.zeros_like(dq)
-
         tau = kp * (q_des - q) + kv * (dq_des - dq)
 
         # optional clamp by force range if present (Genesis does this)
-        fr = self.env_cfg.get("force_range", None)  # e.g. {"lower": -87.0, "upper": 87.0} or per-DOF list
+        fr = self.cfg.env.get("force_range", None)  # e.g. {"lower": -87.0, "upper": 87.0} or per-DOF list
         if fr is not None:
             f_lo = self._expand_to_dof(fr.get("lower", float("-inf")), d, dev).expand(B, d)
             f_hi = self._expand_to_dof(fr.get("upper", float("inf")), d, dev).expand(B, d)
@@ -176,7 +173,7 @@ class IntentionVAE(nn.Module):
         dev = a_t.device
 
         # --- 1) latency & PD target (target stays constant during the K ticks) ---
-        cmd_hold = torch.clamp(a_t, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        cmd_hold = torch.clamp(a_t, -self.cfg.env["clip_actions"], self.cfg.env["clip_actions"])
         exec_actions_last = cmd_hold  # for logging in obs
 
         q_k, dq_k = q_t, dq_t
@@ -184,13 +181,14 @@ class IntentionVAE(nn.Module):
         w_k, dw_k = w_t, dw_t
         u_k, du_k = u_t, du_t
 
+        if self.last_actions is None:
+            self.last_actions = torch.zeros(B, self.joint_dim, device=dev)
         for k in range(self.K):
             if self.simulate_action_latency and k == 0:
                 exec_actions = self.last_actions  # 1-tick delay on the first inner tick
             else:
                 exec_actions = cmd_hold  # current command thereafter
-
-            q_des = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+            q_des = exec_actions * self.cfg.env["action_scale"] + self.default_dof_pos
             tau_pd = self._pd_torque(q_k, dq_k, q_des, dq_des=None)
 
             q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k = self.surrogate(q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k, tau_pd)
@@ -222,18 +220,18 @@ class IntentionVAE(nn.Module):
         proj_g = transform_by_quat(g_world, inv_q_next)
 
         obs_pred = torch.cat([
-            dp_next * self.obs_scales["lin_vel"],  # 3
-            dw_next * self.obs_scales["ang_vel"],  # 3
+            dp_next * self.cfg.obs.obs_scales["lin_vel"],  # 3
+            dw_next * self.cfg.obs.obs_scales["ang_vel"],  # 3
             proj_g,  # 3
-            (q_next - self.default_dof_pos) * self.obs_scales["dof_pos"],  # d
-            dq_next * self.obs_scales["dof_vel"],  # d
+            (q_next - self.default_dof_pos) * self.cfg.obs.obs_scales["dof_pos"],  # d
+            dq_next * self.cfg.obs.obs_scales["dof_vel"],  # d
             exec_actions_last,  # d
             u_next, du_next
         ], dim=-1)
 
         # bookkeeping for next call
-        self.last_actions = a_t
-        self.last_dof_vel = dq_next
+        self.last_actions = a_t.detach()
+        self.last_dof_vel = dq_next.detach()
 
         # RETURN the masked "next" state (consistent with obs_pred)
         return obs_pred, q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next
@@ -289,6 +287,8 @@ class IntentionVAE(nn.Module):
         dq_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_dtype)
         w_seq = torch.empty(B, T, 4, device=dev, dtype=obs_dtype)  # reconstructed base quat
         dw_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)
+        p_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)  # reconstructed base quat
+        dp_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)
         obs_seq = torch.empty(B, T, self.obs_dim, device=dev, dtype=obs_dtype)  # OUTPUT buffer
         objects_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)  # store object POS(3) for recon
         log_sig_seq = torch.empty(B, T, (self.agent.fk_model.num_links + 1) * 3, device=dev, dtype=obs_dtype)
@@ -389,7 +389,6 @@ class IntentionVAE(nn.Module):
             action_t, mu_t, log_std_t, log_sig_t, _ = self.decoder(
                 z, obs_t=obs_prev, mask_t=mask_t
             )
-
             # ----- Surrogate dynamics (FULL state → next state) -----
             obs_pred, q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred = \
                 self.predict_dynamics(action_t, q_in, dq_in, p_in, dp_in, w_in, dw_in, u_in, du_in, mask_t)
@@ -419,6 +418,8 @@ class IntentionVAE(nn.Module):
             _store_col(dq_seq, t, dq_next)
             _store_col(w_seq, t, w_next)
             _store_col(dw_seq, t, dw_next)
+            _store_col(p_seq, t, p_next)
+            _store_col(dp_seq, t, dp_next)
             _store_col(objects_seq, t, u_next)  # u has shape 3; no slicing
             _store_col(obs_seq, t, obs_next)
             _store_col(log_sig_seq, t, log_sig_t)
@@ -448,13 +449,15 @@ class IntentionVAE(nn.Module):
                     "state":
                         {"q": joints_seq,
                          "dq": dq_seq,
+                         "p": p_seq,
+                         "dp": dp_seq,
                          "w": w_seq,
                          "dw": dw_seq},
                     "act":
                         {"act": action_seq,
                          "mu": mu_seq,
                          "log_std": log_std_seq,
-                         "log_sigma": log_std_seq},
+                         "log_sigma": log_sig_seq},
                     "obs":
                         {"obs": obs_seq},
                     "aux":
@@ -466,13 +469,15 @@ class IntentionVAE(nn.Module):
                     "state":
                         {"q": joints_seq,
                          "dq": dq_seq,
+                         "p": p_seq,
+                         "dp": dp_seq,
                          "w": w_seq,
                          "dw": dw_seq},
                     "act":
                         {"act": action_seq,
                          "mu": mu_seq,
                          "log_std": log_std_seq,
-                         "log_sigma": log_std_seq},
+                         "log_sigma": log_sig_seq},
                     "obs":
                         {"obs": obs_seq},
                     "aux":
