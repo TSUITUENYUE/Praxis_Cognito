@@ -199,10 +199,17 @@ class Go2Env:
     def get_privileged_observations(self):
         return None
 
+
+    def reset_with_ball_rel(self, u_rel, du_rel):
+        u_w = transform_by_quat(u_rel, self.base_init_quat) + self.base_init_pos
+        du_w = transform_by_quat(du_rel, self.base_init_quat)
+        self.ball.set_pos(u_w)
+        self.ball.set_dofs_velocity(du_w, dofs_idx_local=[0, 1, 2])
+
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
             return
-
+        '''
         ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
         ball_pos[:, 0] = gs_rand_float(0.5, 1.5, (len(envs_idx),), gs.device)
         ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
@@ -214,7 +221,7 @@ class Go2Env:
         ball_vel[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
         ball_vel[:, 2] = gs_rand_float(1.0, 2.0, (len(envs_idx),), gs.device)  # Flying upwards a bit
         self.ball.set_dofs_velocity(ball_vel, dofs_idx_local=[0,1,2], envs_idx=envs_idx)
-
+        '''
         # reset dofs
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
@@ -249,6 +256,8 @@ class Go2Env:
             self.episode_sums[key][envs_idx] = 0.0
 
         self._resample_commands(envs_idx)
+
+
 
     def reset(self):
         self.reset_buf[:] = True

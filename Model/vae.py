@@ -254,7 +254,7 @@ class IntentionVAE(nn.Module):
     ):
         """
         Returns (for both Gaussian and GMM priors):
-          recon_mu:   [B,T,(links+1)*3]  normalized FK (links) + object-pos(3)
+          recon_traj:   [B,T,(links+1)*3]  normalized FK (links) + object-pos(3)
           joint_cmd:  [B,T,d]            predicted joints
           actions:    [B,T,d]            decoder actions in [-1,1]
           log_sigma:  [B,T,(links+1)*3]  predicted log sigmas over pose dims
@@ -431,7 +431,7 @@ class IntentionVAE(nn.Module):
             u_prev, du_prev = u_next, du_next
             obs_prev = obs_next
 
-        # ----- FK + normalization → recon_mu -----
+        # ----- FK + normalization → recon_traj -----
         B, T, d = joints_seq.shape
         joint_flat = joints_seq.reshape(B * T, d)  # [B*T, d]
         pos_flat = self.decoder.fk_model(joint_flat)  # [B*T, links*3]
@@ -486,95 +486,86 @@ class IntentionVAE(nn.Module):
 
     # ---------- Loss (masked, correct normalization) ----------
     def loss(
-        self,
-        recon_mu,          # [B,T,D] normalized FK positions (prediction)
-        log_sigma,         # [B,T,D_log] (same D if you predict per-dim; else broadcastable)
-        orig_traj,         # [B,T,D] normalized FK positions (target)
-        act_mu,            # [B,T,A] teacher actions (target)
-        action_seq,        # [B,T,A] decoder actions (prediction)
-        mu_seq,           # [B,T,d]  (decoder mean, pre-tanh)
-        log_std_seq,          # [B,T,d]  (decoder log-std)
-        mask,              # [B,T,1] float {0,1}
-        *args,             # latent tuples per prior
-        beta: float,
-        lambda_kinematic: float = 1.0,
-        lambda_dynamic: float = 0.2,
+            self,
+            recon_traj,  # [B,T,D] normalized FK positions (prediction)
+            log_sigma,  # [B,T,D_log]
+            orig_traj,  # [B,T,D] normalized FK positions (target)
+            act_mu,  # [B,T,A] teacher actions (unused now)
+            action_seq,  # [B,T,A] decoder actions (prediction)
+            mu_seq,  # [B,T,d]
+            log_std_seq,  # [B,T,d]
+            mask,  # [B,T,1] float {0,1}
+            *args,  # latent tuples per prior
+            beta: float,
+            lambda_kinematic: float = 1.0,
+            lambda_dynamic: float = 0.2,
+            gamma: float = 1.0,  # discount for kinematic term only
+            wa1: float = 1e-3,  # L1 coeff for action magnitude
+            wa2: float = 1e-3,  # L2 coeff for action magnitude
     ):
         """
         Masked sequence loss:
-          - Pose: MSE (default) or heteroscedastic NLL per-step, masked and normalized.
-          - Action: MSE per-step, masked and normalized, scaled by lambda_action.
+          - Pose: MSE with per-timestep discount gamma^t, masked and normalized.
+          - Action: NO teacher; use magnitude regularizer (wa1*L1 + wa2*L2^2), masked.
           - KL: per-sequence.
         """
-        # Ensure shapes
-        B, T, D = recon_mu.shape
-        mask_bt = mask.squeeze(-1)                         # [B,T], float in {0,1}
-        valid = mask_bt.sum().clamp_min(1.0)               # scalar count of valid steps (across batch)
-        orig_traj=orig_traj.view(B,T,-1)
-        # -------- Pose reconstruction --------
-        #pose_step = self.hetero_nll_per_step(orig_traj, recon_mu, log_sigma)
-        # Per-step MSE averaged over feature dim: [B,T]
-        # pose loss
-        pose_step = ((recon_mu - orig_traj) ** 2).mean(dim=-1)  # [B,T]
-        pose_loss = (pose_step.mul(mask_bt)).sum().div(valid)  # fuse multiplications, no new tensors
+        import torch.nn.functional as F
+        B, T, D = recon_traj.shape
+        device = recon_traj.device
+        dtype = recon_traj.dtype
+
+        mask_bt = mask.squeeze(-1)  # [B,T], {0,1}
+
+        # -------- Pose reconstruction with discount gamma^t --------
+        orig_traj = orig_traj.view(B, T, -1)
+        pose_step = ((recon_traj - orig_traj) ** 2).mean(dim=-1)  # [B,T]
+
+        t_idx = torch.arange(T, device=device, dtype=dtype)
+        w_t = (gamma ** t_idx).to(dtype=dtype)  # [T]
+
+        weighted = pose_step * mask_bt * w_t.unsqueeze(0)  # [B,T]
+        denom = (mask_bt * w_t.unsqueeze(0)).sum().clamp_min(1e-6)
+        pose_loss = weighted.sum() / denom
         pose_loss = lambda_kinematic * pose_loss
-        '''
-        def atanh_clamped(a, eps=1e-6):
-            a = torch.clamp(a, -1.0 + eps, 1.0 - eps)
-            return 0.5 * (torch.log1p(a) - torch.log1p(-a))
 
-        # action NLL (factor out constant once)
-        LOG_2PI = math.log(2.0 * math.pi)
-
-        def _normal_nll(a, mean, log_std):
-            # a, mean, log_std: [B,T,d] in pre-tanh space
-            return 0.5 * (((a - mean) ** 2) * torch.exp(-2.0 * log_std) + 2.0 * log_std + math.log(2 * math.pi))
-
-        #nll_step = _normal_nll(act_mu, mu_seq, log_std_seq).sum(dim=-1)  # [B,T]
-        #action_loss = (nll_step.mul(mask_bt)).sum().div(valid)
-        '''
-        def softsign(x):
-            return x / (1 + x.abs())  # maps R -> (-1, 1)
-
-        a_bounded = softsign(action_seq)
-        mu_bounded = softsign(act_mu)
-        act_step = ((a_bounded - mu_bounded) ** 2).mean(dim=-1)
-        action_loss = (act_step * mask.squeeze(-1)).sum().div(valid)
-
+        # -------- Action magnitude regularizer (replace old MSE) --------
+        # Per-step mean over action dims
+        l1 = action_seq.abs().mean(dim=-1)  # [B,T]
+        l2 = (action_seq ** 2).mean(dim=-1)  # [B,T]
+        act_reg_step = wa1 * l1 + wa2 * l2  # [B,T]
+        valid = mask_bt.sum().clamp_min(1.0)
+        action_loss = (act_reg_step * mask_bt).sum().div(valid)
         action_loss = lambda_dynamic * action_loss
+
         total_recon = pose_loss + action_loss
 
-        # -------- KL (per prior) --------
+        # -------- KL (unchanged) --------
         if self.prior == "GMM":
             mu, logvar, pi_logits = args
-            # mu/logvar: [B,K,D], prior_mu/logvar: [K,D]
             Bk, K, Dk = mu.shape
             pi = F.softmax(pi_logits, dim=-1)  # [B,K]
 
-            prior_mu = self.prior_mu.unsqueeze(0).expand(Bk, -1, -1)         # [B,K,D]
-            prior_logv = self.prior_logvar.unsqueeze(0).expand(Bk, -1, -1)   # [B,K,D]
+            prior_mu = self.prior_mu.unsqueeze(0).expand(Bk, -1, -1)  # [B,K,D]
+            prior_logv = self.prior_logvar.unsqueeze(0).expand(Bk, -1, -1)  # [B,K,D]
 
-            # KL of Gaussians q(z|x,c) || p(z|c), diagonal
-            # 0.5 * [ log|Σ_p| - log|Σ_q| - D + tr(Σ_p^{-1} Σ_q) + (μ_q-μ_p)^T Σ_p^{-1} (μ_q-μ_p) ]
             kl_gauss = 0.5 * torch.sum(
                 prior_logv - logvar - 1.0
                 + (logvar - prior_logv).exp()
                 + (mu - prior_mu).pow(2) / prior_logv.exp(),
-                dim=-1,  # over D
+                dim=-1,
             )  # [B,K]
 
-            # Categorical KL: q(c|x) || p(c) with uniform prior
             log_q = torch.log(pi + 1e-10)
             log_p = math.log(1.0 / K)
             kl_cat = torch.sum(pi * (log_q - log_p), dim=-1)  # [B]
 
-            kl_loss = torch.sum(pi * kl_gauss, dim=-1) + kl_cat  # [B]
+            kl_loss = torch.sum(pi * kl_gauss, dim=-1) + kl_cat
             kl_loss = kl_loss.mean()
-
-        else:  # Gaussian
+        else:
             z, mu, logvar = args
-            kl_per = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)  # [B]
+            kl_per = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
             kl_loss = kl_per.mean()
 
         vae_loss = total_recon + beta * kl_loss
         return vae_loss, pose_loss, action_loss, kl_loss
+

@@ -258,9 +258,10 @@ class Trainer:
                         self.vae.decoder.eval()
                         try:
                             reset_out = self.env.reset()
+                            self.env.reset_with_ball_rel(u_gt[:,0],du_gt[:,0])
                             obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
+                            #obs0_raw[:, -6:-3] = u_gt[:, 0]
                             obs_t_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
-
                             B = act_seq.shape[0]
                             T = act_seq.shape[1]
                             # Pre-allocate on device with correct dtypes
@@ -278,8 +279,10 @@ class Trainer:
                             for t in range(T):
                                 mask_t = mask[:, t, :]
                                 a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
+                                #a_t = act_gt[:,t]
                                 obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
-
+                                #obs_t_raw[:,-6:-3] = u_gt[:,t]
+                                #obs_t_raw[:,-3:] = du_gt[:,t]
                                 q_t = self.env.dof_pos
                                 dq_t = self.env.dof_vel
                                 p_t = self.env.base_pos
@@ -408,7 +411,7 @@ class Trainer:
                         f"| Sim:{sim_loss.item():.4f}"
                         f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
                     )
-                    '''
+
                     print(self.w_q * q_loss.item(),
                     self.w_dq * dq_loss.item() ,
                     self.w_p * p_loss.item() ,
@@ -417,7 +420,7 @@ class Trainer:
                     self.w_dw * dw_loss.item() ,
                     self.w_u * u_loss.item() ,
                     self.w_du * du_loss.item() ,)
-                    '''
+
             os.makedirs(self.save_path, exist_ok=True)
             save_path = os.path.join(self.save_path, f"vae_checkpoint_epoch_{epoch + 1}.pth")
             torch.save(self.vae.state_dict(), save_path)
