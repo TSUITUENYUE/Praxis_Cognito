@@ -499,7 +499,7 @@ class IntentionVAE(nn.Module):
             beta: float,
             lambda_kinematic: float = 1.0,
             lambda_dynamic: float = 0.2,
-            gamma: float = 1.0,  # discount for kinematic term only
+            gamma: float = 0.95,  # discount for kinematic term only
             wa1: float = 1e-3,  # L1 coeff for action magnitude
             wa2: float = 1e-3,  # L2 coeff for action magnitude
     ):
@@ -522,7 +522,6 @@ class IntentionVAE(nn.Module):
 
         t_idx = torch.arange(T, device=device, dtype=dtype)
         w_t = (gamma ** t_idx).to(dtype=dtype)  # [T]
-
         weighted = pose_step * mask_bt * w_t.unsqueeze(0)  # [B,T]
         denom = (mask_bt * w_t.unsqueeze(0)).sum().clamp_min(1e-6)
         pose_loss = weighted.sum() / denom

@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from typing import Tuple
+from genesis.utils.geom import transform_by_quat
 
 class SurrogateDynamics(nn.Module):
     """
@@ -121,17 +122,13 @@ class SurrogateDynamics(nn.Module):
         dq_next  = dq_t + dq_delta
         q_next   = q_t  + self.dt * dq_next   # clamp outside if needed
 
-        # ----- object -----
-        du_res  = torch.tanh(self.du_res_head(h)) * torch.exp(self.log_du_res_scale)  # [B, o]
-        du_next = du_t + du_res
-        u_res   = torch.tanh(self.u_res_head(h))  * torch.exp(self.log_u_res_scale)   # [B, o]
-        u_next  = u_t + self.dt * du_next + u_res
-
         # ----- base linear -----
         dp_res  = torch.tanh(self.dp_res_head(h)) * torch.exp(self.log_dp_res_scale)  # [B, 3]
         dp_next = dp_t + dp_res
-        p_res   = torch.tanh(self.p_res_head(h))  * torch.exp(self.log_p_res_scale)   # [B, 3]
-        p_next  = p_t + self.dt * dp_next + p_res
+
+        p_res = torch.tanh(self.p_res_head(h)) * torch.exp(self.log_p_res_scale)
+        v_world = transform_by_quat(dp_next, w_t)
+        p_next = p_t + self.dt * v_world + p_res
 
         # ----- base angular: integrate quat from ω -----
         dw_res  = torch.tanh(self.dw_res_head(h)) * torch.exp(self.log_dw_res_scale)  # [B, 3]
@@ -139,5 +136,14 @@ class SurrogateDynamics(nn.Module):
         dquat_small = self._delta_quat_from_omega(dw_next)                                # [B,4]
         # note: compose as q_next = q_t ⊗ dq_small (body-frame ω)
         w_next  = self._quat_normalize(self._quat_mul(w_t, dquat_small))
+
+        # ----- object -----
+        du_res  = torch.tanh(self.du_res_head(h)) * torch.exp(self.log_du_res_scale)  # [B, o]
+        #transport = - torch.cross(dw_next, u_t, dim=-1)
+        #du_next = du_t + transport + du_res
+        du_next = du_t + du_res
+        u_res   = torch.tanh(self.u_res_head(h))  * torch.exp(self.log_u_res_scale)   # [B, o]
+        u_next  = u_t + self.dt * du_next + u_res
+
 
         return q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next

@@ -124,6 +124,38 @@ class Go2Env:
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), gs.device)
         self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), gs.device)
 
+    def _refresh_obs(self):
+        inv_base_quat = inv_quat(self.base_quat)
+        # world→body
+        robot_vel_w = self.robot.get_vel()
+        self.base_lin_vel[:] = transform_by_quat(robot_vel_w, inv_base_quat)
+        self.base_ang_vel[:] = transform_by_quat(self.robot.get_ang(), inv_base_quat)
+        self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
+        self.dof_pos[:] = self.robot.get_dofs_position(self.motors_dof_idx)
+        self.dof_vel[:] = self.robot.get_dofs_velocity(self.motors_dof_idx)
+
+        ball_pos = self.ball.get_pos()
+        ball_vel = self.ball.get_vel()
+        self.relative_ball_pos = transform_by_quat(ball_pos - self.base_pos, inv_base_quat)
+        rel_vel_w = ball_vel - robot_vel_w
+        self.relative_ball_vel = transform_by_quat(rel_vel_w, inv_base_quat)
+
+        exec_actions = self.last_actions if self.simulate_action_latency else self.actions
+        self.obs_buf = torch.cat(
+            [
+                self.base_lin_vel * self.obs_scales["lin_vel"],
+                self.base_ang_vel * self.obs_scales["ang_vel"],
+                self.projected_gravity,
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
+                self.dof_vel * self.obs_scales["dof_vel"],
+                exec_actions,
+                self.relative_ball_pos,
+                self.relative_ball_vel,
+            ],
+            dim=-1,
+        )
+        self.extras["observations"]["critic"] = self.obs_buf
+
     def step(self, actions):
         #actions = torch.tanh(actions)
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
@@ -150,7 +182,7 @@ class Go2Env:
         ball_vel = self.ball.get_vel()
         # express in base frame
         self.relative_ball_pos = transform_by_quat(ball_pos - self.base_pos, inv_base_quat)
-        self.relative_ball_vel = transform_by_quat(ball_vel - self.base_lin_vel, inv_base_quat)
+        self.relative_ball_vel = transform_by_quat(ball_vel - self.robot.get_vel(), inv_base_quat)
         # resample commands
 
         # check termination and reset
@@ -205,6 +237,7 @@ class Go2Env:
         du_w = transform_by_quat(du_rel, self.base_init_quat)
         self.ball.set_pos(u_w)
         self.ball.set_dofs_velocity(du_w, dofs_idx_local=[0, 1, 2])
+        self._refresh_obs()
 
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
@@ -262,6 +295,7 @@ class Go2Env:
     def reset(self):
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
+        self._refresh_obs()
         return self.obs_buf, self.extras
 
     # ------------ reward functions----------------

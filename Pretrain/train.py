@@ -161,6 +161,124 @@ class Trainer:
         x_n = self.obs_normalizer(x_flat)  # module in eval mode => uses stored stats
         return x_n.view(B, T, D)
 
+    def _wm_short_loss(self, q, dq, p, dp, dw, obs, act, mask):
+        """
+        Short-window/1-step supervise for world model (surrogate) only.
+        Inputs are GT states & actions (dataset); no env, no decoder.
+        We reconstruct base quat from obs projected gravity (与 VAE.forward 一致的做法)。
+        不对外生球 (u, du) 做监督，只作为输入条件。
+        """
+        device = self.device
+        eps = 1e-8
+
+        # to device
+        q = q.to(device);
+        dq = dq.to(device)
+        p = p.to(device);
+        dp = dp.to(device)
+        dw = dw.to(device)
+        obs = obs.to(device)
+        act = act.to(device)
+        mask_bt = mask.to(device)  # [B,T]
+
+        B, T, d = q.shape
+
+        # ---- 从 obs 重建 base quat（与 VAE 内的 _quat_from_g 一致的零航向构造）----
+        g = obs[:, :, 6:9]  # [B,T,3]
+        z_w = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=g.dtype).expand(B * T, 3)
+        a = -g.reshape(B * T, 3)
+        a = a / (a.norm(dim=-1, keepdim=True) + eps)
+        v = torch.cross(a, z_w, dim=-1)
+        c = (a * z_w).sum(dim=-1, keepdim=True)
+        s = torch.sqrt(torch.clamp(1.0 + c, min=0.0)) * 2.0
+        xyz = v / (s + eps)
+        wq = 0.5 * s
+        q_align = torch.cat([wq, xyz], dim=-1)
+        q_align = q_align / (q_align.norm(dim=-1, keepdim=True) + eps)
+
+        def _quat_mul(q, r):
+            w1, x1, y1, z1 = q.unbind(-1)
+            w2, x2, y2, z2 = r.unbind(-1)
+            return torch.stack([
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+            ], dim=-1)
+
+        x_b = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=g.dtype).expand(B * T, 3)
+
+        # 旋转 x_b
+        def _rot(q, v3):
+            w, x, y, z = q.unbind(-1)
+            qv = torch.stack([torch.zeros_like(w), v3[:, 0], v3[:, 1], v3[:, 2]], dim=-1)
+            inv = torch.stack([w, -x, -y, -z], dim=-1) / (q.norm(dim=-1, keepdim=True) ** 2 + eps)
+            out = _quat_mul(_quat_mul(q, qv), inv)
+            return out[:, 1:4]
+
+        x0_w = _rot(q_align, x_b)
+        phi = torch.atan2(x0_w[:, 1], x0_w[:, 0])
+        half = -0.5 * phi
+        qz = torch.stack([torch.cos(half), torch.zeros_like(half), torch.zeros_like(half), torch.sin(half)], dim=-1)
+        w_flat = _quat_mul(qz, q_align)
+        w = (w_flat / (w_flat.norm(dim=-1, keepdim=True) + eps)).view(B, T, 4)  # [B,T,4]
+
+        # ---- 外生球作为输入条件 ----
+        u = obs[:, :, -6:-3].to(device)  # [B,T,3]
+        du = obs[:, :, -3:].to(device)  # [B,T,3]
+
+        # ---- 1-step 监督：输入用当前 GT，动作用数据动作经 PD 转成 torque（与你 VAE 一致）----
+        total = 0.0
+        denom = 0.0
+
+        for t in range(T - 1):
+            m_pair = (mask_bt[:, t] * mask_bt[:, t + 1]).float()  # [B]
+            if m_pair.sum() < 1.0:
+                continue
+
+            q_t = q[:, t, :]
+            dq_t = dq[:, t, :]
+            p_t = p[:, t, :]
+            dp_t = dp[:, t, :]
+            w_t = w[:, t, :]
+            dw_t = dw[:, t, :]
+            u_t = u[:, t, :]
+            du_t = du[:, t, :]
+
+            a_t = act[:, t, :]  # 数据动作（未 tanh）
+
+            # 用与你模型一致的 PD 生成“执行量”，然后喂给 surrogate
+            q_des = a_t * self.vae.cfg.env["action_scale"] + self.vae.default_dof_pos
+            tau_pd = self.vae._pd_torque(q_t, dq_t, q_des, dq_des=None)
+
+            q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred = \
+                self.vae.surrogate(q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, tau_pd)
+
+            # 监督目标：下一步 GT
+            q_n = q[:, t + 1, :]
+            dq_n = dq[:, t + 1, :]
+            p_n = p[:, t + 1, :]
+            dp_n = dp[:, t + 1, :]
+            w_n = w[:, t + 1, :]
+            dw_n = dw[:, t + 1, :]
+
+            # 只对“可对齐”的 robot 状态做监督（不监督 u/du）
+            q_loss = self.masked_mse(q_pred, q_n, m_pair[:, None])
+            dq_loss = self.masked_mse(dq_pred, dq_n, m_pair[:, None])
+            p_loss = self.masked_mse(p_pred, p_n, m_pair[:, None])
+            dp_loss = self.masked_mse(dp_pred, dp_n, m_pair[:, None])
+            dw_loss = self.masked_mse(dw_pred, dw_n, m_pair[:, None])
+            w_loss = masked_quat_geodesic(w_pred, w_n, m_pair[:, None])
+
+            step_loss = (
+                    self.w_q * q_loss + self.w_dq * dq_loss +
+                    self.w_p * p_loss + self.w_dp * dp_loss +
+                    self.w_w * w_loss + self.w_dw * dw_loss
+            )
+            total = total + step_loss
+            denom += 1.0
+
+        return total / max(denom, 1.0)
 
     # ---------- training ----------
     def train(self):
@@ -185,6 +303,9 @@ class Trainer:
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
+
+
+
             for i, (x, q, dq, p, dp, dw, obs, act, mask) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
 
@@ -250,7 +371,7 @@ class Trainer:
                     # ---- aux latents/posterior
                     aux = out.get("aux", [])
                     z = aux[0]
-
+                    #z = torch.zeros_like(z)
                     z_detached = z.detach()
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
                     with torch.no_grad():
@@ -279,10 +400,10 @@ class Trainer:
                             for t in range(T):
                                 mask_t = mask[:, t, :]
                                 a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
-                                #a_t = act_gt[:,t]
+                                a_t = act_gt[:,t]
                                 obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
-                                #obs_t_raw[:,-6:-3] = u_gt[:,t]
-                                #obs_t_raw[:,-3:] = du_gt[:,t]
+                                obs_t_raw[:,-6:-3] = u_gt[:,t]
+                                obs_t_raw[:,-3:] = du_gt[:,t]
                                 q_t = self.env.dof_pos
                                 dq_t = self.env.dof_vel
                                 p_t = self.env.base_pos
