@@ -304,10 +304,7 @@ class Trainer:
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
-
-
-
-            for i, (x, q, dq, p, dp, dw, obs, act, mask) in enumerate(dataloader):
+            for i, (x, q, dq, p, dp, dw,u, du, dv, obs, act, mask) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
 
                 x      = x.to(self.device)
@@ -319,12 +316,15 @@ class Trainer:
                 dp_gt  = dp.to(self.device)
                 dw_gt   = dw.to(self.device)
 
+                u_gt   = u.to(self.device)
+                du_gt  = du.to(self.device)
+                dv_gt   = dv.to(self.device)
+
                 obs_gt = obs.to(self.device)              # [B,T,obs_dim] (UN-normalized from dataset)
                 act_gt = act.to(self.device)
 
                 mask   = mask.to(self.device)[:, :, None] # [B,T,1]
-                u_gt = obs_gt[:,:,-6:-3]
-                du_gt = obs_gt[:,:,-3:]
+
                 self.optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=False):
                     beta = get_beta(global_step, total_steps, strategy=self.strategy,
@@ -341,7 +341,7 @@ class Trainer:
                         obs_seq=obs_gt,
                         q=q_gt, dq=dq_gt,
                         p=p_gt, dp=dp_gt, dw=dw_gt,
-                        u=u_gt, du=du_gt,
+                        u=u_gt, du=du_gt, dv=dv_gt,
                         tf_ratio=tf_ratio,
                     )
 
@@ -366,8 +366,8 @@ class Trainer:
 
                     # ---- obs
                     obs_seq = out["obs"]["obs"]
-                    u_seq = obs_seq[:, :, -6:-3]
-                    du_seq = obs_seq[:, :, -3:]
+                    #u_seq = obs_seq[:, :, -6:-3]
+                    #du_seq = obs_seq[:, :, -3:]
 
                     # ---- aux latents/posterior
                     aux = out.get("aux", [])
@@ -474,7 +474,11 @@ class Trainer:
                         unnormalized_recon_mu = _denorm_positions(x_recon.detach(), self.pos_mean_d, self.pos_std_d)
                         unnormalized_graph_x = _denorm_positions(x.reshape(x_recon.shape).detach(), self.pos_mean_d,
                                                                  self.pos_std_d)
-                        unnormalized_loss = self.masked_mse(unnormalized_recon_mu, unnormalized_graph_x, mask).item()
+                        unnormalized_loss_obj = self.masked_mse(unnormalized_recon_mu[:,:,-3:], unnormalized_graph_x[:,:,-3:], mask).item()
+
+                        unnormalized_loss = self.masked_mse(unnormalized_recon_mu[:,:,:-3], unnormalized_graph_x[:,:,:-3], mask).item()
+
+
 
                 # Backprop THROUGH total_loss so surrogate learns from sim_loss
                 self.scaler.scale(total_loss).backward()
@@ -528,7 +532,7 @@ class Trainer:
                     print(
                         f"Batch {i + 1}/{len(dataloader)}, "
                         f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
-                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss:.4f} "
+                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss:.4f} | Unnorm_Obj:{unnormalized_loss_obj:.4f} "
                         f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
                         f"| Sim:{sim_loss.item():.4f}"
                         f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
