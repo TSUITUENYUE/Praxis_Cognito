@@ -150,7 +150,8 @@ class Trainer:
     @staticmethod
     def masked_mse(pred, target, mask):
         # pred/target: [B,T,D], mask: [B,T,1]
-        per_t = ((pred - target) ** 2).mean(dim=-1)  # [B,T]
+        per_t = (torch.abs(pred - target)).mean(dim=-1)  # [B,T]
+        #per_t = ((pred - target)**2).mean(dim=-1)  # [B,T]
         denom = mask.sum().clamp_min(1.0)
         return (per_t * mask.squeeze(-1)).sum() / denom
 
@@ -399,11 +400,11 @@ class Trainer:
 
                             for t in range(T):
                                 mask_t = mask[:, t, :]
-                                a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
+                                #a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
                                 a_t = act_gt[:,t]
                                 obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
-                                obs_t_raw[:,-6:-3] = u_gt[:,t]
-                                obs_t_raw[:,-3:] = du_gt[:,t]
+                                #obs_t_raw[:,-6:-3] = u_gt[:,t]
+                                #obs_t_raw[:,-3:] = du_gt[:,t]
                                 q_t = self.env.dof_pos
                                 dq_t = self.env.dof_vel
                                 p_t = self.env.base_pos
