@@ -168,18 +168,13 @@ class IntentionVAE(nn.Module):
 
         return tau
 
-    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, dv_t, mask_t):
+    def predict_dynamics(self, a_t):
         B, d = a_t.shape
         dev = a_t.device
 
         # --- 1) latency & PD target (target stays constant during the K ticks) ---
         cmd_hold = torch.clamp(a_t, -self.cfg.env["clip_actions"], self.cfg.env["clip_actions"])
         exec_actions_last = cmd_hold  # for logging in obs
-
-        q_k, dq_k = q_t, dq_t
-        p_k, dp_k = p_t, dp_t
-        w_k, dw_k = w_t, dw_t
-        u_k, du_k, dv_k = u_t, du_t, dv_t
 
         if self.last_actions is None:
             self.last_actions = torch.zeros(B, self.joint_dim, device=dev)
@@ -191,35 +186,28 @@ class IntentionVAE(nn.Module):
             q_des = exec_actions * self.cfg.env["action_scale"] + self.default_dof_pos
             tau_pd = self._pd_torque(q_k, dq_k, q_des, dq_des=None)
 
-            q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k,dv_k= self.surrogate(q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k, dv_k, tau_pd)
+            self.scene.update() # YOUR JAX IMPLEMENTATION GOES HERE
 
             exec_actions_last = exec_actions
 
         # predicted (t + rollout_dt)
-        q_pred, dq_pred = q_k, dq_k
-        p_pred, dp_pred = p_k, dp_k
-        w_pred, dw_pred = w_k, dw_k
-        u_pred, du_pred,dv_pred = u_k, du_k,dv_k
 
-        # --- 3) mask EVERY state (freeze beyond padding) ---
-        m = mask_t
-        if m.dim() == 1:
-            m = m.unsqueeze(-1)  # [B,1]
-        q_next = m * q_pred + (1.0 - m) * q_t
-        dq_next = m * dq_pred + (1.0 - m) * dq_t
-        p_next = m * p_pred + (1.0 - m) * p_t
-        dp_next = m * dp_pred + (1.0 - m) * dp_t
-        w_next = m * w_pred + (1.0 - m) * w_t
-        dw_next = m * dw_pred + (1.0 - m) * dw_t
-        u_next = m * u_pred + (1.0 - m) * u_t
-        du_next = m * du_pred + (1.0 - m) * du_t
-        dv_next = m * dv_pred + (1.0 - m) * dv_t
+
 
         # --- 4) obs from the UPDATED state (body-frame vel assumed) ---
+        q_next = self.env.robot.get_dofs_positions()
+        dq_next =self.env.robot.get_dofs_velocities()
+        w_next = self.env.robot.get_quat()
+        p_next = self.env.robot.get_pos()
+        dp_next = self.env.robot.get_vel()
+        dw_next = self.env.robot.get_ang()
+        u_next = self.env.ball.get_pos()
+        du_next = self.env.robot.get_vel()
         inv_q_next = inv_quat(w_next)
         base_lin_vel = transform_by_quat(dp_next, inv_q_next)
         base_ang_vel = transform_by_quat(dw_next, inv_q_next)
-        g_world = torch.tensor([0.0, 0.0, -1.0], device=dev, dtype=q_t.dtype).expand(B, 3)
+
+        g_world = torch.tensor([0.0, 0.0, -1.0], device=dev).expand(B, 3)
         proj_g = transform_by_quat(g_world, inv_q_next)
         relative_ball_pos = transform_by_quat(u_next - p_next, inv_q_next)
         relative_ball_vel = transform_by_quat(du_next - dp_next, inv_q_next)
@@ -240,7 +228,7 @@ class IntentionVAE(nn.Module):
         self.last_dof_vel = dq_next.detach()
 
         # RETURN the masked "next" state (consistent with obs_pred)
-        return obs_pred, q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next,dv_next
+        return obs_pred
 
     def forward(
             self,
