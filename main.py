@@ -6,7 +6,7 @@ from Pretrain.train import *
 from Model.agent import *
 from codebook import Codebook
 from Pretrain.generate_dataset import generate
-from Pretrain.go2_env import Go2Env
+from Pretrain.go2_env_mjx import Go2EnvMJX as Go2Env
 import argparse
 import os
 import genesis as gs
@@ -14,6 +14,7 @@ import genesis as gs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
+torch.autograd.set_detect_anomaly(True)
 
 class Runner:
     def __init__(self, mode, config: DictConfig):
@@ -21,11 +22,22 @@ class Runner:
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.agent = Agent(**config.agent).to(self.device)
-        if self.mode != "generate":
-            self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs, fps=config.dataset.frame_rate, cfg=config.rl, **config.model.vae)
+        rl_config = self.config.rl
 
+        if self.mode != "generate":
             if self.mode == "train":
-                self.trainer = Trainer(self.model, config.rl, config.trainer)
+                self.env = Go2Env(
+                    num_envs=self.config.trainer.batch_size,
+                    env_cfg=rl_config.env,
+                    obs_cfg=rl_config.obs,
+                    reward_cfg=rl_config.reward,
+                    command_cfg=rl_config.command,
+                    show_viewer=False,
+                    agent=self.agent,
+                )
+                self.model = IntentionVAE(agent=self.agent, obs_dim=config.rl.obs.num_obs,
+                                          fps=config.dataset.frame_rate, env=self.env, **config.model.vae)
+                self.trainer = Trainer(self.model, rl_config, config.trainer)
             if self.mode != "train":
                 self.codebook = Codebook(**config.codebook)
                 checkpoint_path = self.config.trainer.save_path + f"vae_checkpoint_epoch_{self.config.trainer.num_epochs}.pth"
