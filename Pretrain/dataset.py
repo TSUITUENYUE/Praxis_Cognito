@@ -62,11 +62,15 @@ class TrajectoryDataset(Dataset):
         dp = torch.from_numpy(self.h5_file['base_vel'][idx]).float()    # [T, 3]  (raw)
         w = torch.from_numpy(self.h5_file['base_ang'][idx]).float()     # [T, 3]  (raw)
 
+        u = torch.from_numpy(self.h5_file['ball_pos'][idx]).float()     # [T, 3]  (raw)
+        du = torch.from_numpy(self.h5_file['ball_vel'][idx]).float()    # [T, 3]  (raw)
+        v = torch.from_numpy(self.h5_file['ball_ang'][idx]).float()     # [T, 3]  (raw)
+
         obs  = torch.from_numpy(self.h5_file['obs'][idx]).float()           # [T, obs_dim] (raw)
         act  = torch.from_numpy(self.h5_file['act'][idx]).float()           # [T, n_dofs]
 
         mask = torch.from_numpy(self.h5_file['mask'][idx]).squeeze(-1).float()  # [T] ★ NEW
-        return gx, q, dq, p, dp, w, obs, act, mask
+        return gx, q, dq, p, dp, w, u, du, v, obs, act, mask
 
     @property
     def pos_mean(self): return self._pos_mean
@@ -115,6 +119,9 @@ class TrajectoryDataset(Dataset):
             base_pos_ds = f_in['base_pos']  # [N,T,3]
             base_vel_ds = f_in['base_vel']  # [N,T,3]
             base_ang_ds = f_in['base_ang']  # [N,T,3]
+            ball_pos_ds = f_in['ball_pos']  # [N,T,3]
+            ball_vel_ds = f_in['ball_vel']  # [N,T,3]
+            ball_ang_ds = f_in['ball_ang']  # [N,T,3]
 
             obs_ds = f_in['obs']  # [N,T,obs_dim]
             act_key = 'act' if 'act' in f_in else 'actions'
@@ -139,6 +146,10 @@ class TrajectoryDataset(Dataset):
             f_out.create_dataset('base_pos', (N, T, 3), dtype='f4')
             f_out.create_dataset('base_vel', (N, T, 3), dtype='f4')
             f_out.create_dataset('base_ang', (N, T, 3), dtype='f4')
+
+            f_out.create_dataset('ball_pos', (N, T, 3), dtype='f4')
+            f_out.create_dataset('ball_vel', (N, T, 3), dtype='f4')
+            f_out.create_dataset('ball_ang', (N, T, 3), dtype='f4')
 
             f_out.create_dataset('obs', (N, T, obs_dim), dtype='f4')
             f_out.create_dataset('act', (N, T, self.n_dofs), dtype='f4')
@@ -177,6 +188,9 @@ class TrajectoryDataset(Dataset):
                 f_out['base_pos'][i:j] = base_pos_ds[i:j].astype('f4')
                 f_out['base_vel'][i:j] = base_vel_ds[i:j].astype('f4')
                 f_out['base_ang'][i:j] = base_ang_ds[i:j].astype('f4')
+                f_out['ball_pos'][i:j] = ball_pos_ds[i:j].astype('f4')
+                f_out['ball_vel'][i:j] = ball_vel_ds[i:j].astype('f4')
+                f_out['ball_ang'][i:j] = ball_ang_ds[i:j].astype('f4')
 
                 f_out['obs'][i:j] = obs_ds[i:j].astype('f4')
                 f_out['act'][i:j] = act_ds[i:j].astype('f4')

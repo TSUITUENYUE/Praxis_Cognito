@@ -168,7 +168,7 @@ class IntentionVAE(nn.Module):
 
         return tau
 
-    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, mask_t):
+    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, dv_t, mask_t):
         B, d = a_t.shape
         dev = a_t.device
 
@@ -179,7 +179,7 @@ class IntentionVAE(nn.Module):
         q_k, dq_k = q_t, dq_t
         p_k, dp_k = p_t, dp_t
         w_k, dw_k = w_t, dw_t
-        u_k, du_k = u_t, du_t
+        u_k, du_k, dv_k = u_t, du_t, dv_t
 
         if self.last_actions is None:
             self.last_actions = torch.zeros(B, self.joint_dim, device=dev)
@@ -191,7 +191,7 @@ class IntentionVAE(nn.Module):
             q_des = exec_actions * self.cfg.env["action_scale"] + self.default_dof_pos
             tau_pd = self._pd_torque(q_k, dq_k, q_des, dq_des=None)
 
-            q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k = self.surrogate(q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k, tau_pd)
+            q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k,dv_k= self.surrogate(q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k, dv_k, tau_pd)
 
             exec_actions_last = exec_actions
 
@@ -199,7 +199,7 @@ class IntentionVAE(nn.Module):
         q_pred, dq_pred = q_k, dq_k
         p_pred, dp_pred = p_k, dp_k
         w_pred, dw_pred = w_k, dw_k
-        u_pred, du_pred = u_k, du_k
+        u_pred, du_pred,dv_pred = u_k, du_k,dv_k
 
         # --- 3) mask EVERY state (freeze beyond padding) ---
         m = mask_t
@@ -213,20 +213,26 @@ class IntentionVAE(nn.Module):
         dw_next = m * dw_pred + (1.0 - m) * dw_t
         u_next = m * u_pred + (1.0 - m) * u_t
         du_next = m * du_pred + (1.0 - m) * du_t
+        dv_next = m * dv_pred + (1.0 - m) * dv_t
 
         # --- 4) obs from the UPDATED state (body-frame vel assumed) ---
         inv_q_next = inv_quat(w_next)
+        base_lin_vel = transform_by_quat(dp_next, inv_q_next)
+        base_ang_vel = transform_by_quat(dw_next, inv_q_next)
         g_world = torch.tensor([0.0, 0.0, -1.0], device=dev, dtype=q_t.dtype).expand(B, 3)
         proj_g = transform_by_quat(g_world, inv_q_next)
+        relative_ball_pos = transform_by_quat(u_next - p_next, inv_q_next)
+        relative_ball_vel = transform_by_quat(du_next - dp_next, inv_q_next)
 
         obs_pred = torch.cat([
-            dp_next * self.cfg.obs.obs_scales["lin_vel"],  # 3
-            dw_next * self.cfg.obs.obs_scales["ang_vel"],  # 3
+            base_lin_vel * self.cfg.obs.obs_scales["lin_vel"],  # 3
+            base_ang_vel * self.cfg.obs.obs_scales["ang_vel"],  # 3
             proj_g,  # 3
             (q_next - self.default_dof_pos) * self.cfg.obs.obs_scales["dof_pos"],  # d
             dq_next * self.cfg.obs.obs_scales["dof_vel"],  # d
             exec_actions_last,  # d
-            u_next, du_next
+            relative_ball_pos,
+            relative_ball_vel
         ], dim=-1)
 
         # bookkeeping for next call
@@ -234,7 +240,7 @@ class IntentionVAE(nn.Module):
         self.last_dof_vel = dq_next.detach()
 
         # RETURN the masked "next" state (consistent with obs_pred)
-        return obs_pred, q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next
+        return obs_pred, q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next,dv_next
 
     def forward(
             self,
@@ -248,8 +254,9 @@ class IntentionVAE(nn.Module):
             p,  # [B,T,3]
             dp,  # [B,T,3]
             dw,  # [B,T,3]
-            u,  # [B,T,o]  (o == 3)
-            du,  # [B,T,o]  (o == 3)
+            u,  # [B,T,3]
+            du,  # [B,T,3]
+            dv,  # [B,T,3]
             tf_ratio: float = 1.0,
     ):
         """
@@ -390,8 +397,8 @@ class IntentionVAE(nn.Module):
                 z, obs_t=obs_prev, mask_t=mask_t
             )
             # ----- Surrogate dynamics (FULL state → next state) -----
-            obs_pred, q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred = \
-                self.predict_dynamics(action_t, q_in, dq_in, p_in, dp_in, w_in, dw_in, u_in, du_in, mask_t)
+            obs_pred, q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred, dv_pred = \
+                self.predict_dynamics(action_t, q_in, dq_in, p_in, dp_in, w_in, dw_in, u_in, du_in, dv_in, mask_t)
 
             # Clamp joints to limits
             q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
@@ -509,7 +516,6 @@ class IntentionVAE(nn.Module):
           - Action: NO teacher; use magnitude regularizer (wa1*L1 + wa2*L2^2), masked.
           - KL: per-sequence.
         """
-        import torch.nn.functional as F
         B, T, D = recon_traj.shape
         device = recon_traj.device
         dtype = recon_traj.dtype
@@ -518,7 +524,7 @@ class IntentionVAE(nn.Module):
 
         # -------- Pose reconstruction with discount gamma^t --------
         orig_traj = orig_traj.view(B, T, -1)
-        pose_step = ((recon_traj - orig_traj) ** 2).mean(dim=-1)  # [B,T]
+        pose_step = ((recon_traj[:,:,:-3] - orig_traj[:,:,:-3]) ** 2).mean(dim=-1)  # [B,T]
 
         t_idx = torch.arange(T, device=device, dtype=dtype)
         w_t = (gamma ** t_idx).to(dtype=dtype)  # [T]
