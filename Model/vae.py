@@ -37,7 +37,7 @@ class IntentionVAE(nn.Module):
         hidden_dim: int,
         obs_dim: int,
         fps: int,
-        env,
+        cfg: DictConfig,
         num_components: int = 128,
     ):
         super().__init__()
@@ -50,9 +50,17 @@ class IntentionVAE(nn.Module):
         self.joint_dim = agent.n_dofs
         self.urdf = agent.urdf
 
+        self.cfg = cfg
+        #self.env_cfg = cfg.env
+        self.obs_scale = cfg.obs.obs_scales
+        self.default_dof_pos = agent.init_angles
+        self.simulate_action_latency = self.cfg.env.simulate_action_latency
 
-        self.env = env
-
+        self.base_init_pos = self.cfg.env.base_init_pos
+        self.base_init_quat = self.cfg.env.base_init_quat
+        self.kp = self.cfg.env.kp
+        self.kd = self.cfg.env.kd
+        self.last_actions = None
         # NOTE: replace these with dataset stats (pos_mean/std) before training.
         self.register_buffer("pos_mean", torch.zeros(3))
         self.register_buffer("pos_std", torch.ones(3))
@@ -76,8 +84,9 @@ class IntentionVAE(nn.Module):
         self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim,self.agent, hidden_dim, obs_dim, fps)
 
         self.dt = 1.0 / float(fps)
-        self.control_dt = self.env.dt
+        self.control_dt = self.cfg.env.dt
         self.K = max(1, int(round(self.dt / self.control_dt)))
+        self.surrogate = SurrogateDynamics(self.joint_dim,self.object_dim,hidden_dim,self.dt)
 
 
     # ---------- Latent sampling ----------
@@ -129,6 +138,103 @@ class IntentionVAE(nn.Module):
             return t.view(1, -1)
         return t  # assume broadcastable
 
+    def _pd_torque(self, q, dq, q_des, dq_des=None):
+        """
+        Genesis-style PD: per-DOF
+          tau = Kp*(q_des - q) + Kv*((dq_des or 0) - dq)
+        Then clamp by optional force limits.
+        Shapes:
+          q, dq, q_des, dq_des: [B, d]
+        Returns:
+          tau_pd: [B, d]
+        """
+        dev = q.device
+        B, d = q.shape
+
+        # gains: allow scalar or per-DOF in self.env_cfg["kp"], ["kd"]
+        kp = self._expand_to_dof(self.kp, d, dev).expand(B, d)
+        kv = self._expand_to_dof(self.kd, d, dev).expand(B, d)
+
+        if dq_des is None:
+            dq_des = torch.zeros_like(dq)
+        tau = kp * (q_des - q) + kv * (dq_des - dq)
+
+        # optional clamp by force range if present (Genesis does this)
+        fr = self.cfg.env.get("force_range", None)  # e.g. {"lower": -87.0, "upper": 87.0} or per-DOF list
+        if fr is not None:
+            f_lo = self._expand_to_dof(fr.get("lower", float("-inf")), d, dev).expand(B, d)
+            f_hi = self._expand_to_dof(fr.get("upper", float("inf")), d, dev).expand(B, d)
+            tau = torch.clamp(tau, f_lo, f_hi)
+
+        return tau
+
+    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, mask_t):
+        B, d = a_t.shape
+        dev = a_t.device
+
+        # --- 1) latency & PD target (target stays constant during the K ticks) ---
+        cmd_hold = torch.clamp(a_t, -self.cfg.env["clip_actions"], self.cfg.env["clip_actions"])
+        exec_actions_last = cmd_hold  # for logging in obs
+
+        q_k, dq_k = q_t, dq_t
+        p_k, dp_k = p_t, dp_t
+        w_k, dw_k = w_t, dw_t
+        u_k, du_k = u_t, du_t
+
+        if self.last_actions is None:
+            self.last_actions = torch.zeros(B, self.joint_dim, device=dev)
+        for k in range(self.K):
+            if self.simulate_action_latency and k == 0:
+                exec_actions = self.last_actions  # 1-tick delay on the first inner tick
+            else:
+                exec_actions = cmd_hold  # current command thereafter
+            q_des = exec_actions * self.cfg.env["action_scale"] + self.default_dof_pos
+            tau_pd = self._pd_torque(q_k, dq_k, q_des, dq_des=None)
+
+            q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k = self.surrogate(q_k, dq_k, p_k, dp_k, w_k, dw_k, u_k, du_k, tau_pd)
+
+            exec_actions_last = exec_actions
+
+        # predicted (t + rollout_dt)
+        q_pred, dq_pred = q_k, dq_k
+        p_pred, dp_pred = p_k, dp_k
+        w_pred, dw_pred = w_k, dw_k
+        u_pred, du_pred = u_k, du_k
+
+        # --- 3) mask EVERY state (freeze beyond padding) ---
+        m = mask_t
+        if m.dim() == 1:
+            m = m.unsqueeze(-1)  # [B,1]
+        q_next = m * q_pred + (1.0 - m) * q_t
+        dq_next = m * dq_pred + (1.0 - m) * dq_t
+        p_next = m * p_pred + (1.0 - m) * p_t
+        dp_next = m * dp_pred + (1.0 - m) * dp_t
+        w_next = m * w_pred + (1.0 - m) * w_t
+        dw_next = m * dw_pred + (1.0 - m) * dw_t
+        u_next = m * u_pred + (1.0 - m) * u_t
+        du_next = m * du_pred + (1.0 - m) * du_t
+
+        # --- 4) obs from the UPDATED state (body-frame vel assumed) ---
+        inv_q_next = inv_quat(w_next)
+        g_world = torch.tensor([0.0, 0.0, -1.0], device=dev, dtype=q_t.dtype).expand(B, 3)
+        proj_g = transform_by_quat(g_world, inv_q_next)
+
+        obs_pred = torch.cat([
+            dp_next * self.cfg.obs.obs_scales["lin_vel"],  # 3
+            dw_next * self.cfg.obs.obs_scales["ang_vel"],  # 3
+            proj_g,  # 3
+            (q_next - self.default_dof_pos) * self.cfg.obs.obs_scales["dof_pos"],  # d
+            dq_next * self.cfg.obs.obs_scales["dof_vel"],  # d
+            exec_actions_last,  # d
+            u_next, du_next
+        ], dim=-1)
+
+        # bookkeeping for next call
+        self.last_actions = a_t.detach()
+        self.last_dof_vel = dq_next.detach()
+
+        # RETURN the masked "next" state (consistent with obs_pred)
+        return obs_pred, q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next
 
     def forward(
             self,
@@ -142,8 +248,8 @@ class IntentionVAE(nn.Module):
             p,  # [B,T,3]
             dp,  # [B,T,3]
             dw,  # [B,T,3]
-            u,  # [B,T,3]
-            du,  # [B,T,3]
+            u,  # [B,T,o]  (o == 3)
+            du,  # [B,T,o]  (o == 3)
             tf_ratio: float = 1.0,
     ):
         """
@@ -240,14 +346,12 @@ class IntentionVAE(nn.Module):
 
         # Initial decoder observation (normalized)
         obs_prev = obs_tf_n_all[:, 0, :]  # [B,obs_dim]
-        self.env.reset()
-        self.env.reset_with_ball_rel(obs_prev[:,-6:-3], obs_prev[:,-3:])
+
         for t in range(T):
             mask_t = mask[:, t, :]  # [B,1]
             m = mask_t if mask_t.dim() == 2 else mask_t.unsqueeze(-1)
-            mask_bool = m.bool()  # safe broadcast mask
 
-            # ----- Teacher Forcing (unchanged logic) -----
+            # ----- Teacher Forcing (full state at time t) -----
             if self.training:
                 tf_gate = (torch.rand(B, 1, device=dev) < tf_ratio).float()
                 # GT for time t
@@ -281,78 +385,44 @@ class IntentionVAE(nn.Module):
                 dw_in = dw_prev
                 u_in, du_in = u_prev, du_prev
 
-            # ----- Policy step -----
+            # ----- Policy step (condition on last observation) -----
             action_t, mu_t, log_std_t, log_sig_t, _ = self.decoder(
                 z, obs_t=obs_prev, mask_t=mask_t
             )
+            # ----- Surrogate dynamics (FULL state → next state) -----
+            obs_pred, q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred = \
+                self.predict_dynamics(action_t, q_in, dq_in, p_in, dp_in, w_in, dw_in, u_in, du_in, mask_t)
 
-            # Finite guards + reasonable clamps (keep numerics sane)
-            action_t = torch.nan_to_num(action_t, 0.0, 0.0, 0.0)
-            action_t = torch.clamp(action_t, -5.0, 5.0)
-            mu_t = torch.nan_to_num(mu_t, 0.0, 0.0, 0.0)
-            log_std_t = torch.clamp(torch.nan_to_num(log_std_t, 0.0, 0.0, 0.0), -10.0, 5.0)
-            log_sig_t = torch.clamp(torch.nan_to_num(log_sig_t, 0.0, 0.0, 0.0), -10.0, 5.0)
+            # Clamp joints to limits
+            q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
 
-            # ----- Surrogate dynamics (env) -----
-            obs_pred, _, _, _ = self.env.step(action_t)  # [B, obs_dim]
-            obs_pred = torch.nan_to_num(obs_pred, 0.0, 0.0, 0.0)
+            # Freeze beyond padding (apply mask to ALL state parts)
+            q_next = m * q_pred + (1.0 - m) * q_prev
+            dq_next = m * dq_pred + (1.0 - m) * dq_prev
+            p_next = m * p_pred + (1.0 - m) * p_prev
+            dp_next = m * dp_pred + (1.0 - m) * dp_prev
+            w_next = m * w_pred + (1.0 - m) * w_prev
+            w_next = w_next / (w_next.norm(dim=-1, keepdim=True) + 1e-8)
+            dw_next = m * dw_pred + (1.0 - m) * dw_prev
+            u_next = m * u_pred + (1.0 - m) * u_prev
+            du_next = m * du_pred + (1.0 - m) * du_prev
 
-            # ---------- pull current state from env buffers ----------
-            # joints
-            q_pred = self.env.dof_pos.clone()  # [B, d]
-            dq_pred = self.env.dof_vel.clone()  # [B, d]
+            # Observation for next policy step (already produced by predict_dynamics)
+            obs_next = m * obs_pred + (1.0 - m) * obs_prev
 
-            # base (pose in WORLD)
-            p_pred = self.env.base_pos.clone()  # [B, 3]
-            w_pred = self.env.base_quat.clone()  # [B, 4] (w,x,y,z)
-
-            # base velocities are stored in *body* frame in the env; snapshot then convert
-            base_lin_vel = self.env.base_lin_vel.clone()  # [B,3]
-            base_ang_vel = self.env.base_ang_vel.clone()  # [B,3]
-            dp_world_pred = transform_by_quat(base_lin_vel, w_pred)  # [B,3]
-            dw_world_pred = transform_by_quat(base_ang_vel, w_pred)  # [B,3]
-            dp_pred, dw_pred = dp_world_pred, dw_world_pred
-
-            # ball/object: env keeps relative (body-frame) — snapshot before converting
-            rel_ball_pos_b = self.env.relative_ball_pos.clone()  # [B,3]
-            rel_ball_vel_b = self.env.relative_ball_vel.clone()  # [B,3]
-            rel_ball_pos_w = transform_by_quat(rel_ball_pos_b, w_pred)
-            rel_ball_vel_w = transform_by_quat(rel_ball_vel_b, w_pred)
-            u_pred = p_pred + rel_ball_pos_w  # [B,3] WORLD
-            du_pred = dp_world_pred + rel_ball_vel_w  # [B,3] WORLD
-
-            # ---------- post-step: clamp joints to limits (on the snapshot) ----------
-            q_pred = torch.clamp(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)
-
-            # ---------- mask to freeze padded steps (use where, not multiply) ----------
-            q_next = torch.where(mask_bool, q_pred, q_prev)
-            dq_next = torch.where(mask_bool, dq_pred, dq_prev)
-            p_next = torch.where(mask_bool, p_pred, p_prev)
-
-            w_next_raw = torch.where(mask_bool, w_pred, w_prev)
-            w_next = w_next_raw / (w_next_raw.norm(dim=-1, keepdim=True) + 1e-8)
-
-            dp_next = torch.where(mask_bool, dp_pred, dp_prev)
-            dw_next = torch.where(mask_bool, dw_pred, dw_prev)
-            u_next = torch.where(mask_bool, u_pred, u_prev)
-            du_next = torch.where(mask_bool, du_pred, du_prev)
-
-            obs_next = torch.where(mask_bool, obs_pred, obs_prev)
-
-            # ----- Store step outputs (mask with where so NaNs don't leak) -----
-            _store_col(actions_seq, t, torch.where(mask_bool, action_t, torch.zeros_like(action_t)))
-            _store_col(mu_seq, t, torch.where(mask_bool, mu_t, torch.zeros_like(mu_t)))
-            _store_col(log_std_seq, t, torch.where(mask_bool, log_std_t, torch.zeros_like(log_std_t)))
-            _store_col(log_sig_seq, t, torch.where(mask_bool, log_sig_t, torch.zeros_like(log_sig_t)))
-
+            # ----- Store step outputs -----
+            _store_col(actions_seq, t, m * action_t)
+            _store_col(mu_seq, t, mu_t)
+            _store_col(log_std_seq, t, log_std_t)
             _store_col(joints_seq, t, q_next)
             _store_col(dq_seq, t, dq_next)
             _store_col(w_seq, t, w_next)
             _store_col(dw_seq, t, dw_next)
             _store_col(p_seq, t, p_next)
             _store_col(dp_seq, t, dp_next)
-            _store_col(objects_seq, t, u_next)
+            _store_col(objects_seq, t, u_next)  # u has shape 3; no slicing
             _store_col(obs_seq, t, obs_next)
+            _store_col(log_sig_seq, t, log_sig_t)
 
             # ----- Advance recurrent state -----
             q_prev, dq_prev = q_next, dq_next
@@ -439,6 +509,7 @@ class IntentionVAE(nn.Module):
           - Action: NO teacher; use magnitude regularizer (wa1*L1 + wa2*L2^2), masked.
           - KL: per-sequence.
         """
+        import torch.nn.functional as F
         B, T, D = recon_traj.shape
         device = recon_traj.device
         dtype = recon_traj.dtype
@@ -447,7 +518,7 @@ class IntentionVAE(nn.Module):
 
         # -------- Pose reconstruction with discount gamma^t --------
         orig_traj = orig_traj.view(B, T, -1)
-        pose_step = ((recon_traj[:,:,:-3] - orig_traj[:,:,:-3]) ** 2).mean(dim=-1)  # [B,T]
+        pose_step = ((recon_traj - orig_traj) ** 2).mean(dim=-1)  # [B,T]
 
         t_idx = torch.arange(T, device=device, dtype=dtype)
         w_t = (gamma ** t_idx).to(dtype=dtype)  # [T]
@@ -458,15 +529,13 @@ class IntentionVAE(nn.Module):
 
         # -------- Action magnitude regularizer (replace old MSE) --------
         # Per-step mean over action dims
-        '''
         l1 = action_seq.abs().mean(dim=-1)  # [B,T]
         l2 = (action_seq ** 2).mean(dim=-1)  # [B,T]
         act_reg_step = wa1 * l1 + wa2 * l2  # [B,T]
         valid = mask_bt.sum().clamp_min(1.0)
         action_loss = (act_reg_step * mask_bt).sum().div(valid)
         action_loss = lambda_dynamic * action_loss
-        '''
-        action_loss = torch.zeros_like(pose_loss)
+
         total_recon = pose_loss + action_loss
 
         # -------- KL (unchanged) --------

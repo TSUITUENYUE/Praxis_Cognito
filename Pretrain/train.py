@@ -7,10 +7,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
 
 import os, math
+import genesis as gs
 from rsl_rl.modules import EmpiricalNormalization
 
-from .go2_env_mjx import Go2EnvMJX as Go2Env
-#from .go2_env import Go2Env
+from .go2_env import Go2Env
 from .dataset import TrajectoryDataset
 from .utils import build_edge_index
 
@@ -66,7 +66,16 @@ class Trainer:
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
-        #gs.init(logging_level="warning")
+        gs.init(logging_level="warning")
+        self.env = Go2Env(
+            num_envs=self.batch_size,
+            env_cfg=rl_config.env,
+            obs_cfg=rl_config.obs,
+            reward_cfg=rl_config.reward,
+            command_cfg=rl_config.command,
+            show_viewer=False,
+            agent=self.agent,
+        )
 
         self.end_effector_indices = self.agent.end_effector
         self.edge_index = build_edge_index(self.fk_model, self.end_effector_indices, self.device)
@@ -153,6 +162,125 @@ class Trainer:
         x_n = self.obs_normalizer(x_flat)  # module in eval mode => uses stored stats
         return x_n.view(B, T, D)
 
+    def _wm_short_loss(self, q, dq, p, dp, dw, obs, act, mask):
+        """
+        Short-window/1-step supervise for world model (surrogate) only.
+        Inputs are GT states & actions (dataset); no env, no decoder.
+        We reconstruct base quat from obs projected gravity (与 VAE.forward 一致的做法)。
+        不对外生球 (u, du) 做监督，只作为输入条件。
+        """
+        device = self.device
+        eps = 1e-8
+
+        # to device
+        q = q.to(device);
+        dq = dq.to(device)
+        p = p.to(device);
+        dp = dp.to(device)
+        dw = dw.to(device)
+        obs = obs.to(device)
+        act = act.to(device)
+        mask_bt = mask.to(device)  # [B,T]
+
+        B, T, d = q.shape
+
+        # ---- 从 obs 重建 base quat（与 VAE 内的 _quat_from_g 一致的零航向构造）----
+        g = obs[:, :, 6:9]  # [B,T,3]
+        z_w = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=g.dtype).expand(B * T, 3)
+        a = -g.reshape(B * T, 3)
+        a = a / (a.norm(dim=-1, keepdim=True) + eps)
+        v = torch.cross(a, z_w, dim=-1)
+        c = (a * z_w).sum(dim=-1, keepdim=True)
+        s = torch.sqrt(torch.clamp(1.0 + c, min=0.0)) * 2.0
+        xyz = v / (s + eps)
+        wq = 0.5 * s
+        q_align = torch.cat([wq, xyz], dim=-1)
+        q_align = q_align / (q_align.norm(dim=-1, keepdim=True) + eps)
+
+        def _quat_mul(q, r):
+            w1, x1, y1, z1 = q.unbind(-1)
+            w2, x2, y2, z2 = r.unbind(-1)
+            return torch.stack([
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+            ], dim=-1)
+
+        x_b = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=g.dtype).expand(B * T, 3)
+
+        # 旋转 x_b
+        def _rot(q, v3):
+            w, x, y, z = q.unbind(-1)
+            qv = torch.stack([torch.zeros_like(w), v3[:, 0], v3[:, 1], v3[:, 2]], dim=-1)
+            inv = torch.stack([w, -x, -y, -z], dim=-1) / (q.norm(dim=-1, keepdim=True) ** 2 + eps)
+            out = _quat_mul(_quat_mul(q, qv), inv)
+            return out[:, 1:4]
+
+        x0_w = _rot(q_align, x_b)
+        phi = torch.atan2(x0_w[:, 1], x0_w[:, 0])
+        half = -0.5 * phi
+        qz = torch.stack([torch.cos(half), torch.zeros_like(half), torch.zeros_like(half), torch.sin(half)], dim=-1)
+        w_flat = _quat_mul(qz, q_align)
+        w = (w_flat / (w_flat.norm(dim=-1, keepdim=True) + eps)).view(B, T, 4)  # [B,T,4]
+
+        # ---- 外生球作为输入条件 ----
+        u = obs[:, :, -6:-3].to(device)  # [B,T,3]
+        du = obs[:, :, -3:].to(device)  # [B,T,3]
+
+        # ---- 1-step 监督：输入用当前 GT，动作用数据动作经 PD 转成 torque（与你 VAE 一致）----
+        total = 0.0
+        denom = 0.0
+
+        for t in range(T - 1):
+            m_pair = (mask_bt[:, t] * mask_bt[:, t + 1]).float()  # [B]
+            if m_pair.sum() < 1.0:
+                continue
+
+            q_t = q[:, t, :]
+            dq_t = dq[:, t, :]
+            p_t = p[:, t, :]
+            dp_t = dp[:, t, :]
+            w_t = w[:, t, :]
+            dw_t = dw[:, t, :]
+            u_t = u[:, t, :]
+            du_t = du[:, t, :]
+
+            a_t = act[:, t, :]  # 数据动作（未 tanh）
+
+            # 用与你模型一致的 PD 生成“执行量”，然后喂给 surrogate
+            q_des = a_t * self.vae.cfg.env["action_scale"] + self.vae.default_dof_pos
+            tau_pd = self.vae._pd_torque(q_t, dq_t, q_des, dq_des=None)
+
+            q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred = \
+                self.vae.surrogate(q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, tau_pd)
+
+            # 监督目标：下一步 GT
+            q_n = q[:, t + 1, :]
+            dq_n = dq[:, t + 1, :]
+            p_n = p[:, t + 1, :]
+            dp_n = dp[:, t + 1, :]
+            w_n = w[:, t + 1, :]
+            dw_n = dw[:, t + 1, :]
+
+            # 只对“可对齐”的 robot 状态做监督（不监督 u/du）
+            q_loss = self.masked_mse(q_pred, q_n, m_pair[:, None])
+            dq_loss = self.masked_mse(dq_pred, dq_n, m_pair[:, None])
+            p_loss = self.masked_mse(p_pred, p_n, m_pair[:, None])
+            dp_loss = self.masked_mse(dp_pred, dp_n, m_pair[:, None])
+            dw_loss = self.masked_mse(dw_pred, dw_n, m_pair[:, None])
+            w_loss = masked_quat_geodesic(w_pred, w_n, m_pair[:, None])
+
+            step_loss = (
+                    self.w_q * q_loss + self.w_dq * dq_loss +
+                    self.w_p * p_loss + self.w_dp * dp_loss +
+                    self.w_w * w_loss + self.w_dw * dw_loss
+            )
+            total = total + step_loss
+            denom += 1.0
+
+        return total / max(denom, 1.0)
+
     # ---------- training ----------
     def train(self):
         self.vae.train()
@@ -160,7 +288,7 @@ class Trainer:
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            num_workers=0,
+            num_workers=4,
             shuffle=True,
             drop_last=True
         )
@@ -176,7 +304,10 @@ class Trainer:
             return x.reshape(B, T, D)
 
         for epoch in range(self.num_epochs):
-            for i, (x, q, dq, p, dp, dw,u, du, dv, obs, act, mask) in enumerate(dataloader):
+
+
+
+            for i, (x, q, dq, p, dp, dw, obs, act, mask) in enumerate(dataloader):
                 global_step = epoch * len(dataloader) + i
 
                 x      = x.to(self.device)
@@ -188,15 +319,12 @@ class Trainer:
                 dp_gt  = dp.to(self.device)
                 dw_gt   = dw.to(self.device)
 
-                u_gt   = u.to(self.device)
-                du_gt  = du.to(self.device)
-                dv_gt   = dv.to(self.device)
-
                 obs_gt = obs.to(self.device)              # [B,T,obs_dim] (UN-normalized from dataset)
                 act_gt = act.to(self.device)
 
                 mask   = mask.to(self.device)[:, :, None] # [B,T,1]
-
+                u_gt = obs_gt[:,:,-6:-3]
+                du_gt = obs_gt[:,:,-3:]
                 self.optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=False):
                     beta = get_beta(global_step, total_steps, strategy=self.strategy,
@@ -218,7 +346,7 @@ class Trainer:
                     )
 
                     # ---- trajectory
-                    x_recon = out["traj"]["graph"] #in base frame
+                    x_recon = out["traj"]["graph"]
 
                     # ---- state
                     state = out["state"]
@@ -238,13 +366,69 @@ class Trainer:
 
                     # ---- obs
                     obs_seq = out["obs"]["obs"]
-                    #u_seq = obs_seq[:, :, -6:-3]
-                    #du_seq = obs_seq[:, :, -3:]
+                    u_seq = obs_seq[:, :, -6:-3]
+                    du_seq = obs_seq[:, :, -3:]
 
                     # ---- aux latents/posterior
                     aux = out.get("aux", [])
                     z = aux[0]
+                    #z = torch.zeros_like(z)
+                    z_detached = z.detach()
+                    # --------------- Genesis rollout (teacher for surrogate) ---------------
+                    with torch.no_grad():
+                        was_training = self.vae.decoder.training
+                        self.vae.decoder.eval()
+                        try:
+                            reset_out = self.env.reset()
+                            self.env.reset_with_ball_rel(u_gt[:,0],du_gt[:,0])
+                            obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
+                            #obs0_raw[:, -6:-3] = u_gt[:, 0]
+                            obs_t_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
+                            B = act_seq.shape[0]
+                            T = act_seq.shape[1]
+                            # Pre-allocate on device with correct dtypes
+                            q_sim_seq  = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            dq_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
 
+                            p_sim_seq  = torch.empty(size=p_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+                            dp_sim_seq = torch.empty(size=dp_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+
+                            w_sim_seq  = torch.empty(size=w_seq.shape,device=self.device, dtype=obs_t_n.dtype)
+                            dw_sim_seq = torch.empty(size=dw_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+
+                            obs_sim_seq = torch.empty(size=obs_seq.shape, device=self.device, dtype=obs_t_n.dtype)
+
+                            for t in range(T):
+                                mask_t = mask[:, t, :]
+                                #a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
+                                a_t = act_gt[:,t]
+                                obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
+                                #obs_t_raw[:,-6:-3] = u_gt[:,t]
+                                #obs_t_raw[:,-3:] = du_gt[:,t]
+                                q_t = self.env.dof_pos
+                                dq_t = self.env.dof_vel
+                                p_t = self.env.base_pos
+                                dp_t = self.env.base_lin_vel
+                                w_t = self.env.base_quat
+                                dw_t = self.env.base_ang_vel
+
+                                obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
+
+                                q_sim_seq[:,t].copy_(q_t)
+                                dq_sim_seq[:,t].copy_(dq_t)
+
+                                p_sim_seq[:,t].copy_(p_t)
+                                dp_sim_seq[:,t].copy_(dp_t)
+                                w_sim_seq[:,t].copy_(w_t)
+                                dw_sim_seq[:, t].copy_(dw_t)
+
+                                obs_sim_seq[:, t].copy_(obs_t_n)
+
+
+                            u_sim_seq = obs_sim_seq[:, :, -6:-3]
+                            du_sim_seq = obs_sim_seq[:, :, -3:]
+                        finally:
+                            self.vae.decoder.train(was_training)
                     # --- VAE loss (pose + action + KL) ---
                     loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
                         x_recon, log_sigma, x,
@@ -256,18 +440,44 @@ class Trainer:
                         lambda_dynamic=self.lambda_dynamic
                     )
 
+                    # state-space losses (detach sim targets)
+                    q_loss = self.masked_mse(q_seq, q_sim_seq.detach(), mask)
+                    dq_loss = self.masked_mse(dq_seq, dq_sim_seq.detach(), mask)
+                    p_loss = self.masked_mse(p_seq, p_sim_seq.detach(), mask)
+                    dp_loss = self.masked_mse(dp_seq, dp_sim_seq.detach(), mask)
+                    dw_loss = self.masked_mse(dw_seq, dw_sim_seq.detach(), mask)
+                    w_loss = masked_quat_geodesic(w_seq, w_sim_seq.detach(), mask)
+
+                    u_loss = self.masked_mse(u_seq, u_sim_seq.detach(), mask)
+                    #print(u_loss)
+                    du_loss = self.masked_mse(du_seq, du_sim_seq.detach(), mask)
+                    # print(du_loss)
+                    state_loss = (
+                            self.w_q * q_loss +
+                            self.w_dq * dq_loss +
+                            self.w_p * p_loss +
+                            self.w_dp * dp_loss +
+                            self.w_w * w_loss +
+                            self.w_dw * dw_loss +
+                            self.w_u * u_loss +
+                            self.w_du * du_loss
+                    )
+
+                    # optional: obs regularizer (use your exact normalized obs on both sides)
+                    # obs_pred_n is from surrogate’s predict_dynamics; obs_sim_n_seq from Genesis → normalized
+                    obs_reg = self.masked_mse(obs_seq, obs_sim_seq.detach(), mask)
+                    sim_loss = state_loss + self.w_obs * obs_reg  # choose small self.w_obs, e.g., 0.1 * (avg state weight)
+
+                    total_loss = loss + self.lambda_sim * sim_loss
+
                     with torch.no_grad():
                         unnormalized_recon_mu = _denorm_positions(x_recon.detach(), self.pos_mean_d, self.pos_std_d)
                         unnormalized_graph_x = _denorm_positions(x.reshape(x_recon.shape).detach(), self.pos_mean_d,
                                                                  self.pos_std_d)
-                        unnormalized_loss_obj = self.masked_mse(unnormalized_recon_mu[:,:,-3:], unnormalized_graph_x[:,:,-3:], mask).item()
-
-                        unnormalized_loss = self.masked_mse(unnormalized_recon_mu[:,:,:-3], unnormalized_graph_x[:,:,:-3], mask).item()
-
-
+                        unnormalized_loss = self.masked_mse(unnormalized_recon_mu, unnormalized_graph_x, mask).item()
 
                 # Backprop THROUGH total_loss so surrogate learns from sim_loss
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
 
                 # Calculate the total gradient norm for the entire model
@@ -290,6 +500,14 @@ class Trainer:
                 encoder_norm = encoder_norm ** 0.5
                 print(f"Encoder gradient norm: {encoder_norm}")
 
+                surrogate_norm = 0.0
+                for name, p in self.vae.surrogate.named_parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        surrogate_norm += param_norm.item() ** 2
+                surrogate_norm = surrogate_norm ** 0.5
+                print(f"Surrogate gradient norm: {surrogate_norm}")
+
                 decoder_norm = 0.0
                 for name, p in self.vae.decoder.named_parameters():
                     if p.grad is not None:
@@ -309,13 +527,21 @@ class Trainer:
                 if (global_step % log_every == 0) or (i == len(dataloader) - 1):
                     print(
                         f"Batch {i + 1}/{len(dataloader)}, "
-                        f"Total:{loss.item():.4f} "
-                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss:.4f} | Unnorm_Obj:{unnormalized_loss_obj:.4f} "
+                        f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
+                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss:.4f} "
                         f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
+                        f"| Sim:{sim_loss.item():.4f}"
                         f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
                     )
 
-
+                    print(self.w_q * q_loss.item(),
+                    self.w_dq * dq_loss.item() ,
+                    self.w_p * p_loss.item() ,
+                    self.w_dp * dp_loss.item() ,
+                    self.w_w * w_loss.item() ,
+                    self.w_dw * dw_loss.item() ,
+                    self.w_u * u_loss.item() ,
+                    self.w_du * du_loss.item() ,)
 
             os.makedirs(self.save_path, exist_ok=True)
             save_path = os.path.join(self.save_path, f"vae_checkpoint_epoch_{epoch + 1}.pth")

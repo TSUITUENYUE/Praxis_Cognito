@@ -133,10 +133,6 @@ def generate(cfg: DictConfig):
     base_vel_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
     base_ang_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
 
-    ball_pos_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
-    ball_vel_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
-    ball_ang_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
-
     obs_traj_buffer       = torch.zeros((max_episode_len, NUM_ENVS, env.num_obs), device=gs.device)
     act_traj_buffer       = torch.zeros((max_episode_len, NUM_ENVS, env.num_actions), device=gs.device)
 
@@ -153,7 +149,6 @@ def generate(cfg: DictConfig):
 
     dof_pos_save_buffer,dof_vel_save_buffer, = [], []
     base_pos_save_buffer,base_vel_save_buffer,base_ang_save_buffer = [], [], []
-    ball_pos_save_buffer,ball_vel_save_buffer,ball_ang_save_buffer = [], [], []
     obs_save_buffer, act_save_buffer= [], []
     valid_len_save_buffer = []
 
@@ -196,15 +191,6 @@ def generate(cfg: DictConfig):
         base_ang_ds = f.create_dataset('base_ang',
                                          shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
                                          dtype='float32', compression="gzip")
-        ball_pos_ds = f.create_dataset('ball_pos',                                           # NEW (ball)
-                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
-                                       dtype='float32', compression="gzip")
-        ball_vel_ds = f.create_dataset('ball_vel',                                           # NEW (ball)
-                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
-                                       dtype='float32', compression="gzip")
-        ball_ang_ds = f.create_dataset('ball_ang',                                           # NEW (ball)
-                                       shape=(EPISODES_TO_COLLECT, max_episode_len, 3),
-                                       dtype='float32', compression="gzip")
 
         obs_ds   = f.create_dataset('obs',
                                     shape=(EPISODES_TO_COLLECT, max_episode_len, env.num_obs),
@@ -251,16 +237,12 @@ def generate(cfg: DictConfig):
 
                     q_now  = env.robot.get_dofs_position(env.motors_dof_idx)
                     dq_now = env.robot.get_dofs_velocity(env.motors_dof_idx)
-                    dof_pos_traj_buffer[t] = q_now
+                    dof_pos_traj_buffer[t]   = q_now
                     dof_vel_traj_buffer[t] = dq_now
 
-                    base_pos_buffer[t] = env.robot.get_pos()
-                    base_vel_buffer[t] = env.robot.get_vel()
-                    base_ang_buffer[t] = env.robot.get_ang()
-
-                    ball_pos_buffer[t] = env.ball.get_pos()
-                    ball_vel_buffer[t] = env.ball.get_vel()
-                    ball_ang_buffer[t] = env.ball.get_ang()
+                    base_pos_buffer[t] = env.base_pos
+                    base_vel_buffer[t] = env.base_lin_vel
+                    base_ang_buffer[t] = env.base_ang_vel
 
                     state_normalizer.update(obs)
                     action_normalizer.update(act)
@@ -335,10 +317,6 @@ def generate(cfg: DictConfig):
             base_vel_np = base_vel_buffer.cpu().numpy()
             base_ang_np = base_ang_buffer.cpu().numpy()
 
-            ball_pos_np = ball_pos_buffer.cpu().numpy()
-            ball_vel_np = ball_vel_buffer.cpu().numpy()
-            ball_ang_np = ball_ang_buffer.cpu().numpy()
-
             obs_np   = obs_traj_buffer.cpu().numpy()
             act_np   = act_traj_buffer.cpu().numpy()
 
@@ -354,11 +332,6 @@ def generate(cfg: DictConfig):
             base_vel_batch = np.transpose(base_vel_np,(1, 0, 2))
             base_ang_batch = np.transpose(base_ang_np,(1, 0, 2))
 
-            ball_pos_batch = np.transpose(ball_pos_np, (1, 0, 2))
-            ball_vel_batch = np.transpose(ball_vel_np, (1, 0, 2))
-            ball_ang_batch = np.transpose(ball_ang_np, (1, 0, 2))
-
-
             obs_batch      = np.transpose(obs_np,     (1, 0, 2))
             act_batch      = np.transpose(act_np,     (1, 0, 2))
 
@@ -372,10 +345,6 @@ def generate(cfg: DictConfig):
                     base_pos_batch[e,   L:] = 0.0
                     base_vel_batch[e, L:] = 0.0
                     base_ang_batch[e, L:] = 0.0
-                    ball_pos_batch[e, L:] = 0.0   # NEW (ball)
-                    ball_vel_batch[e, L:] = 0.0   # NEW (ball)
-                    ball_ang_batch[e, L:] = 0.0   # NEW (ball)
-
 
                     obs_batch[e,   L:] = 0.0
                     act_batch[e,   L:] = 0.0
@@ -412,11 +381,6 @@ def generate(cfg: DictConfig):
                 base_vel_save_buffer.append(base_vel_batch[unique_indices])
                 base_ang_save_buffer.append(base_ang_batch[unique_indices])
 
-                ball_pos_save_buffer.append(ball_pos_batch[unique_indices])   # NEW (ball)
-                ball_vel_save_buffer.append(ball_vel_batch[unique_indices])   # NEW (ball)
-                ball_ang_save_buffer.append(ball_ang_batch[unique_indices])   # NEW (ball)
-
-
                 obs_save_buffer.append(obs_batch[unique_indices])
                 act_save_buffer.append(act_batch[unique_indices])
 
@@ -435,11 +399,6 @@ def generate(cfg: DictConfig):
                     base_vel_block = np.concatenate(base_vel_save_buffer, axis=0)
                     base_ang_block = np.concatenate(base_ang_save_buffer, axis=0)
 
-                    ball_pos_block = np.concatenate(ball_pos_save_buffer, axis=0)  # NEW (ball)
-                    ball_vel_block = np.concatenate(ball_vel_save_buffer, axis=0)  # NEW (ball)
-                    ball_ang_block = np.concatenate(ball_ang_save_buffer, axis=0)  # NEW (ball)
-
-
                     obs_block  = np.concatenate(obs_save_buffer,      axis=0)
                     act_block  = np.concatenate(act_save_buffer,      axis=0)
 
@@ -457,10 +416,6 @@ def generate(cfg: DictConfig):
                         base_pos_ds[start_idx:end_idx]  = base_pos_block[:num_to_write]
                         base_vel_ds[start_idx:end_idx]  = base_vel_block[:num_to_write]
                         base_ang_ds[start_idx:end_idx]  = base_ang_block[:num_to_write]
-                        ball_pos_ds[start_idx:end_idx] = ball_pos_block[:num_to_write]  # NEW (ball)
-                        ball_vel_ds[start_idx:end_idx] = ball_vel_block[:num_to_write]  # NEW (ball)
-                        ball_ang_ds[start_idx:end_idx] = ball_ang_block[:num_to_write]  # NEW (ball)
-
 
                         obs_ds[start_idx:end_idx]       = obs_block[:num_to_write]
                         act_ds[start_idx:end_idx]       = act_block[:num_to_write]
@@ -470,8 +425,6 @@ def generate(cfg: DictConfig):
 
                     dof_pos_save_buffer, dof_vel_save_buffer, = [], []
                     base_pos_save_buffer, base_vel_save_buffer, base_ang_save_buffer = [], [], []
-                    ball_pos_save_buffer, ball_vel_save_buffer, ball_ang_save_buffer = [], [], []  # NEW (ball)
-
                     obs_save_buffer, act_save_buffer = [], []
                     valid_len_save_buffer = []
                     episodes_since_last_save = 0
@@ -488,9 +441,6 @@ def generate(cfg: DictConfig):
             base_pos_block   = np.concatenate(base_pos_save_buffer,   axis=0)
             base_vel_block   = np.concatenate(base_vel_save_buffer,   axis=0)
             base_ang_block   = np.concatenate(base_ang_save_buffer,   axis=0)
-            ball_pos_block = np.concatenate(ball_pos_save_buffer, axis=0)  # NEW (ball)
-            ball_vel_block = np.concatenate(ball_vel_save_buffer, axis=0)  # NEW (ball)
-            ball_ang_block = np.concatenate(ball_ang_save_buffer, axis=0)  # NEW (ball)
 
             obs_block   = np.concatenate(obs_save_buffer,   axis=0)
             act_block   = np.concatenate(act_save_buffer,   axis=0)
@@ -503,15 +453,12 @@ def generate(cfg: DictConfig):
             num_to_write = end_idx - start_idx
             if num_to_write > 0:
                 print(f"  ...Writing final {num_to_write} episodes to disk...")
-                dof_pos_ds[start_idx:end_idx] = dof_pos_block[:num_to_write]
+                dof_pos_ds[start_idx:end_idx]   = dof_pos_block[:num_to_write]
                 dof_vel_ds[start_idx:end_idx] = dof_vel_block[:num_to_write]
 
-                base_pos_ds[start_idx:end_idx] = base_pos_block[:num_to_write]
-                base_vel_ds[start_idx:end_idx] = base_vel_block[:num_to_write]
-                base_ang_ds[start_idx:end_idx] = base_ang_block[:num_to_write]
-                ball_pos_ds[start_idx:end_idx] = ball_pos_block[:num_to_write]  # NEW (ball)
-                ball_vel_ds[start_idx:end_idx] = ball_vel_block[:num_to_write]  # NEW (ball)
-                ball_ang_ds[start_idx:end_idx] = ball_ang_block[:num_to_write]  # NEW (ball)
+                base_pos_ds[start_idx:end_idx]     = base_pos_block[:num_to_write]
+                base_vel_ds[start_idx:end_idx]     = base_vel_block[:num_to_write]
+                base_ang_ds[start_idx:end_idx]     = base_ang_block[:num_to_write]
 
                 obs_ds[start_idx:end_idx]     = obs_block[:num_to_write]
                 act_ds[start_idx:end_idx] = act_block[:num_to_write]

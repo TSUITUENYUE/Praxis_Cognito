@@ -116,9 +116,9 @@ rl:
 
 
 dataset:
-  num_envs: 2048
+  num_envs: 25000
   #num_envs: 32768
-  episodes: 10000
+  episodes: 100000
   max_episode_seconds: 3
   frame_rate: 25
 
@@ -154,9 +154,9 @@ trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
   processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
   normalizer_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/normalizers.pt'
-  batch_size: 32
+  batch_size: 256
   device: 'cuda'
-  num_epochs: 16
+  num_epochs: 4
   optimizer:
     lr: 0.001
   beta_anneal:
@@ -167,17 +167,17 @@ trainer:
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"
   kino:
     lambda_kinematic: 1.0
-    lambda_dynamic: 0.0
+    lambda_dynamic: 0.5
   sim:
-    lambda_sim: 0.1
+    lambda_sim: 1.0
     w_q: 1.0
     w_dq: 0.2
     w_p: 1.0
     w_dp : 0.2
     w_w : 0.5
     w_dw : 0.1
-    w_u: 1.0
-    w_du: 0.2
+    w_u: 0.0
+    w_du: 0.0
     w_obs: 0.0
 
 imitator:
