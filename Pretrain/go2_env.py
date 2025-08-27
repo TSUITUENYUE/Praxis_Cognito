@@ -51,6 +51,8 @@ class Go2Env:
             ),
             show_viewer=show_viewer,
         )
+        if show_viewer:
+            self.cam = self.scene.add_camera(res=(1280, 960), pos=(0.0, 3.5, 2.5), lookat=(0.0, 0.0, 0.5), fov=40, GUI=False)
 
         # add plain
         self.scene.add_entity(gs.morphs.Plane(fixed=True))

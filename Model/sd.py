@@ -29,7 +29,7 @@ class SurrogateDynamics(nn.Module):
         self.dt = float(dt)
 
         # feature dim = [q,dq,a] + [p(3),dp(3),quat(4),dw(3)] + [u(o),du(o),dv(3)]
-        in_dim = (3 * self.d) + 13 + (2 * self.o + 3)
+        in_dim = (3 * self.d) + 13 + (2 * self.o )
         h = hidden_dim
 
         # -------- shared trunk --------
@@ -107,7 +107,6 @@ class SurrogateDynamics(nn.Module):
         dw_t:  torch.Tensor,  # [B, 3]  WORLD angular vel
         u_t:   torch.Tensor,  # [B, o]  WORLD (o typically 3)
         du_t:  torch.Tensor,  # [B, o]  WORLD
-        dv_t:  torch.Tensor,  # [B, 3]  WORLD (object angular vel)
         a_t:   torch.Tensor,  # [B, d]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -115,10 +114,10 @@ class SurrogateDynamics(nn.Module):
         assert d == self.d, "joint_dim mismatch"
         assert w_t.shape[-1] == 4, "w_t must be quaternion [w,x,y,z]"
         assert u_t.shape[-1] == self.o and du_t.shape[-1] == self.o, "obj_dim mismatch"
-        assert dv_t.shape[-1] == 3, "dv_t must be [B,3] world angular velocity"
+
 
         # shared features (WORLD-frame states)
-        x = torch.cat([q_t, dq_t, a_t, p_t, dp_t, w_t, dw_t, u_t, du_t, dv_t], dim=-1)
+        x = torch.cat([q_t, dq_t, a_t, p_t, dp_t, w_t, dw_t, u_t, du_t], dim=-1)
         h = self.trunk(x)
 
         # ----- joints -----
@@ -145,7 +144,7 @@ class SurrogateDynamics(nn.Module):
         u_next  = u_t + self.dt * du_next + u_res
 
         # ----- object angular (WORLD) -----
-        dv_res  = torch.tanh(self.dv_res_head(h)) * torch.exp(self.log_dv_res_scale)  # [B, 3]
-        dv_next = dv_t + dv_res
+        #dv_res  = torch.tanh(self.dv_res_head(h)) * torch.exp(self.log_dv_res_scale)  # [B, 3]
+        #dv_next = dv_t + dv_res
 
-        return q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next, dv_next
+        return q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next

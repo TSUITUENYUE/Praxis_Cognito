@@ -366,8 +366,8 @@ class Trainer:
 
                     # ---- obs
                     obs_seq = out["obs"]["obs"]
-                    #u_seq = obs_seq[:, :, -6:-3]
-                    #du_seq = obs_seq[:, :, -3:]
+                    u_seq = obs_seq[:, :, -6:-3]
+                    du_seq = obs_seq[:, :, -3:]
 
                     # ---- aux latents/posterior
                     aux = out.get("aux", [])

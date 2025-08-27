@@ -30,9 +30,10 @@ class Runner:
                 self.codebook = Codebook(**config.codebook)
                 checkpoint_path = self.config.trainer.save_path + f"vae_checkpoint_epoch_{self.config.trainer.num_epochs}.pth"
                 state_dict = torch.load(checkpoint_path, map_location=self.config.trainer.device)
-                self.model = torch.compile(self.model).to(self.config.trainer.device)
+                #self.model = torch.compile(self.model).to(self.config.trainer.device)
+                self.model = self.model.to(self.config.trainer.device)
                 self.model.load_state_dict(state_dict)
-                self.imitator = ImitationModule(model=self.model, cfg = config.imitator)
+                self.imitator = ImitationModule(model=self.model, rl_cfg= config.rl, cfg = config.imitator)
 
     def run(self, demo=None):
         if self.mode == "generate":
@@ -41,7 +42,7 @@ class Runner:
             self.trainer.train()
         elif self.mode == "imitate":
             #self.imitator.imitate(demo, self.codebook)
-            self.imitator.visualize_in_sim(demo, 0)
+            self.imitator.visualize_in_sim(demo, 120)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

@@ -8,7 +8,7 @@ from omegaconf import OmegaConf,DictConfig
 import torch.nn as nn
 import torch.nn.functional as F
 from rsl_rl.runners import OnPolicyRunner
-from .go2_env import Go2Env
+from .go2_env_primitives import Go2Env
 from Model.agent import Agent
 import faiss
 from torch.cuda.amp import autocast, GradScaler  # <-- AMP
