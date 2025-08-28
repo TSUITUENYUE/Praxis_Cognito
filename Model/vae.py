@@ -86,7 +86,7 @@ class IntentionVAE(nn.Module):
         self.dt = 1.0 / float(fps)
         self.control_dt = self.cfg.env.dt
         self.K = max(1, int(round(self.dt / self.control_dt)))
-        self.surrogate = SurrogateDynamics(self.joint_dim,self.object_dim,hidden_dim,self.dt)
+        self.surrogate = SurrogateDynamics(self.joint_dim,self.object_dim,hidden_dim,self.dt,self.agent)
 
 
     # ---------- Latent sampling ----------
