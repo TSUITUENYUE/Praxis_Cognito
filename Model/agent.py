@@ -15,7 +15,7 @@ class Agent(nn.Module):
         self.n_dofs = n_dofs
         self.object_dim = object_dim
         self.joint_name = joint_name
-        self.end_effector = end_effector
+        self.register_buffer("end_effector",torch.tensor(end_effector))
 
 
         fk = FKModel(self.urdf)

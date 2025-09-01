@@ -30,7 +30,7 @@ class Go2Env:
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
 
-        self.ee_idx = agent.end_effector
+        self.ee_idx = [9,10,11,12]
         self.contact_on_force_N = float(self.env_cfg.get("contact_on_force_N", 15.0))
         self.contact_off_force_N = float(self.env_cfg.get("contact_off_force_N", 7.5))
 
@@ -112,7 +112,7 @@ class Go2Env:
         self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.commands = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
-        self.commands_scale = 0
+        self.commands_scale = 1.0
         self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
         self.last_actions = torch.zeros_like(self.actions)
         self.dof_pos = torch.zeros_like(self.actions)
@@ -212,10 +212,12 @@ class Go2Env:
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
+        #print(self.robot.get_link)
         links_F = self.robot.get_links_net_contact_force()
 
         # pick feet: (N, 4, 3) → norm: (N, 4)
-        F_foot = links_F.index_select(dim=1, index=self.ee_idx)
+        #print(links_F.shape)
+        F_foot = links_F[:,self.ee_idx]
         F_norm = torch.linalg.norm(F_foot, dim=-1)
 
         # hysteresis: turn on when > ON, turn off when < OFF, otherwise hold previous
@@ -326,22 +328,27 @@ class Go2Env:
         return (x + math.pi) % (2 * math.pi) - math.pi
 
     # Returns (N, L, 3) foot linear velocities in BODY frame for the links in self.ee_idx
+    def _rot_per_foot(self, v_w, inv_base_quat):
+        # v_w: (N,L,3), inv_base_quat: (N,4)
+        N, L, _ = v_w.shape
+        v_flat = v_w.reshape(N * L, 3)
+        q_flat = inv_base_quat.repeat_interleave(L, dim=0)  # (N·L, 4)
+        v_b_flat = transform_by_quat(v_flat, q_flat)  # (N·L, 3)
+        return v_b_flat.view(N, L, 3)
+
     def _feet_vel_body(self):
-        # Adapt to your Genesis build if names differ:
-        # Many builds provide get_links_velocity() / get_links_pos()
-        links_vel_w = self.robot.get_links_velocity()  # (N, n_links, 3)
+        links_vel_w = self.robot.get_links_vel()  # (N, n_links, 3)
         base_vel_w = self.robot.get_vel()  # (N, 3)
-        inv_base_quat = inv_quat(self.base_quat)  # (N, 4)
-        v_foot_w = links_vel_w.index_select(dim=1, index=self.ee_idx)  # (N, L, 3)
-        v_rel_w = v_foot_w - base_vel_w.unsqueeze(1)  # subtract base linear vel
-        # transform world→body per env, per foot
-        v_rel_b = transform_by_quat(v_rel_w, inv_base_quat.unsqueeze(1))  # (N, L, 3)
+        v_foot_w = links_vel_w[:, self.ee_idx]  # (N, L, 3)
+        v_rel_w = v_foot_w - base_vel_w.unsqueeze(1)  # (N, L, 3)
+        inv = inv_quat(self.base_quat)  # (N, 4)
+        v_rel_b = self._rot_per_foot(v_rel_w, inv)  # (N, L, 3)
         return v_rel_b
 
     # Returns (N, L, 3) foot net external contact forces in WORLD frame, plus norms (N, L)
     def _feet_contact_forces(self):
         links_F_w = self.robot.get_links_net_contact_force()  # (N, n_links, 3)
-        F_foot_w = links_F_w.index_select(dim=1, index=self.ee_idx)  # (N, L, 3)
+        F_foot_w = links_F_w[:,self.ee_idx]  # (N, L, 3)
         F_norm = torch.linalg.norm(F_foot_w, dim=-1)  # (N, L)
         return F_foot_w, F_norm
 
@@ -357,149 +364,196 @@ class Go2Env:
 
     def _reward_tracking_body_pose(self):
         """
-        Track body pose deltas: commands[3]=Δz, [4]=Δpitch, [5]=Δroll
-        Height target is absolute: base_height_target + Δz.
+        Track (dz, pitch, roll) via height + IMU gravity (yaw-invariant).
+        commands: [vx, vy, yaw, dz, pitch, roll]
         """
-        dz_cmd = self.commands[:, 3]
-        pitch_cmd = self.commands[:, 4]
-        roll_cmd = self.commands[:, 5]
+        # --- targets ---
+        dz_t = self.commands[:, 3]
+        pitch_t = self.commands[:, 4]
+        roll_t = self.commands[:, 5]
 
-        # targets
-        h_tgt = self.reward_cfg["base_height_target"] + dz_cmd
+        # --- current orientation from gravity in body frame ---
+        g = self.projected_gravity  # (N,3), unit, z ~ -1 when upright
+        pitch = torch.atan2(g[:, 0], -g[:, 2])
+        roll = torch.atan2(-g[:, 1], -g[:, 2])
 
-        # current
-        h = self.base_pos[:, 2]
-        # base_euler computed in step(): [roll, pitch, yaw]
-        pitch = self.base_euler[:, 1]
-        roll = self.base_euler[:, 0]
+        # wrap-safe errors
+        e_pitch = torch.atan2(torch.sin(pitch - pitch_t), torch.cos(pitch - pitch_t))
+        e_roll = torch.atan2(torch.sin(roll - roll_t), torch.cos(roll - roll_t))
 
-        # errors
-        e_h = h - h_tgt
-        e_pitch = self._angle_wrap(pitch - pitch_cmd)
-        e_roll = self._angle_wrap(roll - roll_cmd)
+        # orientation reward (yaw-free)
+        sigma_pitch = self.reward_cfg.get("sigma_pitch", 0.2)  # tune
+        sigma_roll = self.reward_cfg.get("sigma_roll", 0.2)
+        r_orient = torch.exp(-(e_pitch ** 2) / sigma_pitch - (e_roll ** 2) / sigma_roll)
 
-        sigma_h, sigma_ang = 0.03, 0.10  # meters, radians (tune if needed)
-        r_h = torch.exp(- (e_h ** 2) / (2 * sigma_h ** 2))
-        r_p = torch.exp(- (e_pitch ** 2) / (2 * sigma_ang ** 2))
-        r_r = torch.exp(- (e_roll ** 2) / (2 * sigma_ang ** 2))
+        # height reward from dz (target height = nominal + dz_t)
+        h_nominal = self.reward_cfg.get("base_height_nominal", 0.32)  # your standing height
+        h_target = h_nominal + dz_t
+        sigma_h = self.reward_cfg.get("sigma_h", 0.01)
+        r_height = torch.exp(-torch.square(self.base_pos[:, 2] - h_target) / sigma_h)
 
-        # geometric mean -> balanced tradeoff
-        r = (r_h * r_p * r_r) ** (1 / 3)
-        return r
+        w_o = self.reward_cfg.get("w_pose_orient", 0.5)
+        w_h = self.reward_cfg.get("w_pose_height", 0.5)
+        return w_o * r_orient + w_h * r_height
 
     def _reward_tracking_limb_vel(self):
-        """
-        Track end-effector Cartesian velocity (body frame).
-        commands[6:9] = [vx, vy, vz], commands[9] = impedance scale (not used in reward).
-        Rewards the best-matching foot to avoid needing a limb id.
-        """
-        v_cmd = self.commands[:, 6:9]  # (N, 3)
-        v_cmd = torch.clamp(v_cmd, -10.0, 10.0)
+        # --- command & measures ---
+        v_cmd = torch.clamp(self.commands[:, 6:9], -1.5, 1.5)  # (N,3)
+        s_cmd = torch.linalg.norm(v_cmd, dim=1, keepdim=True)  # (N,1)
+        u_cmd = v_cmd / (s_cmd + 1e-6)
 
-        v_foot_b = self._feet_vel_body()  # (N, L, 3)
-        # error per foot
-        e = v_foot_b - v_cmd.unsqueeze(1)  # (N, L, 3)
-        e2 = torch.sum(e * e, dim=-1)  # (N, L)
+        v_foot = self._feet_vel_body()  # (N,L,3)
+        v_mag = torch.linalg.norm(v_foot, dim=-1)  # (N,L)
 
-        sigma_v = 0.25  # m/s tolerance
-        r_per_foot = torch.exp(- e2 / (2 * sigma_v ** 2))  # (N, L)
-        r = torch.max(r_per_foot, dim=1).values  # best foot wins
-        return r
+        # per-foot direction + speed
+        dot = (v_foot @ u_cmd.unsqueeze(-1)).squeeze(-1)  # (N,L)
+        dir_cos = 0.5 * (1.0 + dot / (v_mag + 1e-6))  # [0,1]
+        e_speed = (v_mag - s_cmd).squeeze(-1) ** 2  # (N,L)
+        sigma_s = self.reward_cfg.get("limb_speed_sigma", 0.45)
+        r_speed = torch.exp(- e_speed / (2 * sigma_s ** 2))  # (N,L)
+        r_per = torch.sqrt(dir_cos * r_speed + 1e-8)  # (N,L)
+
+        # soft selector + one-hot bonus
+        beta = self.reward_cfg.get("limb_selector_beta", 8.0)
+        w = torch.softmax(beta * r_per, dim=1)  # (N,L)
+        r_track = (w * r_per).sum(dim=1)  # (N,)
+        L = r_per.shape[1]
+        onehot = (w ** 2).sum(dim=1)
+        onehot = (onehot - 1.0 / L) / (1.0 - 1.0 / L)
+
+        # discourage non-selected motion (light)
+        p_non = ((1.0 - w) * v_mag).sum(dim=1) * s_cmd.squeeze(-1)
+
+        # --- posture/height gate (no explicit contacts) ---
+        # upright scalar in [0,1]: 1 when upright, ~0 when flat
+        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5  # matches _reward_upright
+        # smooth step on height
+        z = self.base_pos[:, 2]
+        z0, z1 = 0.24, 0.30  # no reward if below z0
+        gate_h = ((z - z0) / (z1 - z0)).clamp(0.0, 1.0)
+        gate = (upr ** 2) * gate_h  # both must be decent
+
+        # final
+        return gate * (0.85 * r_track + 0.15 * onehot) - 0.03 * p_non
 
     def _reward_tracking_contact_hold(self):
         """
-        Track normal force and tangential creep when in contact.
-        commands[10]=Fn [N], [11]=vt [m/s], [12]=phi [rad] (direction in contact plane).
-        Rewards the best contact foot.
+        Track normal force and tangential creep for the best contact foot.
+        commands[10]=Fn [N], [11]=vt [m/s], [12]=phi [rad].
         """
-        Fn_cmd = self.commands[:, 10].clamp(0.0, 500.0)  # (N,)
-        vt_cmd = self.commands[:, 11].clamp(-0.5, 0.5)  # (N,)
-        phi_cmd = self.commands[:, 12]  # (N,)
+        Fn_cmd = self.commands[:, 10].clamp(0.0, 500.0)
+        vt_cmd = self.commands[:, 11].clamp(-0.5, 0.5)
+        phi_cmd = self.commands[:, 12]
 
+        # Forces (WORLD) and feet velocities (BODY)
         F_w, Fn = self._feet_contact_forces()  # (N,L,3), (N,L)
         v_foot_b = self._feet_vel_body()  # (N,L,3)
 
-        # contact mask from hysteresis flags (N,L)
-        contact = (self.contact_flags > 0.5)
+        # Contact mask from instantaneous force (flags are updated after rewards)
+        contact_thresh = self.reward_cfg.get("contact_thresh", 5.0)
+        contact = (Fn > contact_thresh).float()  # (N,L)
 
-        # Build proxy normals (WORLD) and tangent basis in BODY frame
         eps = 1e-6
-        n_hat_w = F_w / (Fn.unsqueeze(-1) + eps)  # (N,L,3), stable when in contact
-        # pick a body-x world direction by rotating body-x to world
-        body_x_b = torch.tensor([1., 0., 0.], device=gs.device, dtype=gs.tc_float).view(1, 1, 3).repeat(self.num_envs,
-                                                                                                        1, 1)
-        body_x_w = transform_by_quat(body_x_b, self.base_quat.unsqueeze(1))  # (N,1,3)
-        t1_w = body_x_w - (n_hat_w * torch.sum(body_x_w * n_hat_w, dim=-1, keepdim=True))
-        t1_w = t1_w / (torch.linalg.norm(t1_w, dim=-1, keepdim=True) + eps)
-        t2_w = torch.cross(n_hat_w, t1_w, dim=-1)
+        # Unit contact normal (WORLD) → rotate to BODY per foot safely
+        n_hat_w = F_w / (Fn.unsqueeze(-1) + eps)  # (N,L,3)
+        inv = inv_quat(self.base_quat)  # (N,4)
+        n_hat_b = self._rot_per_foot(n_hat_w, inv)  # (N,L,3)
 
-        # Bring tangents to BODY for projecting body-frame foot velocities
-        inv_base_quat = inv_quat(self.base_quat)
-        t1_b = transform_by_quat(t1_w, inv_base_quat.unsqueeze(1))
-        t2_b = transform_by_quat(t2_w, inv_base_quat.unsqueeze(1))
+        # Tangent basis in BODY (use ex projected onto plane; fallback to ey if degenerate)
+        N, L = Fn.shape
+        ex = torch.tensor([1., 0., 0.], device=gs.device, dtype=gs.tc_float).view(1, 1, 3).expand(N, L, 3)
+        proj = (ex * n_hat_b).sum(-1, keepdim=True) * n_hat_b
+        t1_b = ex - proj
+        bad = (torch.linalg.norm(t1_b, dim=-1, keepdim=True) < 1e-3).float()
+        ey = torch.tensor([0., 1., 0.], device=gs.device, dtype=gs.tc_float).view(1, 1, 3).expand(N, L, 3)
+        t1_fallback = ey - (ey * n_hat_b).sum(-1, keepdim=True) * n_hat_b
+        t1_b = torch.where(bad > 0, t1_fallback, t1_b)
+        t1_b = t1_b / (torch.linalg.norm(t1_b, dim=-1, keepdim=True) + eps)
+        t2_b = torch.cross(n_hat_b, t1_b, dim=-1)
 
-        # Desired tangential direction in BODY plane
-        cosφ = torch.cos(phi_cmd).unsqueeze(1)  # (N,1)
-        sinφ = torch.sin(phi_cmd).unsqueeze(1)
-        # Combine basis per-foot; broadcast φ per env across feet
-        t_cmd_b = cosφ.unsqueeze(-1) * t1_b + sinφ.unsqueeze(-1) * t2_b  # (N,L,3)
+        # Desired BODY tangential direction from phi
+        cosφ = torch.cos(phi_cmd).view(-1, 1, 1)  # (N,1,1)
+        sinφ = torch.sin(phi_cmd).view(-1, 1, 1)
+        t_cmd_b = cosφ * t1_b + sinφ * t2_b  # (N,L,3)
 
-        # Project measured body-frame foot velocity onto t_cmd
-        vt_meas = torch.sum(v_foot_b * t_cmd_b, dim=-1)  # (N,L)
+        # Tangential speed along commanded direction
+        vt_meas = (v_foot_b * t_cmd_b).sum(dim=-1)  # (N,L)
 
-        # --- rewards ---
-        # Force tracking (only when contact)
-        sigma_F = 10.0
-        rF = torch.exp(- (Fn - Fn_cmd.unsqueeze(1)).abs() / sigma_F) * contact
+        # Rewards (masked by contact)
+        sigma_F = 20.0
+        rF = torch.exp(- (Fn - Fn_cmd.view(-1, 1)).abs() / sigma_F) * contact
 
-        # Tangential speed tracking (only when contact)
-        sigma_v = 0.05
-        rv = torch.exp(- ((vt_meas - vt_cmd.unsqueeze(1)) ** 2) / (2 * sigma_v ** 2)) * contact
+        sigma_v = 0.08
+        rv = torch.exp(- ((vt_meas - vt_cmd.view(-1, 1)) ** 2) / (2 * sigma_v ** 2)) * contact
 
-        # Combine and pick best contact foot
-        r_per_foot = (rF * rv) ** 0.5  # geometric mean
-        r = torch.where(contact.any(dim=1),
-                        r_per_foot.max(dim=1).values,
-                        torch.zeros_like(Fn_cmd))
-        return r
+        r_per = (rF * rv).sqrt()  # (N,L)
+        has_contact = contact.any(dim=1)
+        r = torch.where(has_contact, r_per.max(dim=1).values, torch.zeros_like(Fn_cmd))
+
+        # (Optional) light creep penalty on other contact feet
+        v_tan = v_foot_b - (v_foot_b * n_hat_b).sum(-1, keepdim=True) * n_hat_b
+        v_tan_mag = torch.linalg.norm(v_tan, dim=-1)  # (N,L)
+        best_mask = (r_per == r_per.max(dim=1, keepdim=True).values).float()
+        creep_pen = ((1.0 - best_mask) * v_tan_mag * contact).sum(dim=1) / (contact.sum(dim=1) + 1e-6)
+
+        return r - 0.05 * creep_pen
 
     def _reward_tracking_hop(self):
         """
         commands[13]=apex_h [m], [14]=psi [rad] (horizontal takeoff direction in body frame),
         [15]=pitch_imp (scaled target pitch rate).
-        Two components:
-          - vertical speed toward height target (pre/at takeoff),
-          - horizontal velocity direction toward psi,
-          - pitch rate toward scaled command.
+        Reward terms:
+          (1) vertical takeoff speed toward height target
+          (2) flight/airtime bonus (all feet off contact)
+          (3) horizontal direction alignment (robust at low speed)
+          (4) pitch-rate shaping
+          (5) (optional) apex-height shaping during flight
         """
-        h_cmd = self.commands[:, 13].clamp(0.0, 0.40)  # (N,)
-        psi_cmd = self.commands[:, 14]
-        imp_cmd = self.commands[:, 15].clamp(-1.0, 1.0)
-
         g = 9.81
-        v0 = torch.sqrt(torch.clamp(2.0 * g * torch.abs(h_cmd), min=0.0))  # target vertical speed for hop height
-        vz = self.base_lin_vel[:, 2].abs()
+        h_cmd = self.commands[:, 13].clamp(0.0, 0.40)  # (N,)
+        psi = self.commands[:, 14]
+        imp = self.commands[:, 15].clamp(-1.0, 1.0)
 
-        # vertical speed tracking
-        sigma_vz = 0.2
+        # target vertical speed for the commanded apex (v0 = sqrt(2 g h))
+        v0 = torch.sqrt(torch.clamp(2.0 * g * h_cmd, min=0.0))  # (N,)
+        vz = self.base_lin_vel[:, 2]
+
+        # (1) vertical speed tracking (looser sigma to allow learning)
+        sigma_vz = 0.5
         r_vz = torch.exp(- (vz - v0) ** 2 / (2 * sigma_vz ** 2))
 
-        # horizontal direction tracking (in BODY frame)
-        vx, vy = self.base_lin_vel[:, 0], self.base_lin_vel[:, 1]
-        psi_meas = torch.atan2(vy, vx)
-        dpsi = torch.abs(
-            torch.tensor([self._angle_wrap(p - q) for p, q in zip(psi_meas, psi_cmd)]).to(gs.device).to(gs.tc_float))
-        sigma_psi = 0.35  # rad
-        r_dir = torch.exp(- dpsi ** 2 / (2 * sigma_psi ** 2))
+        # Foot contacts & flight detection
+        F = self.robot.get_links_net_contact_force()  # (N, n_links, 3)
+        Fn = torch.linalg.norm(F[:, self.ee_idx], dim=-1)  # (N, 4)
+        contact = (Fn > self.reward_cfg.get("contact_thresh", 5.0)).float()  # (N,4)
+        num_contact = contact.sum(dim=1)  # (N,)
+        in_flight = (num_contact == 0).float()  # (N,)
 
-        # pitch impulse as pitch rate target (BODY y angular vel)
-        # scale desired |pitch rate| by a constant factor per unit imp_cmd
-        k_rate = 3.0  # rad/s per unit impulse (tune)
-        pitch_rate_meas = self.base_ang_vel[:, 1]
-        r_pitch = torch.exp(- (pitch_rate_meas - k_rate * imp_cmd) ** 2 / (2 * (0.6 ** 2)))
+        # (2) flight/airtime bonus to break the "stand still" basin
+        r_flight = in_flight
 
-        # Combine (weighted geometric mean)
-        r = (r_vz * (r_dir ** 0.5) * (r_pitch ** 0.5)) ** (1 / 2)
+        # (3) horizontal direction alignment (robust at |v|~0)
+        vxy = self.base_lin_vel[:, :2]  # (N,2)
+        d = torch.stack([torch.cos(psi), torch.sin(psi)], dim=1)  # (N,2)
+        speed = torch.linalg.norm(vxy, dim=1)  # (N,)
+        cosang = (vxy * d).sum(dim=1) / (speed + 1e-6)  # (N,)
+        r_dir = 0.5 * (1.0 + cosang)  # ∈[0,1], well-defined at low speed
+
+        # (4) pitch-rate shaping (BODY y-axis)
+        k_rate = 3.0
+        pitch_rate = self.base_ang_vel[:, 1]
+        sigma_pitch = 0.8
+        r_pitch = torch.exp(- (pitch_rate - k_rate * imp) ** 2 / (2 * sigma_pitch ** 2))
+
+        # (5) apex-height shaping only while in flight
+        h0 = self.reward_cfg.get("base_height_target", 0.30)
+        h_gain = (self.base_pos[:, 2] - h0).clamp(min=0.0)
+        sigma_h = 0.06
+        r_apex = torch.exp(- (h_gain - h_cmd) ** 2 / (2 * sigma_h ** 2)) * in_flight
+
+        # Weighted sum (keep simple; avoid geometric mean collapse)
+        w_vz, w_f, w_dir, w_pitch, w_h = 0.5, 0.3, 0.1, 0.05, 0.05
+        r = w_vz * r_vz + w_f * r_flight + w_dir * r_dir + w_pitch * r_pitch + w_h * r_apex
         return r
 
     def _reward_lin_vel_z(self):

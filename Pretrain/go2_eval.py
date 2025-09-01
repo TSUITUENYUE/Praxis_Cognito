@@ -15,15 +15,15 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import genesis as gs
 from Model.agent import Agent
-from go2_env import Go2Env
+from go2_env_primitives import Go2Env
 from rsl_rl.runners import OnPolicyRunner
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="../conf/go2.yaml", help="unified YAML config, e.g. ./conf/go2.yaml")
-    parser.add_argument("-e", "--exp_name", default="go2-walking",type=str,help="experiment name under Pretrain/primitives/")
-    parser.add_argument("--ckpt", type=int, default=200, help="checkpoint index to load")
+    parser.add_argument("--config", type=str, default="../conf/go2contact.yaml", help="unified YAML config, e.g. ./conf/go2pos.yaml")
+    parser.add_argument("-e", "--exp_name", default="go2contact",type=str,help="experiment name under Pretrain/primitives/")
+    parser.add_argument("--ckpt", type=int, default=400, help="checkpoint index to load")
     parser.add_argument("--episodes", type=int, default=1, help="number of episodes to record")
     parser.add_argument("--viewer", action="store_true", help="show viewer while recording")
     args = parser.parse_args()

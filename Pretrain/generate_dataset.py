@@ -8,10 +8,13 @@ from omegaconf import OmegaConf,DictConfig
 import torch.nn as nn
 import torch.nn.functional as F
 from rsl_rl.runners import OnPolicyRunner
-from .go2_env_primitives import Go2Env
+from .go2_env_icm import Go2Env
 from Model.agent import Agent
+from Model.MoE import MoEActorCritic
 import faiss
 from torch.cuda.amp import autocast, GradScaler  # <-- AMP
+from pathlib import Path
+import copy
 
 class RunningMeanStd:
     def __init__(self, shape, epsilon=1e-4, device='cuda'):
@@ -90,7 +93,7 @@ def generate(cfg: DictConfig):
 
     gs.init(logging_level='warning')
 
-    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0}
+    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.5}
     agent = Agent(**cfg.agent)
     env = Go2Env(
         num_envs=NUM_ENVS,
@@ -100,10 +103,58 @@ def generate(cfg: DictConfig):
     )
     train_cfg = OmegaConf.to_container(cfg.rl.train, resolve=True)
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
-    primitives = os.path.join(log_dir, "model_200.pt")
-    runner.load(primitives)
-    policy_alg = runner.alg
 
+    ckpts = []
+    for d in sorted(Path(log_dir).iterdir()):
+        p = d / "model_400.pt"
+        ckpts.append(str(p))
+
+
+    experts = []
+    for p in ckpts:
+        runner.load(p)  # load into runner.alg (PPO) in-place
+        expert_alg = copy.deepcopy(runner.alg)  # freeze a copy as an expert
+        for param in expert_alg.actor_critic.parameters():
+            param.requires_grad = False
+        expert_alg.actor_critic.eval()
+        experts.append(expert_alg)
+
+    #runner.load(primitives)
+    policy_alg = runner.alg  # PPO instance to keep your storage/updates pipeline
+    # command range tensors for scaling/normalization injection
+    cmd_lows  = torch.tensor([
+        cfg.rl.command.lin_vel_x_range[0], cfg.rl.command.lin_vel_y_range[0], cfg.rl.command.ang_vel_range[0],
+        cfg.rl.command.dz_range[0],        cfg.rl.command.pitch_range[0],     cfg.rl.command.roll_range[0],
+        cfg.rl.command.ee_vx_range[0],     cfg.rl.command.ee_vy_range[0],     cfg.rl.command.ee_vz_range[0], cfg.rl.command.imp_s_range[0],
+        cfg.rl.command.Fn_range[0],        cfg.rl.command.vt_range[0],        cfg.rl.command.phi_range[0],
+        cfg.rl.command.apex_h_range[0],    cfg.rl.command.psi_range[0],       cfg.rl.command.pitch_imp_range[0],
+    ], device=gs.device, dtype=gs.tc_float)
+    cmd_highs = torch.tensor([
+        cfg.rl.command.lin_vel_x_range[1], cfg.rl.command.lin_vel_y_range[1], cfg.rl.command.ang_vel_range[1],
+        cfg.rl.command.dz_range[1],        cfg.rl.command.pitch_range[1],     cfg.rl.command.roll_range[1],
+        cfg.rl.command.ee_vx_range[1],     cfg.rl.command.ee_vy_range[1],     cfg.rl.command.ee_vz_range[1], cfg.rl.command.imp_s_range[1],
+        cfg.rl.command.Fn_range[1],        cfg.rl.command.vt_range[1],        cfg.rl.command.phi_range[1],
+        cfg.rl.command.apex_h_range[1],    cfg.rl.command.psi_range[1],       cfg.rl.command.pitch_imp_range[1],
+    ], device=gs.device, dtype=gs.tc_float)
+
+    moe_ac = MoEActorCritic(
+        obs_dim=env.num_obs,
+        act_dim=env.num_actions,
+        num_cmd=env.num_commands,
+        experts_algs=experts,
+        obs_normalizer=runner.obs_normalizer,
+        cmd_lows=cmd_lows,
+        cmd_highs=cmd_highs,
+        hidden=POLICY_HIDDEN_DIM,
+        topk=2,
+        stickiness=0.85
+    ).to(gs.device)
+    moe_ac = torch.compile(moe_ac)
+    moe_ac.reset_prev(NUM_ENVS, gs.device)
+
+    # install into PPO (re-use PPO's optimizer machinery)
+    policy_alg.actor_critic = moe_ac
+    policy_alg.optimizer = torch.optim.Adam(policy_alg.actor_critic.parameters(), lr=3e-4)
     # ICM (curiosity)
     icm = ICMModule(state_dim=env.num_obs, action_dim=env.num_actions, hidden_dim=POLICY_HIDDEN_DIM).to(gs.device)
 
@@ -133,9 +184,9 @@ def generate(cfg: DictConfig):
     base_vel_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
     base_ang_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3),           device=gs.device)
 
-    ball_pos_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
-    ball_vel_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
-    ball_ang_buffer     = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
+    ball_pos_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
+    ball_vel_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
+    ball_ang_buffer       = torch.zeros((max_episode_len, NUM_ENVS, 3), device=gs.device)  # NEW (ball)
 
     obs_traj_buffer       = torch.zeros((max_episode_len, NUM_ENVS, env.num_obs), device=gs.device)
     act_traj_buffer       = torch.zeros((max_episode_len, NUM_ENVS, env.num_actions), device=gs.device)
@@ -242,7 +293,9 @@ def generate(cfg: DictConfig):
                 with torch.no_grad():
                     obs_traj_buffer[t] = obs
 
+
                     raw_act = policy_alg.act(obs_n, critic_obs_n)
+                    env.set_commands(policy_alg.actor_critic.last_cmd01)
                     act = torch.clamp(raw_act, -100.0, 100.0)   # executed action
                     act_traj_buffer[t] = act
 

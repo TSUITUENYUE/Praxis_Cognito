@@ -375,7 +375,6 @@ class Trainer:
                     #z = torch.zeros_like(z)
                     z_detached = z.detach()
                     # --------------- Genesis rollout (teacher for surrogate) ---------------
-                    '''
                     with torch.no_grad():
                         was_training = self.vae.decoder.training
                         self.vae.decoder.eval()
@@ -430,7 +429,6 @@ class Trainer:
                             du_sim_seq = obs_sim_seq[:, :, -3:]
                         finally:
                             self.vae.decoder.train(was_training)
-                    '''
                     # --- VAE loss (pose + action + KL) ---
                     loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
                         x_recon, log_sigma, x,
@@ -443,7 +441,6 @@ class Trainer:
                     )
 
                     # state-space losses (detach sim targets)
-                    '''
                     q_loss = self.masked_mse(q_seq, q_sim_seq.detach(), mask)
                     dq_loss = self.masked_mse(dq_seq, dq_sim_seq.detach(), mask)
                     p_loss = self.masked_mse(p_seq, p_sim_seq.detach(), mask)
@@ -454,24 +451,13 @@ class Trainer:
                     u_loss = self.masked_mse(u_seq, u_sim_seq.detach(), mask)
                     #print(u_loss)
                     du_loss = self.masked_mse(du_seq, du_sim_seq.detach(), mask)
-                    '''
-                    q_loss = self.masked_mse(q_seq, q_gt, mask)
-                    dq_loss = self.masked_mse(dq_seq, dq_gt, mask)
-                    p_loss = self.masked_mse(p_seq, p_gt, mask)
-                    dp_loss = self.masked_mse(dp_seq, dp_gt, mask)
-                    dw_loss = self.masked_mse(dw_seq, dw_gt, mask)
-                    #w_loss = masked_quat_geodesic(w_seq, w_gt, mask)
-
-                    u_loss = self.masked_mse(u_seq, u_gt, mask)
-                    #print(u_loss)
-                    du_loss = self.masked_mse(du_seq, du_gt, mask)
                     # print(du_loss)
                     state_loss = (
                             self.w_q * q_loss +
                             self.w_dq * dq_loss +
                             self.w_p * p_loss +
                             self.w_dp * dp_loss +
-                            #self.w_w * w_loss +
+                            self.w_w * w_loss +
                             self.w_dw * dw_loss +
                             self.w_u * u_loss +
                             self.w_du * du_loss
@@ -479,8 +465,8 @@ class Trainer:
 
                     # optional: obs regularizer (use your exact normalized obs on both sides)
                     # obs_pred_n is from surrogate’s predict_dynamics; obs_sim_n_seq from Genesis → normalized
-                    # obs_reg = self.masked_mse(obs_seq, obs_sim_seq.detach(), mask)
-                    sim_loss = state_loss
+                    obs_reg = self.masked_mse(obs_seq, obs_sim_seq.detach(), mask)
+                    sim_loss = state_loss + self.w_obs * obs_reg  # choose small self.w_obs, e.g., 0.1 * (avg state weight)
 
                     total_loss = loss + self.lambda_sim * sim_loss
 
@@ -556,7 +542,7 @@ class Trainer:
                     self.w_dq * dq_loss.item() ,
                     self.w_p * p_loss.item() ,
                     self.w_dp * dp_loss.item() ,
-                    #self.w_w * w_loss.item() ,
+                    self.w_w * w_loss.item() ,
                     self.w_dw * dw_loss.item() ,
                     self.w_u * u_loss.item() ,
                     self.w_du * du_loss.item() ,)

@@ -10,21 +10,21 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
-from go2_env import Go2Env
+from go2_env_primitives import Go2Env
 from Model.agent import Agent
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="go2-walking")
+    parser.add_argument("-e", "--exp_name", type=str, default="go2pose")
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
-    parser.add_argument("--max_iterations", type=int, default=201)
-    parser.add_argument("--config", type=str, default="../conf/go2.yaml")
+    parser.add_argument("--max_iterations", type=int, default=401)
+    parser.add_argument("--config", type=str, default="../conf/go2pose.yaml")
     args = parser.parse_args()
 
     gs.init(logging_level="warning")
 
     # Create log dir
-    log_dir = f"./primitives/{args.exp_name}"
+    log_dir = f"Pretrain/primitives/{args.exp_name}"
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
@@ -41,7 +41,7 @@ def main():
     FRAME_RATE = config.dataset.frame_rate
 
     # ---- Agent & Env ----
-    agent = Agent(**config.agent)
+    agent = Agent(**config.agent).to('cuda')
     NUM_ENVS = args.num_envs
     env = Go2Env(
         num_envs=NUM_ENVS,
