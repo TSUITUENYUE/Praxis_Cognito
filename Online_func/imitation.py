@@ -66,7 +66,7 @@ class ImitationModule:
         """
         Returns:
           losses: list of float (MSE on normalized FK/object space, same as training)
-          joint_cmds: list of [B,T,DoF] tensors from model rollout (decoder + surrogate)
+          joint_cmds: list of [B,T,DoF] tensors from model rollout (decoder and surrogate)
         """
         dataset = TrajectoryDataset(
             processed_path=self.cfg.processed_path,

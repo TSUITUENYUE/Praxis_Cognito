@@ -524,7 +524,7 @@ class IntentionVAE(nn.Module):
 
         # -------- Pose reconstruction with discount gamma^t --------
         orig_traj = orig_traj.view(B, T, -1)
-        pose_step = ((recon_traj[:,:,:-3] - orig_traj[:,:,:-3]) ** 2).mean(dim=-1)  # [B,T]
+        pose_step = ((recon_traj[:,:,:] - orig_traj[:,:,:]) ** 2).mean(dim=-1)  # [B,T]
 
         t_idx = torch.arange(T, device=device, dtype=dtype)
         w_t = (gamma ** t_idx).to(dtype=dtype)  # [T]
