@@ -93,7 +93,7 @@ def generate(cfg: DictConfig):
 
     gs.init(logging_level='warning')
 
-    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.5}
+    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.00}
     agent = Agent(**cfg.agent)
     env = Go2Env(
         num_envs=NUM_ENVS,
@@ -136,9 +136,9 @@ def generate(cfg: DictConfig):
     cmd_masks = torch.stack([
         on(0, 1, 2),  # locomote: vx,vy,wz
         on(3, 4, 5),  # body pose: dz,pitch,roll
-        on(13, 14, 15),  # hop: apex_h, psi, pitch_imp
         on(6, 7, 8, 9),  # swing leg: ee_vx,ee_vy,ee_vz,imp_s
         on(10, 11, 12),  # contact hold: Fn, vt, phi
+        on(13, 14, 15),  # hop: apex_h, psi, pitch_imp
     ], dim=0).to(gs.device)  # [K=5, C=16]; expand/reorder to match your expert list
 
     moe_ac = MoEActorCritic(

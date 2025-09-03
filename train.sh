@@ -1,1 +1,1 @@
-python main.py --mode train --config ./conf/go2.yaml
+python main.py --mode train --config ./conf/go2bak.yaml

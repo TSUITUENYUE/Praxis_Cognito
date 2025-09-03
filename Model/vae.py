@@ -5,10 +5,19 @@ import torch.nn.functional as F
 import genesis
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat,  transform_quat_by_quat
 
+from pathlib import Path
+import copy
+from rsl_rl.runners import OnPolicyRunner
+from Pretrain.go2_env_icm import Go2Env   # same env used in data gen
+import genesis as gs
+
 from .encoder import GMMEncoder, VanillaEncoder
-from .decoder import Decoder
+from .decoder import Decoder, DecoderMoE
 from .sd import SurrogateDynamics
 
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch._dynamo as dynamo
 from omegaconf import DictConfig, OmegaConf
@@ -55,7 +64,7 @@ class IntentionVAE(nn.Module):
         self.obs_scale = cfg.obs.obs_scales
         self.default_dof_pos = agent.init_angles
         self.simulate_action_latency = self.cfg.env.simulate_action_latency
-
+        self.command_scale = 1.0
         self.base_init_pos = self.cfg.env.base_init_pos
         self.base_init_quat = self.cfg.env.base_init_quat
         self.kp = self.cfg.env.kp
@@ -81,7 +90,94 @@ class IntentionVAE(nn.Module):
             )
 
         # --- Decoder ---
-        self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim,self.agent, hidden_dim, obs_dim, fps)
+        #self.decoder = Decoder(latent_dim, seq_len, self.object_dim, self.joint_dim,self.agent, hidden_dim, obs_dim, fps)
+
+        train_cfg = OmegaConf.to_container(self.cfg.train, resolve=True)
+        gs.init(logging_level="warning")
+        # env (exactly like data-gen)
+        env = Go2Env(
+            num_envs=1,
+            env_cfg=self.cfg.env,
+            obs_cfg=self.cfg.obs,
+            reward_cfg=self.cfg.reward,
+            command_cfg=self.cfg.command,
+            show_viewer=False,
+            agent=self.agent,
+        )
+        # locate primitives root and collect checkpoints
+        prims_root = self.cfg.train.log_dir
+        prims_root = Path(prims_root)
+
+        ckpts = [d / "model_400.pt" for d in sorted(prims_root.iterdir()) if (d / "model_400.pt").exists()]
+
+        runner = OnPolicyRunner(env, train_cfg, str(prims_root), device=gs.device)
+
+        # load PPO experts and freeze
+        experts_ac = []
+        for p in ckpts:
+            runner.load(str(p))
+            expert_alg = copy.deepcopy(runner.alg)
+            for param in expert_alg.actor_critic.parameters():
+                param.requires_grad = False
+            expert_alg.actor_critic.eval()
+            experts_ac.append(expert_alg.actor_critic)
+
+        # command ranges (C = env.num_commands)
+        C = env.num_commands
+        cmd_lows = torch.tensor([
+            self.cfg.command.lin_vel_x_range[0], self.cfg.command.lin_vel_y_range[0], self.cfg.command.ang_vel_range[0],
+            self.cfg.command.dz_range[0], self.cfg.command.pitch_range[0], self.cfg.command.roll_range[0],
+            self.cfg.command.ee_vx_range[0], self.cfg.command.ee_vy_range[0], self.cfg.command.ee_vz_range[0],
+            self.cfg.command.imp_s_range[0],
+            self.cfg.command.Fn_range[0], self.cfg.command.vt_range[0], self.cfg.command.phi_range[0],
+            self.cfg.command.apex_h_range[0], self.cfg.command.psi_range[0], self.cfg.command.pitch_imp_range[0],
+        ], dtype=torch.float32, device=self.pos_mean.device)
+        cmd_highs = torch.tensor([
+            self.cfg.command.lin_vel_x_range[1], self.cfg.command.lin_vel_y_range[1], self.cfg.command.ang_vel_range[1],
+            self.cfg.command.dz_range[1], self.cfg.command.pitch_range[1], self.cfg.command.roll_range[1],
+            self.cfg.command.ee_vx_range[1], self.cfg.command.ee_vy_range[1], self.cfg.command.ee_vz_range[1],
+            self.cfg.command.imp_s_range[1],
+            self.cfg.command.Fn_range[1], self.cfg.command.vt_range[1], self.cfg.command.phi_range[1],
+            self.cfg.command.apex_h_range[1], self.cfg.command.psi_range[1], self.cfg.command.pitch_imp_range[1],
+        ], dtype=torch.float32, device=self.pos_mean.device)
+
+        # SAME masks as in data-gen (expects 5 primitives). If you trained a different K, adjust indices here.
+        def _on(*idxs):
+            m = torch.zeros(C, device=self.pos_mean.device)
+            m[list(idxs)] = 1.0
+            return m
+
+        cmd_masks = torch.stack([
+            _on(0, 1, 2),  # locomotion: vx, vy, wz
+            _on(3, 4, 5),  # body pose: dz, pitch, roll
+            _on(6, 7, 8, 9),  # swing: ee_vx, ee_vy, ee_vz, imp_s
+            _on(10, 11, 12),  # contact hold: Fn, vt, phi
+            _on(13, 14, 15),  # hop: apex_h, psi, pitch_imp
+        ], dim=0)
+
+        # finally, the VAE decoder becomes a MoE that takes (z, obs, mask) and mixes the SAME primitives
+        self.decoder = DecoderMoE(
+            latent_dim=latent_dim,
+            seq_len=seq_len,
+            object_dim=self.object_dim,
+            joint_dim=self.joint_dim,
+            agent=self.agent,
+            hidden_dim=hidden_dim,
+            obs_dim=obs_dim,
+            fps=fps,
+            std_init=0.3,
+            std_min=1e-4,
+            std_max=5.0,
+            state_dependent_std=True,
+            experts_ac=experts_ac,  # frozen primitives
+            num_cmd=C,
+            cmd_lows=cmd_lows,
+            cmd_highs=cmd_highs,
+            cmd_masks=cmd_masks,  # per-primitive command visibility
+            gate_hidden=(256, 256),
+            topk=2,
+            obs_norm=runner.obs_normalizer,  # same normalizer used in data-gen
+        ).to(self.pos_mean.device)
 
         self.dt = 1.0 / float(fps)
         self.control_dt = self.cfg.env.dt
@@ -168,7 +264,7 @@ class IntentionVAE(nn.Module):
 
         return tau
 
-    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, mask_t):
+    def predict_dynamics(self, a_t, q_t, dq_t, p_t, dp_t, w_t, dw_t, u_t, du_t, mask_t,cmd):
         B, d = a_t.shape
         dev = a_t.device
 
@@ -224,6 +320,7 @@ class IntentionVAE(nn.Module):
         relative_ball_vel = transform_by_quat(du_next - dp_next, inv_q_next)
 
         obs_pred = torch.cat([
+            cmd * self.command_scale, #16
             base_lin_vel * self.cfg.obs.obs_scales["lin_vel"],  # 3
             base_ang_vel * self.cfg.obs.obs_scales["ang_vel"],  # 3
             proj_g,  # 3
@@ -395,9 +492,10 @@ class IntentionVAE(nn.Module):
             action_t, mu_t, log_std_t, log_sig_t, _ = self.decoder(
                 z, obs_t=obs_prev, mask_t=mask_t
             )
+            cmd_t = self.decoder.get_cmd()
             # ----- Surrogate dynamics (FULL state → next state) -----
             obs_pred, q_pred, dq_pred, p_pred, dp_pred, w_pred, dw_pred, u_pred, du_pred = \
-                self.predict_dynamics(action_t, q_in, dq_in, p_in, dp_in, w_in, dw_in, u_in, du_in, mask_t)
+                self.predict_dynamics(action_t, q_in, dq_in, p_in, dp_in, w_in, dw_in, u_in, du_in, mask_t,cmd_t)
 
             # Clamp joints to limits
             q_pred = _clamp_to_limits(q_pred, self.decoder.joint_lower, self.decoder.joint_upper)

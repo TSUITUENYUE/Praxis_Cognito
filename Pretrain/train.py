@@ -10,9 +10,10 @@ import os, math
 import genesis as gs
 from rsl_rl.modules import EmpiricalNormalization
 
-from .go2_env import Go2Env
+from .go2_env_icm import Go2Env
 from .dataset import TrajectoryDataset
 from .utils import build_edge_index
+
 
 def get_beta(epoch, total_epochs, strategy='cyclical', num_cycles=4, max_beta=1.0, warmup_epochs=20):
     if strategy == 'warmup':
@@ -66,6 +67,7 @@ class Trainer:
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
+        '''
         gs.init(logging_level="warning")
         self.env = Go2Env(
             num_envs=self.batch_size,
@@ -76,7 +78,7 @@ class Trainer:
             show_viewer=False,
             agent=self.agent,
         )
-
+        '''
         self.end_effector_indices = self.agent.end_effector
         self.edge_index = build_edge_index(self.fk_model, self.end_effector_indices, self.device)
 
