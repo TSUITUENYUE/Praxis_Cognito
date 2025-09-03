@@ -122,35 +122,57 @@ def generate(cfg: DictConfig):
     #runner.load(primitives)
     policy_alg = runner.alg  # PPO instance to keep your storage/updates pipeline
     # command range tensors for scaling/normalization injection
-    cmd_lows  = torch.tensor([
-        cfg.rl.command.lin_vel_x_range[0], cfg.rl.command.lin_vel_y_range[0], cfg.rl.command.ang_vel_range[0],
-        cfg.rl.command.dz_range[0],        cfg.rl.command.pitch_range[0],     cfg.rl.command.roll_range[0],
-        cfg.rl.command.ee_vx_range[0],     cfg.rl.command.ee_vy_range[0],     cfg.rl.command.ee_vz_range[0], cfg.rl.command.imp_s_range[0],
-        cfg.rl.command.Fn_range[0],        cfg.rl.command.vt_range[0],        cfg.rl.command.phi_range[0],
-        cfg.rl.command.apex_h_range[0],    cfg.rl.command.psi_range[0],       cfg.rl.command.pitch_imp_range[0],
-    ], device=gs.device, dtype=gs.tc_float)
-    cmd_highs = torch.tensor([
-        cfg.rl.command.lin_vel_x_range[1], cfg.rl.command.lin_vel_y_range[1], cfg.rl.command.ang_vel_range[1],
-        cfg.rl.command.dz_range[1],        cfg.rl.command.pitch_range[1],     cfg.rl.command.roll_range[1],
-        cfg.rl.command.ee_vx_range[1],     cfg.rl.command.ee_vy_range[1],     cfg.rl.command.ee_vz_range[1], cfg.rl.command.imp_s_range[1],
-        cfg.rl.command.Fn_range[1],        cfg.rl.command.vt_range[1],        cfg.rl.command.phi_range[1],
-        cfg.rl.command.apex_h_range[1],    cfg.rl.command.psi_range[1],       cfg.rl.command.pitch_imp_range[1],
-    ], device=gs.device, dtype=gs.tc_float)
+    experts_ac = [ex.actor_critic for ex in experts]  # <-- ActorCritic modules
+
+    # build masks [K, C]; example for 5 primitives (locomote, bodypose, hop, swing, contacthold)
+    # shape must match env.num_commands (C=16 per your config)
+    C = env.num_commands
+
+    def on(*idxs):
+        m = torch.zeros(C, device=gs.device)
+        m[list(idxs)] = 1.0
+        return m
+
+    cmd_masks = torch.stack([
+        on(0, 1, 2),  # locomote: vx,vy,wz
+        on(3, 4, 5),  # body pose: dz,pitch,roll
+        on(13, 14, 15),  # hop: apex_h, psi, pitch_imp
+        on(6, 7, 8, 9),  # swing leg: ee_vx,ee_vy,ee_vz,imp_s
+        on(10, 11, 12),  # contact hold: Fn, vt, phi
+    ], dim=0).to(gs.device)  # [K=5, C=16]; expand/reorder to match your expert list
 
     moe_ac = MoEActorCritic(
-        obs_dim=env.num_obs,
-        act_dim=env.num_actions,
+        num_actor_obs=env.num_obs,
+        num_critic_obs=env.num_obs,
+        num_actions=env.num_actions,
+        experts_ac=experts_ac,
         num_cmd=env.num_commands,
-        experts_algs=experts,
-        obs_normalizer=runner.obs_normalizer,
-        cmd_lows=cmd_lows,
-        cmd_highs=cmd_highs,
-        hidden=POLICY_HIDDEN_DIM,
+        cmd_lows=torch.tensor([
+            cfg.rl.command.lin_vel_x_range[0], cfg.rl.command.lin_vel_y_range[0], cfg.rl.command.ang_vel_range[0],
+            cfg.rl.command.dz_range[0], cfg.rl.command.pitch_range[0], cfg.rl.command.roll_range[0],
+            cfg.rl.command.ee_vx_range[0], cfg.rl.command.ee_vy_range[0], cfg.rl.command.ee_vz_range[0],
+            cfg.rl.command.imp_s_range[0],
+            cfg.rl.command.Fn_range[0], cfg.rl.command.vt_range[0], cfg.rl.command.phi_range[0],
+            cfg.rl.command.apex_h_range[0], cfg.rl.command.psi_range[0], cfg.rl.command.pitch_imp_range[0],
+        ], device=gs.device, dtype=gs.tc_float),
+        cmd_highs=torch.tensor([
+            cfg.rl.command.lin_vel_x_range[1], cfg.rl.command.lin_vel_y_range[1], cfg.rl.command.ang_vel_range[1],
+            cfg.rl.command.dz_range[1], cfg.rl.command.pitch_range[1], cfg.rl.command.roll_range[1],
+            cfg.rl.command.ee_vx_range[1], cfg.rl.command.ee_vy_range[1], cfg.rl.command.ee_vz_range[1],
+            cfg.rl.command.imp_s_range[1],
+            cfg.rl.command.Fn_range[1], cfg.rl.command.vt_range[1], cfg.rl.command.phi_range[1],
+            cfg.rl.command.apex_h_range[1], cfg.rl.command.psi_range[1], cfg.rl.command.pitch_imp_range[1],
+        ], device=gs.device, dtype=gs.tc_float),
+        cmd_masks=cmd_masks,
+        gate_hidden=[256, 256],
+        activation="elu",
         topk=2,
-        stickiness=0.85
+        stickiness=0.85,
+        obs_norm=runner.obs_normalizer,  # ok if Identity; code guards it
+        init_noise_std=cfg.rl.train.algorithm.get("init_noise_std", 1.0),
+        noise_std_type="scalar",
     ).to(gs.device)
-    moe_ac = torch.compile(moe_ac)
-    moe_ac.reset_prev(NUM_ENVS, gs.device)
+    #moe_ac = torch.compile(moe_ac)
 
     # install into PPO (re-use PPO's optimizer machinery)
     policy_alg.actor_critic = moe_ac
