@@ -13,7 +13,7 @@ from rsl_rl.modules import EmpiricalNormalization
 
 from Pretrain.dataset import TrajectoryDataset
 from Pretrain.utils import build_edge_index
-from Pretrain.go2_env import Go2Env
+from Pretrain.go2_env_icm import Go2Env
 
 class ImitationModule:
     def __init__(self, model, rl_cfg:DictConfig, cfg: DictConfig):
@@ -21,7 +21,7 @@ class ImitationModule:
         self.agent = self.vae.agent
         self.cfg = cfg
         self.rl_config = rl_cfg
-        gs.init(theme="light", logging_level="warning")
+        #gs.init(theme="light", logging_level="warning")
         self.env = Go2Env(
             num_envs=1,
             env_cfg=self.rl_config.env,

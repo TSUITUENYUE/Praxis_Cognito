@@ -183,6 +183,28 @@ class IntentionVAE(nn.Module):
         self.control_dt = self.cfg.env.dt
         self.K = max(1, int(round(self.dt / self.control_dt)))
         self.surrogate = SurrogateDynamics(self.joint_dim,self.object_dim,hidden_dim,self.dt,self.agent)
+        # cache end-effector indices (Python list) to avoid per-step host sync
+        try:
+            self.ee_idx = [int(i) for i in self.agent.end_effector.tolist()]
+        except Exception:
+            self.ee_idx = []
+
+        # Hoisted constants/buffers to reduce per-step allocations
+        dev = self.pos_mean.device
+        self.register_buffer("g_world_down", torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=dev))
+        self.register_buffer("z_world_up", torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=dev))
+        self.register_buffer("x_body_axis", torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=dev))
+
+        # Per-DOF PD gains as buffers (shape [1,d])
+        def _per_dof(val, d, device):
+            t = torch.as_tensor(val, dtype=torch.float32, device=device)
+            if t.ndim == 0:
+                t = t.repeat(d)
+            assert t.numel() == d, "kp/kd must be scalar or per-DOF list"
+            return t.view(1, d)
+
+        self.register_buffer("kp_dof", _per_dof(self.kp, self.joint_dim, dev))
+        self.register_buffer("kd_dof", _per_dof(self.kd, self.joint_dim, dev))
 
 
     # ---------- Latent sampling ----------
@@ -247,9 +269,9 @@ class IntentionVAE(nn.Module):
         dev = q.device
         B, d = q.shape
 
-        # gains: allow scalar or per-DOF in self.env_cfg["kp"], ["kd"]
-        kp = self._expand_to_dof(self.kp, d, dev).expand(B, d)
-        kv = self._expand_to_dof(self.kd, d, dev).expand(B, d)
+        # gains from cached per-DOF buffers
+        kp = self.kp_dof.expand(B, d)
+        kv = self.kd_dof.expand(B, d)
 
         if dq_des is None:
             dq_des = torch.zeros_like(dq)
@@ -314,21 +336,45 @@ class IntentionVAE(nn.Module):
         inv_q_next = inv_quat(w_next)
         base_lin_vel = transform_by_quat(dp_next, inv_q_next)
         base_ang_vel = transform_by_quat(dw_next, inv_q_next)
-        g_world = torch.tensor([0.0, 0.0, -1.0], device=dev, dtype=q_t.dtype).expand(B, 3)
+        g_world = self.g_world_down.to(device=dev, dtype=q_t.dtype).expand(B, 3)
         proj_g = transform_by_quat(g_world, inv_q_next)
         relative_ball_pos = transform_by_quat(u_next - p_next, inv_q_next)
         relative_ball_vel = transform_by_quat(du_next - dp_next, inv_q_next)
 
+        # --- Base height (world z) ---
+        base_height = p_next[:, 2:3]
+
+        # --- Contact flags via surrogate dynamics (per end-effector) ---
+        # Approximate contact using signed distance of EE link-spheres to ground (z - radius).
+        # Gate with a sigmoid and threshold to obtain binary flags, matching env format.
+        with torch.no_grad():
+            link_pos_base = self.surrogate.fk(q_next).view(B, -1, 3)  # [B,L,3] in BASE frame
+            # rotate to WORLD and translate by base position
+            L = link_pos_base.shape[1]
+            link_flat = link_pos_base.reshape(B * L, 3)
+            quat_rep = w_next.repeat_interleave(L, dim=0)
+            link_world_flat = transform_by_quat(link_flat, quat_rep)
+            link_pos_world = link_world_flat.view(B, L, 3) + p_next.view(B, 1, 3)
+
+            ee_idx = self.ee_idx
+            z_world_ee = link_pos_world[:, ee_idx, 2]  # [B, E]
+            radii_ee = self.surrogate.link_bsphere_radius[ee_idx].view(1, -1).to(z_world_ee.device)
+            sdf_ee = z_world_ee - radii_ee  # >0 above ground, <0 penetrating
+            prob_ee = torch.sigmoid(-sdf_ee / max(1e-6, float(self.surrogate.sdf_tau)))
+            contact_flags = (prob_ee > 0.5).to(z_world_ee.dtype)  # [B, E] as float
+
         obs_pred = torch.cat([
-            cmd * self.command_scale, #16
+            cmd * self.command_scale,  # commands
             base_lin_vel * self.cfg.obs.obs_scales["lin_vel"],  # 3
             base_ang_vel * self.cfg.obs.obs_scales["ang_vel"],  # 3
             proj_g,  # 3
+            base_height,  # 1 (inserted to match env format)
             (q_next - self.default_dof_pos) * self.cfg.obs.obs_scales["dof_pos"],  # d
             dq_next * self.cfg.obs.obs_scales["dof_vel"],  # d
             exec_actions_last,  # d
-            relative_ball_pos,
-            relative_ball_vel
+            contact_flags,  # E contact flags to mirror env (e.g., 4 feet)
+            relative_ball_pos,  # 3
+            relative_ball_vel  # 3
         ], dim=-1)
 
         # bookkeeping for next call
@@ -382,19 +428,13 @@ class IntentionVAE(nn.Module):
         # Pre-normalize teacher observations ONCE (for decoder conditioning)
         obs_tf_n_all = normalizer(obs_in_seq)  # [B,T,obs_dim]
 
-        # -------- Preallocate outputs (do NOT clobber obs_in_seq) --------
-        actions_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_dtype)
-        mu_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_dtype)
-        log_std_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_dtype)
-        joints_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_dtype)
-        dq_seq = torch.empty(B, T, self.joint_dim, device=dev, dtype=obs_dtype)
-        w_seq = torch.empty(B, T, 4, device=dev, dtype=obs_dtype)  # reconstructed base quat
-        dw_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)
-        p_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)  # reconstructed base quat
-        dp_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)
-        obs_seq = torch.empty(B, T, self.obs_dim, device=dev, dtype=obs_dtype)  # OUTPUT buffer
-        objects_seq = torch.empty(B, T, 3, device=dev, dtype=obs_dtype)  # store object POS(3) for recon
-        log_sig_seq = torch.empty(B, T, (self.agent.fk_model.num_links + 1) * 3, device=dev, dtype=obs_dtype)
+        # -------- Collect outputs per-timestep, stack once at the end --------
+        actions_list, mu_list, log_std_list = [], [], []
+        joints_list, dq_list = [], []
+        w_list, dw_list = [], []
+        p_list, dp_list = [], []
+        obs_list, objects_list = [], []
+        log_sig_list = []
 
         def _quat_from_g(proj_g: torch.Tensor) -> torch.Tensor:
             """
@@ -406,8 +446,8 @@ class IntentionVAE(nn.Module):
             dev = proj_g.device
             dtype = proj_g.dtype
 
-            # World up/down
-            z_w = torch.tensor([0.0, 0.0, 1.0], device=dev, dtype=dtype).expand(B, 3)
+            # World up/down from buffer
+            z_w = self.z_world_up.to(device=dev, dtype=dtype).expand(B, 3)
 
             # Body 'up' unit vector in *body* frame (opposite gravity)
             a = -proj_g / (proj_g.norm(dim=-1, keepdim=True) + eps)  # [B,3]
@@ -423,7 +463,7 @@ class IntentionVAE(nn.Module):
             q_align = q_align / (q_align.norm(dim=-1, keepdim=True) + eps)
 
             # Resolve the free yaw: make body x-axis align with world x after rotation
-            x_b = torch.tensor([1.0, 0.0, 0.0], device=dev, dtype=dtype).expand(B, 3)
+            x_b = self.x_body_axis.to(device=dev, dtype=dtype).expand(B, 3)
             x0_w = transform_by_quat(x_b, q_align)  # [B,3]
             phi = torch.atan2(x0_w[:, 1], x0_w[:, 0])  # yaw of x0_w
             half = -0.5 * phi
@@ -440,8 +480,12 @@ class IntentionVAE(nn.Module):
         dq_prev = dq[:, 0, :].to(dev)  # [B,d]
         p_prev = p[:, 0, :].to(dev)  # [B,3]
         dp_prev = dp[:, 0, :].to(dev)  # [B,3]
-        # reconstruct w_prev from projected gravity in obs_in_seq[:,0,6:9]
-        g0 = obs_in_seq[:, 0, 6:9].to(dev)  # [B,3] projected gravity at t=0
+        # reconstruct w_prev from projected gravity; gravity starts after [cmd(C), lin(3), ang(3)]
+        cmd_dim = getattr(self.decoder, "num_cmd", None)
+        if cmd_dim is None:
+            cmd_dim = int(self.cfg.command.get("num_commands", 16))
+        grav_start = cmd_dim + 6
+        g0 = obs_in_seq[:, 0, grav_start:grav_start + 3].to(dev)  # [B,3] projected gravity at t=0
         w_prev = _quat_from_g(g0)  # [B,4]
         dw_prev = dw[:, 0, :].to(dev)  # [B,3]
         u_prev = u[:, 0, :].to(dev)  # [B,3]
@@ -463,7 +507,7 @@ class IntentionVAE(nn.Module):
                 p_teacher = p[:, t, :]
                 dp_teacher = dp[:, t, :]
                 # reconstruct w_teacher from obs_in_seq gravity at time t
-                g_t = obs_in_seq[:, t, 6:9].to(dev)
+                g_t = obs_in_seq[:, t, grav_start:grav_start + 3].to(dev)
                 w_teacher = _quat_from_g(g_t)
                 dw_teacher = dw[:, t, :]
                 u_teacher = u[:, t, :]
@@ -483,7 +527,7 @@ class IntentionVAE(nn.Module):
                 q_in, dq_in = q_prev, dq_prev
                 p_in, dp_in = p_prev, dp_prev
                 # reconstruct current w_in from current obs_prev gravity (consistent)
-                g_cur = obs_in_seq[:, t, 6:9].to(dev)
+                g_cur = obs_in_seq[:, t, grav_start:grav_start + 3].to(dev)
                 w_in = _quat_from_g(g_cur)
                 dw_in = dw_prev
                 u_in, du_in = u_prev, du_prev
@@ -515,18 +559,18 @@ class IntentionVAE(nn.Module):
             obs_next = m * obs_pred + (1.0 - m) * obs_prev
 
             # ----- Store step outputs -----
-            _store_col(actions_seq, t, m * action_t)
-            _store_col(mu_seq, t, mu_t)
-            _store_col(log_std_seq, t, log_std_t)
-            _store_col(joints_seq, t, q_next)
-            _store_col(dq_seq, t, dq_next)
-            _store_col(w_seq, t, w_next)
-            _store_col(dw_seq, t, dw_next)
-            _store_col(p_seq, t, p_next)
-            _store_col(dp_seq, t, dp_next)
-            _store_col(objects_seq, t, u_next)  # u has shape 3; no slicing
-            _store_col(obs_seq, t, obs_next)
-            _store_col(log_sig_seq, t, log_sig_t)
+            actions_list.append(m * action_t)
+            mu_list.append(mu_t)
+            log_std_list.append(log_std_t)
+            joints_list.append(q_next)
+            dq_list.append(dq_next)
+            w_list.append(w_next)
+            dw_list.append(dw_next)
+            p_list.append(p_next)
+            dp_list.append(dp_next)
+            objects_list.append(u_next)
+            obs_list.append(obs_next)
+            log_sig_list.append(log_sig_t)
 
             # ----- Advance recurrent state -----
             q_prev, dq_prev = q_next, dq_next
@@ -536,6 +580,18 @@ class IntentionVAE(nn.Module):
             obs_prev = obs_next
 
         # ----- FK + normalization → recon_traj -----
+        # Stack along time once to reduce per-step copies
+        joints_seq = torch.stack(joints_list, dim=1)
+        dq_seq = torch.stack(dq_list, dim=1)
+        w_seq = torch.stack(w_list, dim=1)
+        dw_seq = torch.stack(dw_list, dim=1)
+        p_seq = torch.stack(p_list, dim=1)
+        dp_seq = torch.stack(dp_list, dim=1)
+        obs_seq = torch.stack(obs_list, dim=1)
+        objects_seq = torch.stack(objects_list, dim=1)
+        log_sig_seq = torch.stack(log_sig_list, dim=1)
+        actions_seq = torch.stack(actions_list, dim=1)
+
         B, T, d = joints_seq.shape
         joint_flat = joints_seq.reshape(B * T, d)  # [B*T, d]
         pos_flat = self.decoder.fk_model(joint_flat)  # [B*T, links*3]
@@ -671,4 +727,3 @@ class IntentionVAE(nn.Module):
 
         vae_loss = total_recon + beta * kl_loss
         return vae_loss, pose_loss, action_loss, kl_loss
-

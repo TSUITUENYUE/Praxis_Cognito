@@ -60,18 +60,18 @@ rl:
     base_height_target: 0.3
     feet_height_target: 0.075
     reward_scales:
-      tracking_lin_vel: 1.0
-      tracking_ang_vel: 0.2
+      tracking_lin_vel: 0.0
+      tracking_ang_vel: 0.0
       tracking_body_pose: 0.0
       tracking_limb_vel: 0.0
       tracking_contact_hold: 0.0
       tracking_hop: 0.0
 
-      lin_vel_z: -1.0
-      base_height: -50.0
-      action_rate: -0.005
+      lin_vel_z: 0.0
+      base_height: 0.0
+      action_rate: 0.0
       similar_to_default: -0.1
-      upright: 2.0
+      upright: 0.0
 
   command:
     num_commands: 16
@@ -138,19 +138,20 @@ rl:
     save_interval: 100
     empirical_normalization: null
     seed: 1
+    log_dir: "Pretrain/primitives"
 
 
 
 
 dataset:
-  num_envs: 25000
+  num_envs: 20000
   #num_envs: 32768
   episodes: 150000
   max_episode_seconds: 3
   frame_rate: 25
-
+  preview: true
   log_dir: "Pretrain/primitives"
-  curiosity_beta: 0.1
+  curiosity_beta: 0.2
   policy_hidden_dim: 256
   similarity_threshold: 0.6
   downsample_factor: 5
@@ -171,7 +172,7 @@ model:
     hidden_features: 128
     num_layers: 2
     rnn_hidden: 128
-    latent_dim: 64
+    latent_dim: 4
     seq_len: ${mul:${dataset.max_episode_seconds},${dataset.frame_rate}}
     hidden_dim: 128
   res_rl: {}
@@ -181,7 +182,7 @@ trainer:
   load_path: "./Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}.h5"
   processed_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/preprocess.h5'
   normalizer_path: './Pretrain/data/${agent.name}/${dataset.num_envs} ${dataset.episodes} ${dataset.max_episode_seconds} ${dataset.frame_rate}/normalizers.pt'
-  batch_size: 256
+  batch_size: 512
   device: 'cuda'
   num_epochs: 4
   optimizer:

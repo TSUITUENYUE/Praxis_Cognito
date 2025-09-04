@@ -93,12 +93,15 @@ def generate(cfg: DictConfig):
 
     gs.init(logging_level='warning')
 
-    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.00}
+    #cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.00}
     agent = Agent(**cfg.agent)
+    # Preview: optionally open Genesis viewer and render only one env during data generation.
+    # Enable by setting cfg.dataset.preview: true (defaults to False if missing).
+    preview = bool(getattr(cfg.dataset, 'preview', False))
     env = Go2Env(
         num_envs=NUM_ENVS,
         env_cfg=cfg.rl.env, obs_cfg=cfg.rl.obs, reward_cfg=cfg.rl.reward, command_cfg=cfg.rl.command,
-        show_viewer=NUM_ENVS < 128,
+        show_viewer=(preview or (NUM_ENVS < 128)),
         agent=agent
     )
     train_cfg = OmegaConf.to_container(cfg.rl.train, resolve=True)
@@ -215,8 +218,14 @@ def generate(cfg: DictConfig):
 
     done_traj_buffer      = torch.zeros((max_episode_len, NUM_ENVS), dtype=torch.bool, device=gs.device)
 
-    # >>> DEDUP EMBEDDING BACK TO JOINTS-ONLY <<<
-    embedding_dim = (max_episode_len // DOWNSAMPLE_FACTOR) * (n_dofs + 2 * 3)
+    # >>> DEDUP EMBEDDING: joints + base_vel + base_ang + contact_flags + ball_rel(pos, vel) <<<
+    # Time-downsampled timesteps per episode
+    _Tds = (max_episode_len // DOWNSAMPLE_FACTOR)
+    # env.num_commands used for slicing observation buffer later
+    cmd_dim = env.num_commands
+    # Per-timestep feature dims included in dedup embedding
+    _per_step_dim = (n_dofs + 3 + 3 + 4 + 3 + 3)  # joints + base_vel + base_ang + contact + ball_pos + ball_vel
+    embedding_dim = _Tds * _per_step_dim
     res = faiss.StandardGpuResources()
     faiss_index = faiss.GpuIndexFlatIP(res, embedding_dim)
 
@@ -352,7 +361,7 @@ def generate(cfg: DictConfig):
 
                     reward_normalizer.update(intrinsic_reward.unsqueeze(-1))
                     intrinsic_reward /= torch.sqrt(reward_normalizer.var + reward_normalizer.epsilon)
-                    total_reward = rews + intrinsic_reward * CURIOSITY_BETA
+                    total_reward =  rews + intrinsic_reward * CURIOSITY_BETA
 
                     policy_alg.process_env_step(total_reward, dones, infos)
 
@@ -460,23 +469,43 @@ def generate(cfg: DictConfig):
             base_vel_dsmp = base_vel_batch[:, ::DOWNSAMPLE_FACTOR, :]
             base_ang_dsmp = base_ang_batch[:, ::DOWNSAMPLE_FACTOR, :]
 
+            # Slice raw contact flags and ball rel state directly from obs (use same downsampling)
+            A = output_dim  # num_actions
+            C = cmd_dim     # num_commands
+            # Offsets: commands(C), lin(3), ang(3), proj_g(3), base_h(1) => +10
+            base_off = C + 10 + 3 * A
+            contact_dsmp = obs_batch[:, ::DOWNSAMPLE_FACTOR, base_off : base_off + 4]
+            ball_pos_dsmp = obs_batch[:, ::DOWNSAMPLE_FACTOR, base_off + 4 : base_off + 7]
+            ball_vel_dsmp = obs_batch[:, ::DOWNSAMPLE_FACTOR, base_off + 7 : base_off + 10]
+
             # Flatten per episode
             J = dof_pos_dsmp.reshape(NUM_ENVS, -1)
             V = base_vel_dsmp.reshape(NUM_ENVS, -1)
             W = base_ang_dsmp.reshape(NUM_ENVS, -1)
+            CF = contact_dsmp.reshape(NUM_ENVS, -1)
+            BP = ball_pos_dsmp.reshape(NUM_ENVS, -1)
+            BV = ball_vel_dsmp.reshape(NUM_ENVS, -1)
 
             faiss.normalize_L2(J)
             faiss.normalize_L2(V)
             faiss.normalize_L2(W)
 
-            new_embeddings = np.concatenate([J, V, W],axis=1)
+            new_embeddings = np.concatenate([J, V, W, CF, BP, BV], axis=1)
             faiss.normalize_L2(new_embeddings)  # IMPORTANT: normalize after concat
 
             if faiss_index.ntotal == 0:
                 unique_indices = np.arange(len(new_embeddings))
             else:
                 D, I = faiss_index.search(x=new_embeddings, k=1)
-                is_unique_mask = D[:, 0] < SIMILARITY_THRESHOLD
+                # FAISS threshold scheduling: permissive early, stricter as index grows
+                ntotal = faiss_index.ntotal
+                if ntotal < EPISODES_TO_COLLECT // 5:
+                    tau = float(SIMILARITY_THRESHOLD) + 0.10
+                elif ntotal < EPISODES_TO_COLLECT // 2:
+                    tau = float(SIMILARITY_THRESHOLD) + 0.05
+                else:
+                    tau = float(SIMILARITY_THRESHOLD)
+                is_unique_mask = D[:, 0] < tau
                 unique_indices = np.where(is_unique_mask)[0]
 
             if unique_indices.size > 0:
