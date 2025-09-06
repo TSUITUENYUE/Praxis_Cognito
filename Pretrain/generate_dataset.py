@@ -93,7 +93,7 @@ def generate(cfg: DictConfig):
 
     gs.init(logging_level='warning')
 
-    #cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.00}
+    #cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0}
     agent = Agent(**cfg.agent)
     # Preview: optionally open Genesis viewer and render only one env during data generation.
     # Enable by setting cfg.dataset.preview: true (defaults to False if missing).
@@ -125,8 +125,8 @@ def generate(cfg: DictConfig):
     #runner.load(primitives)
     policy_alg = runner.alg  # PPO instance to keep your storage/updates pipeline
     # command range tensors for scaling/normalization injection
-    experts_ac = [ex.actor_critic for ex in experts]  # <-- ActorCritic modules
 
+    experts_ac = [ex.actor_critic for ex in experts]  # <-- ActorCritic modules
     # build masks [K, C]; example for 5 primitives (locomote, bodypose, hop, swing, contacthold)
     # shape must match env.num_commands (C=16 per your config)
     C = env.num_commands
@@ -169,7 +169,7 @@ def generate(cfg: DictConfig):
         cmd_masks=cmd_masks,
         gate_hidden=[256, 256],
         activation="elu",
-        topk=2,
+        topk=1,
         stickiness=0.85,
         obs_norm=runner.obs_normalizer,  # ok if Identity; code guards it
         init_noise_std=cfg.rl.train.algorithm.get("init_noise_std", 1.0),
@@ -319,6 +319,7 @@ def generate(cfg: DictConfig):
             action_std = 0.0
 
             first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)
+            env.reset()
             for t in range(max_episode_len):
                 # ================== ROLLOUT (no autograd, AMP for speed) ==================
                 with torch.no_grad():

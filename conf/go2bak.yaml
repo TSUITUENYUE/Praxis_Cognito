@@ -149,7 +149,7 @@ dataset:
   episodes: 150000
   max_episode_seconds: 3
   frame_rate: 25
-  preview: true
+  preview: false
   log_dir: "Pretrain/primitives"
   curiosity_beta: 0.2
   policy_hidden_dim: 256
