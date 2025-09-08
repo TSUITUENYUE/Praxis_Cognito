@@ -146,12 +146,12 @@ rl:
 dataset:
   num_envs: 20000
   #num_envs: 32768
-  episodes: 150000
+  episodes: 40000
   max_episode_seconds: 3
   frame_rate: 25
-  preview: false
+  preview: true
   log_dir: "Pretrain/primitives"
-  curiosity_beta: 0.2
+  curiosity_beta: 0.5
   policy_hidden_dim: 256
   similarity_threshold: 0.6
   downsample_factor: 5

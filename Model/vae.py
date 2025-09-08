@@ -14,7 +14,7 @@ import genesis as gs
 from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder, DecoderMoE
 from .sd import SurrogateDynamics
-
+from Pretrain.utils import build_soft_masks_from_sigma
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -422,7 +422,7 @@ class IntentionVAE(nn.Module):
             mu, logvar, pi_logits = self.encoder(x, edge_index, mask)  # mu/logvar: [B,K,D], pi: [B,K]
             z = self.reparameterize_gmm(mu, logvar, pi_logits, self.training)  # [B,D]
         else:
-            mu, logvar = self.encoder(x, edge_index, mask)  # [B,D]
+            mu, logvar, ptr = self.encoder(x, edge_index, mask)  # [B,D]
             z = self.reparameterize_gaussian(mu, logvar)  # [B,D]
 
         # Pre-normalize teacher observations ONCE (for decoder conditioning)
@@ -605,7 +605,8 @@ class IntentionVAE(nn.Module):
         action_seq = actions_seq
         if self.prior == "GMM":
             return {"traj":
-                        {"graph": graph_recon},
+                        {"graph": graph_recon,
+                          "ptr": ptr,},
                     "state":
                         {"q": joints_seq,
                          "dq": dq_seq,
@@ -616,8 +617,8 @@ class IntentionVAE(nn.Module):
                          "u": objects_seq,},
                     "act":
                         {"act": action_seq,
-                         "mu": mu_seq,
-                         "log_std": log_std_seq,
+                         "mu": 0,
+                         "log_std": 0,
                          "log_sigma": log_sig_seq},
                     "obs":
                         {"obs": obs_seq},
@@ -626,7 +627,8 @@ class IntentionVAE(nn.Module):
                     }
         else:
             return {"traj":
-                        {"graph": graph_recon},
+                        {"graph": graph_recon,
+                        "ptr": ptr,},
                     "state":
                         {"q": joints_seq,
                          "dq": dq_seq,
@@ -636,8 +638,8 @@ class IntentionVAE(nn.Module):
                          "dw": dw_seq},
                     "act":
                         {"act": action_seq,
-                         "mu": mu_seq,
-                         "log_std": log_std_seq,
+                         "mu": 0,
+                         "log_std": 0,
                          "log_sigma": log_sig_seq},
                     "obs":
                         {"obs": obs_seq},

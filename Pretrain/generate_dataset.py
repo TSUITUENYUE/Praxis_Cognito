@@ -16,6 +16,148 @@ from torch.cuda.amp import autocast, GradScaler  # <-- AMP
 from pathlib import Path
 import copy
 
+# ---------- Option Scheduler (semi-MDP layer) ----------
+class OptionScheduler:
+    """
+    A minimal, vectorized scheduler that converts per-step MoE commands in [0,1]
+    into scheduled commands with primitive lifecycles (Idle→Active→Cooldown).
+    It persists long-horizon base channels and triggers short event channels
+    opportunistically based on the raw command magnitude.
+
+    Channel layout (indices, 0-based):
+      Base (persistent): locomotion [0,1,2], body pose [3,4,5]
+      Events (brief):    swing-EE   [6,7,8,9], contact-hold [10,11,12]
+      Hop (brief):       hop        [13,14,15]
+    """
+    def __init__(self, num_envs: int, cmd_dim: int, device, dtype):
+        assert cmd_dim >= 16, "OptionScheduler expects 16 command dims"
+        self.num_envs = num_envs
+        self.cmd_dim = cmd_dim
+
+        # Indices for groups
+        self.idx_base = torch.tensor([0,1,2,3,4,5], device=device)
+        self.idx_swing = torch.tensor([6,7,8,9], device=device)
+        self.idx_hold = torch.tensor([10,11,12], device=device)
+        self.idx_hop = torch.tensor([13,14,15], device=device)
+
+        # Per-env state
+        self.base_active = torch.ones(num_envs, device=device, dtype=torch.bool)
+        self.base_ttl = torch.zeros(num_envs, device=device, dtype=torch.int32)
+        self.base_cmd = torch.zeros(num_envs, self.idx_base.numel(), device=device, dtype=dtype)
+
+        self.swing_active = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        self.swing_ttl = torch.zeros(num_envs, device=device, dtype=torch.int32)
+        self.swing_cmd = torch.zeros(num_envs, self.idx_swing.numel(), device=device, dtype=dtype)
+
+        self.hold_active = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        self.hold_ttl = torch.zeros(num_envs, device=device, dtype=torch.int32)
+        self.hold_cmd = torch.zeros(num_envs, self.idx_hold.numel(), device=device, dtype=dtype)
+
+        self.hop_active = torch.zeros(num_envs, device=device, dtype=torch.bool)
+        self.hop_ttl = torch.zeros(num_envs, device=device, dtype=torch.int32)
+        self.hop_cmd = torch.zeros(num_envs, self.idx_hop.numel(), device=device, dtype=dtype)
+
+        # TTL ranges (in steps)
+        self.rng = torch.Generator(device=device)
+        self.base_ttl_range = (50, 150)     # ~1–3 s @ 20 ms
+        self.swing_ttl_range = (6, 15)      # ~120–300 ms
+        self.hold_ttl_range = (5, 12)       # ~100–240 ms
+        self.hop_ttl_range = (15, 30)       # ~300–600 ms
+
+        # Trigger thresholds (norm on raw subvector)
+        self.trig_thr_swing = 0.15
+        self.trig_thr_hold  = 0.15
+        self.trig_thr_hop   = 0.15
+
+        # Initialize base immediately with a TTL so it persists from step 0
+        self._resample_ttl(self.base_ttl, self.base_ttl_range)
+
+    def _resample_ttl(self, ttl_tensor: torch.Tensor, ttl_range):
+        low, high = ttl_range
+        # randint is [low, high), so add 1 to include high
+        ttl_tensor.copy_(torch.randint(low, high + 1, (self.num_envs,), generator=self.rng, device=ttl_tensor.device))
+
+    @torch.no_grad()
+    def step(self, raw_cmd01: torch.Tensor) -> torch.Tensor:
+        """
+        raw_cmd01: [N, C] in [0,1]
+        returns scheduled_cmd01: [N, C] in [0,1]
+        """
+        N, C = raw_cmd01.shape
+        assert N == self.num_envs and C == self.cmd_dim
+
+        out = torch.zeros_like(raw_cmd01)
+
+        # ---- BASE (persistent over TTL) ----
+        # decrement ttl; where expired, refresh and adopt new base command
+        self.base_ttl.sub_(1)
+        expired = self.base_ttl <= 0
+        if torch.any(expired):
+            self.base_cmd[expired] = raw_cmd01.index_select(1, self.idx_base)[expired]
+            self._resample_ttl(self.base_ttl, self.base_ttl_range)
+        # always output held base cmd
+        out[:, self.idx_base] = self.base_cmd
+
+        # ---- SWING event (brief) ----
+        # decrement active ttl
+        self.swing_ttl.sub_(self.swing_active.to(self.swing_ttl.dtype))
+        ended = (self.swing_active & (self.swing_ttl <= 0))
+        if torch.any(ended):
+            self.swing_active[ended] = False
+
+        # consider triggers for inactive envs
+        inactive = ~self.swing_active
+        if torch.any(inactive):
+            swing_raw = raw_cmd01.index_select(1, self.idx_swing)
+            trig = (swing_raw.pow(2).sum(dim=1).sqrt() > self.trig_thr_swing) & inactive
+            if torch.any(trig):
+                self.swing_cmd[trig] = swing_raw[trig]
+                self._resample_ttl(self.swing_ttl, self.swing_ttl_range)
+                self.swing_active[trig] = True
+
+        # output if active
+        if torch.any(self.swing_active):
+            out[self.swing_active][:, self.idx_swing] = self.swing_cmd[self.swing_active]
+
+        # ---- HOLD event (brief) ----
+        self.hold_ttl.sub_(self.hold_active.to(self.hold_ttl.dtype))
+        ended = (self.hold_active & (self.hold_ttl <= 0))
+        if torch.any(ended):
+            self.hold_active[ended] = False
+
+        inactive = ~self.hold_active
+        if torch.any(inactive):
+            hold_raw = raw_cmd01.index_select(1, self.idx_hold)
+            trig = (hold_raw.pow(2).sum(dim=1).sqrt() > self.trig_thr_hold) & inactive
+            if torch.any(trig):
+                self.hold_cmd[trig] = hold_raw[trig]
+                self._resample_ttl(self.hold_ttl, self.hold_ttl_range)
+                self.hold_active[trig] = True
+
+        if torch.any(self.hold_active):
+            out[self.hold_active][:, self.idx_hold] = self.hold_cmd[self.hold_active]
+
+        # ---- HOP event (brief) ----
+        self.hop_ttl.sub_(self.hop_active.to(self.hop_ttl.dtype))
+        ended = (self.hop_active & (self.hop_ttl <= 0))
+        if torch.any(ended):
+            self.hop_active[ended] = False
+
+        inactive = ~self.hop_active
+        if torch.any(inactive):
+            hop_raw = raw_cmd01.index_select(1, self.idx_hop)
+            trig = (hop_raw.pow(2).sum(dim=1).sqrt() > self.trig_thr_hop) & inactive
+            if torch.any(trig):
+                self.hop_cmd[trig] = hop_raw[trig]
+                self._resample_ttl(self.hop_ttl, self.hop_ttl_range)
+                self.hop_active[trig] = True
+
+        if torch.any(self.hop_active):
+            out[self.hop_active][:, self.idx_hop] = self.hop_cmd[self.hop_active]
+
+        return out
+
+
 class RunningMeanStd:
     def __init__(self, shape, epsilon=1e-4, device='cuda'):
         self.mean = torch.zeros(shape, device=device)
@@ -93,7 +235,7 @@ def generate(cfg: DictConfig):
 
     gs.init(logging_level='warning')
 
-    #cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0}
+    cfg.rl.reward["reward_scales"] = {"survive": 1.0, "termination": -200.0, "ball_motion_mag": 0.00}
     agent = Agent(**cfg.agent)
     # Preview: optionally open Genesis viewer and render only one env during data generation.
     # Enable by setting cfg.dataset.preview: true (defaults to False if missing).
@@ -104,6 +246,8 @@ def generate(cfg: DictConfig):
         show_viewer=(preview or (NUM_ENVS < 128)),
         agent=agent
     )
+        # Option Scheduler: persist base & trigger brief events
+    option_scheduler = OptionScheduler(env.num_envs, env.num_commands, device=env.commands.device, dtype=env.commands.dtype)
     train_cfg = OmegaConf.to_container(cfg.rl.train, resolve=True)
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
 
@@ -125,8 +269,8 @@ def generate(cfg: DictConfig):
     #runner.load(primitives)
     policy_alg = runner.alg  # PPO instance to keep your storage/updates pipeline
     # command range tensors for scaling/normalization injection
-
     experts_ac = [ex.actor_critic for ex in experts]  # <-- ActorCritic modules
+    # experts_ac = [experts[0].actor_critic]
     # build masks [K, C]; example for 5 primitives (locomote, bodypose, hop, swing, contacthold)
     # shape must match env.num_commands (C=16 per your config)
     C = env.num_commands
@@ -319,7 +463,6 @@ def generate(cfg: DictConfig):
             action_std = 0.0
 
             first_done_seen = torch.full((NUM_ENVS,), fill_value=max_episode_len, dtype=torch.int32, device=gs.device)
-            env.reset()
             for t in range(max_episode_len):
                 # ================== ROLLOUT (no autograd, AMP for speed) ==================
                 with torch.no_grad():
@@ -327,7 +470,8 @@ def generate(cfg: DictConfig):
 
 
                     raw_act = policy_alg.act(obs_n, critic_obs_n)
-                    env.set_commands(policy_alg.actor_critic.last_cmd01)
+                    env.set_commands(option_scheduler.step(policy_alg.actor_critic.last_cmd01))
+                    #print(policy_alg.actor_critic.last_cmd01.mean())
                     act = torch.clamp(raw_act, -100.0, 100.0)   # executed action
                     act_traj_buffer[t] = act
 
@@ -397,7 +541,8 @@ def generate(cfg: DictConfig):
                             # AMP-scaled ICM update
                             with autocast(enabled=torch.cuda.is_available()):
                                 f_loss, i_loss = icm(norm_batch_states, norm_batch_act, norm_batch_next_states)
-                                icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
+                                #icm_loss = 0.2 * f_loss.mean() + 0.8 * i_loss.mean()
+                                icm_loss = 0.7 * f_loss.mean() + 0.3 * i_loss.mean()
                             icm_optimizer.zero_grad(set_to_none=True)
                             scaler.scale(icm_loss).backward()
                             scaler.step(icm_optimizer)
@@ -581,7 +726,7 @@ def generate(cfg: DictConfig):
                     valid_len_save_buffer = []
                     episodes_since_last_save = 0
 
-            print(f"  ...Collected: {total_episodes_saved}/{EPISODES_TO_COLLECT} | PPO Loss: {mean_surrogate_loss:.3f} "
+            print(f"  ...Collected: {total_episodes_saved + episodes_since_last_save} /{EPISODES_TO_COLLECT} | PPO Loss: {mean_surrogate_loss:.3f} "
                   f"| Fwd Loss: {f_loss.mean().item():.3f} | Inv Loss: {i_loss.mean().item():.3f} "
                   f"| Action Mean: {action_mean:.3f} | Action Std: {action_std:.3f}")
 

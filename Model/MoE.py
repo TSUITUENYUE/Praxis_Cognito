@@ -39,7 +39,7 @@ class MoEActorCritic(ActorCritic):
         stickiness: float = 0.85,            # EMA on routing weights (0..1)
         hysteresis: float = 0.5,             # margin (logit units) to keep an active expert
         dwell_min: int | List[int] = 6,      # min consecutive steps per expert
-        cmd_stickiness: float = 0.9,         # EMA on commands (shared & per-expert)
+        cmd_stickiness: float = 0.5,         # EMA on commands (shared & per-expert)
         obs_norm=None,
         # base ActorCritic kwargs
         actor_hidden_dims=[256, 256, 256],
@@ -287,7 +287,11 @@ class MoEActorCritic(ActorCritic):
 
     @torch.no_grad()
     def act_inference(self, observations: torch.Tensor):
-        mu_mix, _, _, _ = self._mixture_mean(observations)
+        mu_mix, w, cmd01_sh, cmd01_k = self._mixture_mean(observations)
+        # keep these three in sync with update_distribution
+        self.last_cmd01 = cmd01_sh.detach()
+        self.last_cmd01_k = cmd01_k.detach()
+        self.last_gate_w = w.detach()
         return mu_mix
 
     def evaluate(self, critic_observations: torch.Tensor, **kwargs):
