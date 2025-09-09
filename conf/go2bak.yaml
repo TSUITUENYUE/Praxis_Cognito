@@ -146,22 +146,22 @@ rl:
 dataset:
   num_envs: 20000
   #num_envs: 32768
-  episodes: 40000
+  episodes: 150000
   max_episode_seconds: 3
   frame_rate: 25
   preview: true
   log_dir: "Pretrain/primitives"
   curiosity_beta: 0.5
   policy_hidden_dim: 256
-  similarity_threshold: 0.6
+  similarity_threshold: 0.7
   downsample_factor: 5
   write_buffer_size: 5000
   loss_beta: 0.2
 
 
   agent_pos: [ 0.0, 0.0, 0.42]
-  obj_pos_low: [ -0.5, -0.5, 0.0 ]
-  obj_pos_high: [ 0.5, 0.5, 1.0 ]
+  obj_pos_low: [ -0.1, -0.1, 0.0 ]
+  obj_pos_high: [ 0.1, 0.1, 0.2 ]
   obj_vel_low: [ -1.5, -1.5, -1.5 ]
   obj_vel_high: [ 1.5, 1.5, 1.5 ]
 

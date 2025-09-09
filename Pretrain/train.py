@@ -381,8 +381,8 @@ class Trainer:
                 self.scheduler.step()
 
                 # Reduce logging frequency to minimize host/device sync
-                log_every = 50
-                grad_log_every = 200
+                log_every = 1
+                grad_log_every = 10
 
                 if (global_step % log_every == 0) or (i == len(dataloader) - 1):
                     with torch.no_grad():

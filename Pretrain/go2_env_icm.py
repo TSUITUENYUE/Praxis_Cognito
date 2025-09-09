@@ -175,8 +175,8 @@ class Go2Env:
 
         # check termination and reset
         self.reset_buf = self.episode_length_buf > self.max_episode_length
-        self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
-        self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        #self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
+        #self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
 
         time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).reshape((-1,))
         self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
@@ -249,8 +249,8 @@ class Go2Env:
             return
 
         ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_pos[:, 0] = gs_rand_float(0.5, 1.5, (len(envs_idx),), gs.device)
-        ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
+        ball_pos[:, 0] = gs_rand_float(-0.25, 0.25, (len(envs_idx),), gs.device)
+        ball_pos[:, 1] = gs_rand_float(-0.25, 0.25, (len(envs_idx),), gs.device)
         ball_pos[:, 2] = gs_rand_float(0.0, 0.5, (len(envs_idx),), gs.device)
         self.ball.set_pos(ball_pos, envs_idx=envs_idx)
 
@@ -296,6 +296,7 @@ class Go2Env:
 
     def reset(self):
         self.reset_buf[:] = True
+        self.reset_idx(torch.arange(self.num_envs, device=gs.device))
 
         return self.obs_buf, self.extras
 
