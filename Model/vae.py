@@ -14,18 +14,14 @@ import genesis as gs
 from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder, DecoderMoE
 from .sd import SurrogateDynamics
-from Pretrain.utils import build_soft_masks_from_sigma
+from Pretrain.utils import build_soft_masks_from_sigma, infer_contact_pointer_from_inputs
+from Pretrain.util_class import TrajDiscriminator
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch._dynamo as dynamo
 from omegaconf import DictConfig, OmegaConf
-
-@dynamo.disable
-def _store_col(dst, t, src):
-    # identical effect to: dst[:, t].copy_(src)
-    dst[:, t].copy_(src)
 
 @dynamo.disable
 def _clamp_to_limits(x, lo, hi):
@@ -86,7 +82,7 @@ class IntentionVAE(nn.Module):
             self.register_buffer("prior_pi", torch.full((num_components,), 1.0 / num_components))
         else:  # Gaussian
             self.encoder = VanillaEncoder(
-                node_features, hidden_features, num_layers, rnn_hidden, latent_dim
+                node_features, hidden_features, num_layers, rnn_hidden, latent_dim, link_r=self.agent.link_bsphere_radius
             )
 
         # --- Decoder ---
@@ -183,6 +179,7 @@ class IntentionVAE(nn.Module):
         self.control_dt = self.cfg.env.dt
         self.K = max(1, int(round(self.dt / self.control_dt)))
         self.surrogate = SurrogateDynamics(self.joint_dim,self.object_dim,hidden_dim,self.dt,self.agent)
+        self.disc_post = TrajDiscriminator(in_dim=(self.agent.fk_model.num_links + 1) * 3 + self.latent_dim).to('cuda')
         # cache end-effector indices (Python list) to avoid per-step host sync
         try:
             self.ee_idx = [int(i) for i in self.agent.end_effector.tolist()]
@@ -230,18 +227,6 @@ class IntentionVAE(nn.Module):
         std = torch.exp(0.5 * logdu_sel)
         eps = torch.randn_like(std)
         return mu_sel + eps * std
-
-    # ---------- Heteroscedastic NLL (per-step) ----------
-    @staticmethod
-    def hetero_nll_per_step(x, mu, log_sigma):
-        """
-        x, mu, log_sigma: [B,T,D] in same (normalized) space.
-        Returns per-step NLL averaged over features: [B,T].
-        """
-        # per-element NLL
-        inv_var = torch.exp(-2.0 * log_sigma)     # 1/σ^2
-        elem = 0.5 * ((x - mu) ** 2) * inv_var + log_sigma + 0.5 * math.log(2 * math.pi)  # [B,T,D]
-        return elem.mean(dim=-1)  # [B,T]
 
     def _expand_to_dof(self, x, d, dev):
         """
@@ -399,7 +384,6 @@ class IntentionVAE(nn.Module):
             u,  # [B,T,3]
             du,  # [B,T,3]
             dv,  # [B,T,3]
-            tf_ratio: float = 1.0,
     ):
         """
         Returns (for both Gaussian and GMM priors):
@@ -497,40 +481,13 @@ class IntentionVAE(nn.Module):
         for t in range(T):
             mask_t = mask[:, t, :]  # [B,1]
             m = mask_t if mask_t.dim() == 2 else mask_t.unsqueeze(-1)
-
-            # ----- Teacher Forcing (full state at time t) -----
-            if self.training:
-                tf_gate = (torch.rand(B, 1, device=dev) < tf_ratio).float()
-                # GT for time t
-                q_teacher = q[:, t, :]
-                dq_teacher = dq[:, t, :]
-                p_teacher = p[:, t, :]
-                dp_teacher = dp[:, t, :]
-                # reconstruct w_teacher from obs_in_seq gravity at time t
-                g_t = obs_in_seq[:, t, grav_start:grav_start + 3].to(dev)
-                w_teacher = _quat_from_g(g_t)
-                dw_teacher = dw[:, t, :]
-                u_teacher = u[:, t, :]
-                du_teacher = du[:, t, :]
-
-                # Blend GT vs model-prev; renormalize quaternion afterwards
-                q_in = tf_gate * q_teacher + (1.0 - tf_gate) * q_prev
-                dq_in = tf_gate * dq_teacher + (1.0 - tf_gate) * dq_prev
-                p_in = tf_gate * p_teacher + (1.0 - tf_gate) * p_prev
-                dp_in = tf_gate * dp_teacher + (1.0 - tf_gate) * dp_prev
-                w_in = tf_gate * w_teacher + (1.0 - tf_gate) * w_prev
-                w_in = w_in / (w_in.norm(dim=-1, keepdim=True) + 1e-8)
-                dw_in = tf_gate * dw_teacher + (1.0 - tf_gate) * dw_prev
-                u_in = tf_gate * u_teacher + (1.0 - tf_gate) * u_prev
-                du_in = tf_gate * du_teacher + (1.0 - tf_gate) * du_prev
-            else:
-                q_in, dq_in = q_prev, dq_prev
-                p_in, dp_in = p_prev, dp_prev
-                # reconstruct current w_in from current obs_prev gravity (consistent)
-                g_cur = obs_in_seq[:, t, grav_start:grav_start + 3].to(dev)
-                w_in = _quat_from_g(g_cur)
-                dw_in = dw_prev
-                u_in, du_in = u_prev, du_prev
+            q_in, dq_in = q_prev, dq_prev
+            p_in, dp_in = p_prev, dp_prev
+            # reconstruct current w_in from current obs_prev gravity (consistent)
+            g_cur = obs_in_seq[:, t, grav_start:grav_start + 3].to(dev)
+            w_in = _quat_from_g(g_cur)
+            dw_in = dw_prev
+            u_in, du_in = u_prev, du_prev
 
             # ----- Policy step (condition on last observation) -----
             action_t, mu_t, log_std_t, log_sig_t, _ = self.decoder(
@@ -650,76 +607,123 @@ class IntentionVAE(nn.Module):
     # ---------- Loss (masked, correct normalization) ----------
     def loss(
             self,
-            recon_traj,  # [B,T,D] normalized FK positions (prediction)
-            log_sigma,  # [B,T,D_log]
-            orig_traj,  # [B,T,D] normalized FK positions (target)
-            act_mu,  # [B,T,A] teacher actions (unused now)
-            action_seq,  # [B,T,A] decoder actions (prediction)
-            mu_seq,  # [B,T,d]
-            log_std_seq,  # [B,T,d]
-            mask,  # [B,T,1] float {0,1}
-            *args,  # latent tuples per prior
+            recon_traj,  # [B,T,D] normalized FK+obj (prediction)
+            log_sigma,  # [B,T,D_log] (unused here)
+            orig_traj,  # [B,T,D] normalized FK+obj (target)
+            act_mu,  # [B,T,A] (unused)
+            action_seq,  # [B,T,A] decoder actions
+            mu_seq,  # [B,T,d] (unused)
+            log_std_seq,  # [B,T,d] (unused)
+            ptr,  # dict or tuple -> must contain mu_hat, sigma
+            mask,  # [B,T,1] {0,1}
+            *args,  # latent tuples per prior (unchanged)
             beta: float,
-            lambda_kinematic: float = 1.0,
-            lambda_dynamic: float = 0.2,
-            gamma: float = 0.95,  # discount for kinematic term only
-            wa1: float = 1e-3,  # L1 coeff for action magnitude
-            wa2: float = 1e-3,  # L2 coeff for action magnitude
+            lambda_kinematic: float = 1.0,  # weight for pre-contact MAE
+            lambda_dynamic: float = 0.0,  # action magnitude regularization
+            wa1: float = 1e-3,  # L1 coeff on actions
+            wa2: float = 1e-3,  # L2 coeff on actions
+            lambda_amp: float = 0.00,  # post-contact AMP generator weight
+            post_window_frames: int = 12,  # *** new: only use a short post window for AMP ***
     ):
         """
-        Masked sequence loss:
-          - Pose: MSE with per-timestep discount gamma^t, masked and normalized.
-          - Action: NO teacher; use magnitude regularizer (wa1*L1 + wa2*L2^2), masked.
-          - KL: per-sequence.
+        Pre:  MAE over frames selected by soft pre weights w_pre (no time reweighting).
+        Post: AMP **only on a short window** [μ, μ+post_window_frames); later post frames are ignored.
         """
         B, T, D = recon_traj.shape
         device = recon_traj.device
-        dtype = recon_traj.dtype
+        eps = 1e-8
 
-        mask_bt = mask.squeeze(-1)  # [B,T], {0,1}
-
-        # -------- Pose reconstruction with discount gamma^t --------
         orig_traj = orig_traj.view(B, T, -1)
-        pose_step = ((recon_traj[:,:,:-3] - orig_traj[:,:,:-3]) ** 2).mean(dim=-1)  # [B,T]
+        # Unpack pointer
+        if isinstance(ptr, dict):
+            mu_hat = ptr["mu_hat"]  # [B] in (0,1)
+            sigma_hat = ptr["sigma"]  # [B] > 0
+        else:
+            _, mu_hat, sigma_hat = ptr  # (alpha_time, mu, sigma)
 
-        t_idx = torch.arange(T, device=device, dtype=dtype)
-        w_t = (gamma ** t_idx).to(dtype=dtype)  # [T]
-        weighted = pose_step * mask_bt * w_t.unsqueeze(0)  # [B,T]
-        denom = (mask_bt * w_t.unsqueeze(0)).sum().clamp_min(1e-6)
-        pose_loss = weighted.sum() / denom
-        pose_loss = lambda_kinematic * pose_loss
+        # ----- build soft masks -----
+        valid_mask = mask.squeeze(-1).float()  # [B,T]
+        lengths = valid_mask.sum(dim=1).long()  # [B]
+        t_norm, m_pre, m_post, w_pre, w_post = build_soft_masks_from_sigma(
+            mu_hat, sigma_hat, lengths, T, valid_mask
+        )
 
-        # -------- Action magnitude regularizer (replace old MSE) --------
-        # Per-step mean over action dims
+        # ---------- PRE: pose MAE over pre segment ----------
+        # Exclude object xyz from pre MAE (as in your prior code)
+        pre_err_t = (recon_traj[:, :, :-3] - orig_traj[:, :, :-3]).abs().mean(dim=-1)  # [B,T]
+        pre_pose_mae = lambda_kinematic * (pre_err_t * w_pre).sum(dim=1).mean()
+
+        # ---------- ACTION regularization (same as before) ----------
         l1 = action_seq.abs().mean(dim=-1)  # [B,T]
         l2 = (action_seq ** 2).mean(dim=-1)  # [B,T]
         act_reg_step = wa1 * l1 + wa2 * l2  # [B,T]
-        valid = mask_bt.sum().clamp_min(1.0)
-        action_loss = (act_reg_step * mask_bt).sum().div(valid)
-        action_loss = lambda_dynamic * action_loss
+        denom_valid = valid_mask.sum().clamp_min(1.0)
+        action_reg = lambda_dynamic * (act_reg_step * valid_mask).sum() / denom_valid
 
-        total_recon = pose_loss + action_loss
+        # ---------- POST: AMP on a *short window* after μ only ----------
+        # Build a hard window mask per sequence: t in [t0, t0 + post_window_frames)
+        t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)  # [B,T]
+        t0 = (mu_hat * (lengths - 1).clamp_min(1).to(mu_hat.dtype)).round().long()  # [B]
+        t1 = (t0 + post_window_frames).clamp(max=T)  # [B]
+        win_mask = ((t_idx >= t0.unsqueeze(1)) & (t_idx < t1.unsqueeze(1))).float()
+        # Respect padding
+        win_mask = win_mask * valid_mask  # [B,T]
 
-        # -------- KL (unchanged) --------
+        # Normalize to weights (sum=1 over the window if any)
+        win_sum = win_mask.sum(dim=1, keepdim=True)  # [B,1]
+        has_post_win = (win_sum.squeeze(1) > eps)  # [B]
+        w_post_win = torch.where(
+            win_sum > 0.0, win_mask / (win_sum + eps), torch.zeros_like(win_mask)
+        )  # [B,T]
+
+        # Pool descriptors over that short window
+        post_desc_fake = torch.bmm(w_post_win.unsqueeze(1), recon_traj).squeeze(1)  # [B,D]
+        post_desc_real = torch.bmm(w_post_win.unsqueeze(1), orig_traj).squeeze(1)  # [B,D]
+
+        # (Optional) condition D on z later by concatenating z:
+        # if condition_D_on_z:
+        z = args[0]  # first in aux for both priors
+        z = z.detach()
+        post_desc_fake = torch.cat([post_desc_fake, z], dim=-1)
+        post_desc_real = torch.cat([post_desc_real, z], dim=-1)
+
+        post_amp_G = torch.tensor(0.0, device=device)
+        amp_D_loss = torch.tensor(0.0, device=device)
+
+        ones = torch.ones(B, device=device)
+        zeros = torch.zeros(B, device=device)
+
+        # G step: encourage D(fake) -> 1 on samples that actually have a post window
+        logits_fake = self.disc_post(post_desc_fake)
+        if has_post_win.any():
+            post_amp_G = F.binary_cross_entropy_with_logits(logits_fake[has_post_win], ones[has_post_win])
+
+        # D step (returned so you can update D separately)
+        logits_real = self.disc_post(post_desc_real.detach())
+        logits_fake_det = self.disc_post(post_desc_fake.detach())
+        if has_post_win.any():
+            loss_real = F.binary_cross_entropy_with_logits(logits_real[has_post_win], ones[has_post_win])
+            loss_fake = F.binary_cross_entropy_with_logits(logits_fake_det[has_post_win], zeros[has_post_win])
+            amp_D_loss = loss_real + loss_fake
+
+        post_amp_G = lambda_amp * post_amp_G
+
+        # ---------- KL (unchanged) ----------
         if self.prior == "GMM":
             mu, logvar, pi_logits = args
-            Bk, K, Dk = mu.shape
+            K = pi_logits.shape[-1]
             pi = F.softmax(pi_logits, dim=-1)  # [B,K]
-
-            prior_mu = self.prior_mu.unsqueeze(0).expand(Bk, -1, -1)  # [B,K,D]
-            prior_logv = self.prior_logvar.unsqueeze(0).expand(Bk, -1, -1)  # [B,K,D]
-
+            prior_mu = self.prior_mu.unsqueeze(0).expand_as(mu)
+            prior_logv = self.prior_logvar.unsqueeze(0).expand_as(logvar)
             kl_gauss = 0.5 * torch.sum(
                 prior_logv - logvar - 1.0
                 + (logvar - prior_logv).exp()
                 + (mu - prior_mu).pow(2) / prior_logv.exp(),
-                dim=-1,
-            )  # [B,K]
-
+                dim=-1,  # [B,K]
+            )
             log_q = torch.log(pi + 1e-10)
             log_p = math.log(1.0 / K)
             kl_cat = torch.sum(pi * (log_q - log_p), dim=-1)  # [B]
-
             kl_loss = torch.sum(pi * kl_gauss, dim=-1) + kl_cat
             kl_loss = kl_loss.mean()
         else:
@@ -727,5 +731,6 @@ class IntentionVAE(nn.Module):
             kl_per = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
             kl_loss = kl_per.mean()
 
-        vae_loss = total_recon + beta * kl_loss
-        return vae_loss, pose_loss, action_loss, kl_loss
+        # ---------- Total ----------
+        vae_total = pre_pose_mae + action_reg + post_amp_G + beta * kl_loss
+        return vae_total, pre_pose_mae, post_amp_G, action_reg, kl_loss, amp_D_loss

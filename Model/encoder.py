@@ -5,7 +5,7 @@ from torch_geometric.nn import GATConv, GCNConv
 from torch_geometric.utils import softmax as pyg_softmax
 from torch_scatter import scatter_add
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
+from Model.ptr import AnalyticPointer
 # ---- Shared attention pooling module ----
 class NodeAttentionPool(nn.Module):
     def __init__(self, in_dim):
@@ -93,13 +93,17 @@ class GMMEncoder(nn.Module):
         return mu, logvar, pi_logits
 
 # ---- Vanilla (Gaussian) Encoder ----
-# ---- Vanilla (Gaussian) Encoder ----
 class VanillaEncoder(nn.Module):
-    def __init__(self, node_features, hidden_features, num_layers, rnn_hidden, latent_dim):
+    def __init__(self, node_features, hidden_features, num_layers, rnn_hidden, latent_dim,
+                 obj_index: int = -1,
+                 link_r: torch.Tensor = None,
+                 ball_r: float = 0.05,
+                 sdf_tau: float = 0.02,
+                 ):
         super().__init__()
         self.heads = 4
 
-        # --- spatial GNN stack (kept, GCN 版本) ---
+        # spatial GNN
         self.gnns = nn.ModuleList()
         self.gnns.append(GCNConv(node_features, hidden_features))
         for _ in range(num_layers - 2):
@@ -107,86 +111,62 @@ class VanillaEncoder(nn.Module):
         self.gnns.append(GCNConv(hidden_features, hidden_features))
 
         self.pool = NodeAttentionPool(hidden_features)
+        self.rnn  = nn.LSTM(hidden_features, rnn_hidden, batch_first=True, bidirectional=True)
 
-        # --- temporal encoder: keep bidirectional LSTM, but we will use per-time outputs ---
-        self.rnn = nn.LSTM(hidden_features, rnn_hidden, batch_first=True, bidirectional=True)
-
-        # --- Gaussian pointer head over time (produces μ in (0,1), σ > 0) ---
-        self.ptr_head = nn.Sequential(
-            nn.Linear(2 * rnn_hidden, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 2)  # -> [mu_hat, log_sigma]
+        # >>> analytic pointer (no learned ptr_head) <<<
+        self.ptr = AnalyticPointer(
+            obj_index=obj_index,
+            pos_slice=slice(0,3),
+            link_r=link_r,
+            ball_r=ball_r,
+            sdf_tau=sdf_tau,
+            temp=6.0,
+            smooth=0,
+            sigma_floor=1e-3,
+            sigma_cap=0.10,
         )
 
-        # --- latent heads ---
+        # latent heads
         self.fc_mu     = nn.Linear(2 * rnn_hidden, latent_dim)
         self.fc_logvar = nn.Linear(2 * rnn_hidden, latent_dim)
-
         nn.init.zeros_(self.fc_mu.weight);     nn.init.zeros_(self.fc_mu.bias)
         nn.init.zeros_(self.fc_logvar.weight); nn.init.zeros_(self.fc_logvar.bias)
 
     def forward(self, x, edge_index, mask):
-        """
-        x:    [B, T, N, F]
-        mask: [B, T, 1]  (float {0,1})
-        returns:
-            mu, logvar, extras (dict：alpha_time, mu_hat, sigma)
-        """
         B, T, N, Fdim = x.shape
         device = x.device
-        xt = x.view(B * T * N, Fdim)
 
-        # --- repeat edges across B*T graphs ---
+        # repeat edges across B*T
         num_graphs = B * T
         E = edge_index.size(1)
         batched_edge_index = edge_index.repeat(1, num_graphs)
         offset = (torch.arange(num_graphs, device=device).repeat_interleave(E) * N)
         batched_edge_index = batched_edge_index + offset
-
         batch_idx = torch.arange(num_graphs, device=device).repeat_interleave(N)
 
-        # --- spatial GNN per (b,t), then node-attn pool -> [B,T,H] ---
+        # spatial GNN + attention pool → [B,T,H]
+        xt = x.view(B*T*N, Fdim)
         for gnn in self.gnns:
             xt = F.relu(gnn(xt, batched_edge_index))
-        graph_embs = self.pool(xt, batch_idx, num_graphs)           # [B*T, H]
-        graph_embs = graph_embs.view(B, T, -1)                      # [B, T, H]
+        graph_embs = self.pool(xt, batch_idx, num_graphs).view(B, T, -1)
 
-        # --- temporal masking ---
-        mask_t = mask  # [B,T,1]
-        graph_embs = graph_embs * mask_t
-
-        lengths = mask_t.squeeze(-1).sum(dim=1).clamp_min(1).long()  # [B]
-        # pack -> LSTM -> unpack
+        # temporal masking & BiLSTM (packed)
+        graph_embs = graph_embs * mask
+        lengths = mask.squeeze(-1).sum(dim=1).clamp_min(1).long()
         packed = pack_padded_sequence(graph_embs, lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_out, _ = self.rnn(packed)
-        rnn_out, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=T)  # [B, T, 2H]
+        rnn_out, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=T)  # [B,T,2H]
 
-        # --------- Gaussian pointer over time ---------
-        denom = lengths.clamp_min(1).unsqueeze(1).to(device).float()   # [B,1]
-        masked_sum = (rnn_out * mask_t).sum(dim=1)                     # [B, 2H]
-        clip_feat  = masked_sum / denom                                 # [B, 2H]
+        # >>> analytic μ,σ,α_t from graph itself <<<
+        mu_hat, sigma, alpha_time = self.ptr(x, mask)  # all detached by design
 
-        ptr_params = self.ptr_head(clip_feat)     # [B, 2]
-        mu_hat     = ptr_params[:, 0].sigmoid()   # in (0,1), normalize time
-        log_sigma  = ptr_params[:, 1].clamp(-4, 4)
-        sigma      = F.softplus(log_sigma) + 1e-4 # > 0
+        # time-pool with α_t
+        temporal_feat = torch.bmm(alpha_time.unsqueeze(1), rnn_out).squeeze(1)  # [B,2H]
 
+        # latent
+        mu     = self.fc_mu(temporal_feat)
+        logvar = self.fc_logvar(temporal_feat)
 
-        t_idx   = torch.arange(T, device=device).float().unsqueeze(0).expand(B, T)  # [B,T]
-        # normalize
-        denom_t = (lengths - 1).clamp_min(1).unsqueeze(1).to(device).float()        # [B,1]
-        t_norm  = t_idx / denom_t                                                   # [B,T], 0..1
+        ptr = [alpha_time, mu_hat, sigma]
+        return mu, logvar, ptr
 
-        gauss = torch.exp(-0.5 * ((t_norm - mu_hat.unsqueeze(1)) / sigma.unsqueeze(1)) ** 2)  # [B,T]
-        gauss = gauss * mask_t.squeeze(-1)                                          # [B,T]
-        alpha_time = gauss / (gauss.sum(dim=1, keepdim=True) + 1e-8)                # [B,T]
-
-        # Gaussian temporal_feat
-        temporal_feat = torch.bmm(alpha_time.unsqueeze(1), rnn_out).squeeze(1)      # [B, 2H]
-
-        # --- latent heads ---
-        mu     = self.fc_mu(temporal_feat)       # [B, Dz]
-        logvar = self.fc_logvar(temporal_feat)   # [B, Dz]
-
-        extras = {'alpha_time': alpha_time, 'mu_hat': mu_hat, 'sigma': sigma}
-        return mu, logvar, extras

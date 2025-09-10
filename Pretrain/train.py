@@ -13,33 +13,7 @@ from rsl_rl.modules import EmpiricalNormalization
 
 from .go2_env_icm import Go2Env
 from .dataset import TrajectoryDataset
-from .utils import build_edge_index
-
-
-def get_beta(epoch, total_epochs, strategy='cyclical', num_cycles=4, max_beta=1.0, warmup_epochs=20):
-    if strategy == 'warmup':
-        return 0.0 if epoch < warmup_epochs else max_beta * (epoch - warmup_epochs) / max(1, (total_epochs - warmup_epochs))
-    elif strategy == 'cyclical':
-        cycle_length = max(1, total_epochs // num_cycles)
-        cycle_progress = (epoch % cycle_length) / cycle_length
-        return max_beta * (1 / (1 + math.exp(-10 * (cycle_progress - 0.5))))
-    else:
-        return max_beta
-
-def masked_quat_geodesic(pred_w, tgt_w, mask, eps=1e-8):
-    # pred_w, tgt_w: [B,T,4] (wxyz, normalized)
-    # mask: [B,T,1] or [B,T]
-    # geodesic distance: 2*acos(|<q1,q2>|); we can use (1 - dot^2) as a smooth proxy
-    pred = pred_w / (pred_w.norm(dim=-1, keepdim=True) + eps)
-    tgt  = tgt_w  / (tgt_w.norm(dim=-1, keepdim=True) + eps)
-    dot  = (pred * tgt).sum(dim=-1).abs().clamp(max=1.0)       # [B,T]
-    # proxy loss (smooth, scale ~ angle^2 near 0)
-    loss = 1.0 - dot**2
-    if mask.dim() == 3: mask = mask.squeeze(-1)
-    # average over unmasked
-    denom = mask.sum().clamp_min(1.0)
-    return (loss * mask).sum() / denom
-
+from .utils import build_edge_index, infer_contact_pointer_from_inputs, get_beta, masked_quat_geodesic
 
 class Trainer:
     def __init__(self, model, rl_config, config):
@@ -127,11 +101,24 @@ class Trainer:
         self.pos_std_d = self.dataset.pos_std.to(self.device)
 
         # optimizer & schedulers
-        base_lr = config.optimizer.lr
-        self.optimizer = optim.Adam(self.vae.parameters(), lr=base_lr, weight_decay=0, fused=True)
-        num_total_steps = self.num_epochs * max(1, (self.episodes // self.batch_size))
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=num_total_steps)
+        # --- Two optimizers: G (everything except D) and D (discriminator only) ---
+        self.base_lr = config.optimizer.lr
         self.scaler = GradScaler()
+
+        # Split params cleanly
+        disc_params = list(self.vae.disc_post.parameters())
+        disc_ids = {id(p) for p in disc_params}
+        gen_params = [p for p in self.vae.parameters() if id(p) not in disc_ids]
+
+        # Adam (fused=True if available)
+        self.opt_G = optim.Adam(gen_params, lr=self.base_lr, weight_decay=0, fused=True)
+        self.opt_D = optim.Adam(self.vae.disc_post.parameters(), lr=self.base_lr, weight_decay=0, fused=True)
+
+        # Cosine schedulers
+        self.steps_per_epoch = max(1, (self.episodes // self.batch_size))
+        self.num_total_steps = self.num_epochs * self.steps_per_epoch
+        self.sched_G = CosineAnnealingLR(self.opt_G, T_max=self.num_total_steps)
+        self.sched_D = CosineAnnealingLR(self.opt_D, T_max=self.num_total_steps)
 
         # weights
         self.strategy = config.beta_anneal.strategy
@@ -184,62 +171,102 @@ class Trainer:
             prefetch_factor=4,
         )
 
-        total_steps = self.num_epochs * len(dataloader)
-
         def _denorm_positions(traj_norm, pos_mean_d, pos_std_d):
-            # traj_norm: [B,T,3*num_nodes]; pos_mean_d/pos_std_d already on device
             B, T, D = traj_norm.shape
             num_nodes = D // 3
             x = traj_norm.reshape(B, T, num_nodes, 3)
             x = x * pos_std_d[None, None, None, :] + pos_mean_d[None, None, None, :]
             return x.reshape(B, T, D)
 
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        global_step = 0
+
         for epoch in range(self.num_epochs):
-            for i, (x, q, dq, p, dp, dw,u, du, dv, obs, act, mask) in enumerate(dataloader):
-                global_step = epoch * len(dataloader) + i
-
-                x      = x.to(self.device, non_blocking=True)
-
-                q_gt   = q.to(self.device, non_blocking=True)
-                dq_gt  = dq.to(self.device, non_blocking=True)
-
-                p_gt   = p.to(self.device, non_blocking=True)
-                dp_gt  = dp.to(self.device, non_blocking=True)
-                dw_gt  = dw.to(self.device, non_blocking=True)
-
-                u_gt   = u.to(self.device, non_blocking=True)
-                du_gt  = du.to(self.device, non_blocking=True)
-                dv_gt  = dv.to(self.device, non_blocking=True)
-
-                obs_gt = obs.to(self.device, non_blocking=True)  # [B,T,obs_dim]
+            for i, (x, q, dq, p, dp, dw, u, du, dv, obs, act, mask) in enumerate(dataloader):
+                x = x.to(self.device, non_blocking=True)
+                q_gt = q.to(self.device, non_blocking=True)
+                dq_gt = dq.to(self.device, non_blocking=True)
+                p_gt = p.to(self.device, non_blocking=True)
+                dp_gt = dp.to(self.device, non_blocking=True)
+                dw_gt = dw.to(self.device, non_blocking=True)
+                u_gt = u.to(self.device, non_blocking=True)
+                du_gt = du.to(self.device, non_blocking=True)
+                dv_gt = dv.to(self.device, non_blocking=True)
+                obs_gt = obs.to(self.device, non_blocking=True)
                 act_gt = act.to(self.device, non_blocking=True)
+                mask = mask.to(self.device, non_blocking=True)[:, :, None]
 
-                mask   = mask.to(self.device, non_blocking=True)[:, :, None] # [B,T,1]
+                beta = get_beta(global_step, self.num_total_steps, strategy=self.strategy,
+                                warmup_epochs=self.warm_up, max_beta=self.max_beta)
 
-                self.optimizer.zero_grad(set_to_none=True)
-                # Use AMP (bf16 if supported, else fp16) to increase throughput
-                amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                # ============================================================
+                # D-STEP: update discriminator on detached G outputs
+                # ============================================================
+                # 1) Cheap forward for G outputs (no G graph)
+                with torch.no_grad(), autocast(enabled=True, dtype=amp_dtype):
+                    out_D = self.vae(
+                        x, self.edge_index, mask,
+                        self.obs_normalizer,
+                        obs_seq=obs_gt,
+                        q=q_gt, dq=dq_gt, p=p_gt, dp=dp_gt, dw=dw_gt,
+                        u=u_gt, du=du_gt, dv=dv_gt,
+                    )
+                    x_recon_D = out_D["traj"]["graph"]
+                    log_sigma_D = out_D["act"]["log_sigma"]
+                    ptr_D = out_D["traj"]["ptr"]
+                    aux_D = out_D.get("aux", [])
+                    act_seq_D = out_D["act"]["act"]
+                    mu_seq_D = out_D["act"]["mu"]
+                    log_std_D = out_D["act"]["log_std"]
+
+                # 2) Compute D loss with gradients only for D
+                self.opt_D.zero_grad(set_to_none=True)
                 with autocast(enabled=True, dtype=amp_dtype):
-                    beta = get_beta(global_step, total_steps, strategy=self.strategy,
-                                    warmup_epochs=self.warm_up, max_beta=self.max_beta)
+                    _, _, _, _, _, amp_D_loss = self.vae.loss(
+                        x_recon_D, log_sigma_D, x,
+                        act_gt, act_seq_D,
+                        mu_seq_D, log_std_D,
+                        ptr_D, mask, *aux_D,
+                        beta=beta,
+                        lambda_kinematic=self.lambda_kinematic,
+                        lambda_dynamic=self.lambda_dynamic
+                    )
 
-                    # teacher forcing ratio: decay to 0 by midway
+                if amp_D_loss.requires_grad:
+                    self.scaler.scale(amp_D_loss).backward()
+                    self.scaler.unscale_(self.opt_D)
+                    nn.utils.clip_grad_norm_(self.vae.disc_post.parameters(), self.grad_clip_value)
+                    self.scaler.step(self.opt_D)
+                    # single scaler for both steps; update after G-step to be safe
+                    self.sched_D.step()
 
-                    tf_ratio = max(0.0, 1.0 - global_step / (0.5 * total_steps))
-                    tf_ratio = 0
-                    # --- forward (policy decoder returns actions) ---
+                # ============================================================
+                # G-STEP: update encoder/decoder/surrogate on full loss
+                # ============================================================
+                self.opt_G.zero_grad(set_to_none=True)
+                with autocast(enabled=True, dtype=amp_dtype):
+
+                    # q,p,w,u,valid from your dataset batch (WORLD frames, same as trainer)
+                    mu_star, sigma_star, contact_p, first_idx = infer_contact_pointer_from_inputs(
+                        q=q_gt, p=p_gt, w=w_gt, u=u_gt, valid_mask=mask.squeeze(-1),
+                        fk_model=self.agent.fk_model,
+                        link_bsphere_radius=self.agent.link_bsphere_radius,
+                        ball_radius=0.05, sdf_tau=0.02, smooth_kernel=5
+                    )
+
+                    # Store mu_star/sigma_star in the batch dict to be used later in your encoder reg.
+
                     out = self.vae(
                         x, self.edge_index, mask,
                         self.obs_normalizer,
                         obs_seq=obs_gt,
-                        q=q_gt, dq=dq_gt,
-                        p=p_gt, dp=dp_gt, dw=dw_gt,
+                        q=q_gt, dq=dq_gt, p=p_gt, dp=dp_gt, dw=dw_gt,
                         u=u_gt, du=du_gt, dv=dv_gt,
-                        tf_ratio=tf_ratio,
                     )
 
                     # ---- trajectory
                     x_recon = out["traj"]["graph"]
+                    ptr = out["traj"]["ptr"]
 
                     # ---- state
                     state = out["state"]
@@ -251,11 +278,11 @@ class Trainer:
                     dp_seq = state.get("dp")
 
                     # ---- actions
-                    act = out["act"]
-                    act_seq = act.get("act")
-                    mu_seq = act.get("mu")
-                    log_std_seq = act.get("log_std")
-                    log_sigma = act.get("log_sigma")
+                    act_pack = out["act"]
+                    act_seq = act_pack.get("act")
+                    mu_seq = act_pack.get("mu")
+                    log_std_seq = act_pack.get("log_std")
+                    log_sigma = act_pack.get("log_sigma")
 
                     # ---- obs
                     obs_seq = out["obs"]["obs"]
@@ -264,144 +291,75 @@ class Trainer:
 
                     # ---- aux latents/posterior
                     aux = out.get("aux", [])
-                    z = aux[0]
-                    #z = torch.zeros_like(z)
-                    z_detached = z.detach()
-                    # --------------- Genesis rollout (teacher for surrogate) ---------------
-                    '''
-                    with torch.no_grad():
-                        was_training = self.vae.decoder.training
-                        self.vae.decoder.eval()
-                        try:
-                            reset_out = self.env.reset()
-                            self.env.reset_with_ball_rel(u_gt[:,0],du_gt[:,0])
-                            obs0_raw = reset_out[0] if isinstance(reset_out, tuple) else reset_out  # [B,obs_dim]
-                            #obs0_raw[:, -6:-3] = u_gt[:, 0]
-                            obs_t_n = self.obs_normalizer(obs0_raw.to(self.device, non_blocking=True))
-                            B = act_seq.shape[0]
-                            T = act_seq.shape[1]
-                            # Pre-allocate on device with correct dtypes
-                            q_sim_seq  = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-                            dq_sim_seq = torch.empty(size=q_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-
-                            p_sim_seq  = torch.empty(size=p_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-                            dp_sim_seq = torch.empty(size=dp_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-
-                            w_sim_seq  = torch.empty(size=w_seq.shape,device=self.device, dtype=obs_t_n.dtype)
-                            dw_sim_seq = torch.empty(size=dw_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-
-                            obs_sim_seq = torch.empty(size=obs_seq.shape, device=self.device, dtype=obs_t_n.dtype)
-
-                            for t in range(T):
-                                mask_t = mask[:, t, :]
-                                #a_t, _, _, _, _ = self.vae.decoder(z_detached, obs_t_n, mask_t)
-                                a_t = act_gt[:,t]
-                                obs_t_raw, rew_t, done_t, info_t = self.env.step(a_t)
-                                #obs_t_raw[:,-6:-3] = u_gt[:,t]
-                                #obs_t_raw[:,-3:] = du_gt[:,t]
-                                q_t = self.env.dof_pos
-                                dq_t = self.env.dof_vel
-                                p_t = self.env.base_pos
-                                dp_t = self.env.base_lin_vel
-                                w_t = self.env.base_quat
-                                dw_t = self.env.base_ang_vel
-
-                                obs_t_n = self.obs_normalizer(obs_t_raw.to(self.device, non_blocking=True))
-
-                                q_sim_seq[:,t].copy_(q_t)
-                                dq_sim_seq[:,t].copy_(dq_t)
-
-                                p_sim_seq[:,t].copy_(p_t)
-                                dp_sim_seq[:,t].copy_(dp_t)
-                                w_sim_seq[:,t].copy_(w_t)
-                                dw_sim_seq[:, t].copy_(dw_t)
-
-                                obs_sim_seq[:, t].copy_(obs_t_n)
 
 
-                            u_sim_seq = obs_sim_seq[:, :, -6:-3]
-                            du_sim_seq = obs_sim_seq[:, :, -3:]
-                        finally:
-                            self.vae.decoder.train(was_training)
-                    '''
-                    # --- VAE loss (pose + action + KL) ---
-                    loss, kinematic_loss, dynamic_loss, kl_loss = self.vae.loss(
+
+                    # VAE loss (pre-MAE + action-reg + post-AMP(G) + KL)
+                    loss, pre_pose_mae, post_amp_G, action_reg, kl_loss, _ = self.vae.loss(
                         x_recon, log_sigma, x,
                         act_gt, act_seq,
                         mu_seq, log_std_seq,
-                        mask, *aux,
+
+                        ptr, mask, *aux,
                         beta=beta,
                         lambda_kinematic=self.lambda_kinematic,
                         lambda_dynamic=self.lambda_dynamic
                     )
 
-                    # state-space losses (detach sim targets)
+                    # State-space losses
                     q_loss = self.masked_mse(q_seq, q_gt, mask)
                     dq_loss = self.masked_mse(dq_seq, dq_gt, mask)
                     p_loss = self.masked_mse(p_seq, p_gt, mask)
                     dp_loss = self.masked_mse(dp_seq, dp_gt, mask)
                     dw_loss = self.masked_mse(dw_seq, dw_gt, mask)
-                    #w_loss = masked_quat_geodesic(w_seq, w_gt, mask)
-
                     u_loss = self.masked_mse(u_seq, u_gt, mask)
-                    #print(u_loss)
                     du_loss = self.masked_mse(du_seq, du_gt, mask)
-                    # print(du_loss)
+
                     state_loss = (
                             self.w_q * q_loss +
                             self.w_dq * dq_loss +
                             self.w_p * p_loss +
                             self.w_dp * dp_loss +
-                            #self.w_w * w_loss +
                             self.w_dw * dw_loss +
                             self.w_u * u_loss +
                             self.w_du * du_loss
                     )
 
-                    # optional: obs regularizer (use your exact normalized obs on both sides)
-                    # obs_pred_n is from surrogate’s predict_dynamics; obs_sim_n_seq from Genesis → normalized
-                    #obs_reg = self.masked_mse(obs_seq, obs_sim_seq.detach(), mask)
                     sim_loss = state_loss
                     total_loss = loss + self.lambda_sim * sim_loss
 
-                    # defer unnormalized metrics to the logging branch to avoid sync each step
-
-
-
                 # Backprop THROUGH total_loss so surrogate learns from sim_loss
                 self.scaler.scale(total_loss).backward()
-                self.scaler.unscale_(self.optimizer)
-
-                # Calculate gradient norms only when logging to avoid sync stalls
-
-
+                self.scaler.unscale_(self.opt_G)
                 nn.utils.clip_grad_norm_(self.vae.parameters(), self.grad_clip_value)
-                self.scaler.step(self.optimizer)
+                self.scaler.step(self.opt_G)
                 self.scaler.update()
-                self.scheduler.step()
+                self.sched_G.step()
 
-                # Reduce logging frequency to minimize host/device sync
+                # ------------- logging -------------
                 log_every = 1
                 grad_log_every = 10
-
                 if (global_step % log_every == 0) or (i == len(dataloader) - 1):
                     with torch.no_grad():
-                        unnormalized_recon_mu = _denorm_positions(x_recon.detach(), self.pos_mean_d, self.pos_std_d)
-                        unnormalized_graph_x = _denorm_positions(x.reshape(x_recon.shape).detach(), self.pos_mean_d, self.pos_std_d)
-                        unnormalized_loss_obj = self.masked_mse(
-                            unnormalized_recon_mu[:,:,-3:], unnormalized_graph_x[:,:,-3:], mask
+                        unnormalized_recon = _denorm_positions(x_recon.detach(), self.pos_mean_d, self.pos_std_d)
+                        unnormalized_gt = _denorm_positions(x.reshape(x_recon.shape).detach(), self.pos_mean_d,
+                                                            self.pos_std_d)
+                        unnorm_obj = self.masked_mse(
+                            unnormalized_recon[:, :, -3:], unnormalized_gt[:, :, -3:], mask
                         ).item()
-                        unnormalized_loss = self.masked_mse(
-                            unnormalized_recon_mu[:,:,:-3], unnormalized_graph_x[:,:,:-3], mask
+                        unnorm_kino = self.masked_mse(
+                            unnormalized_recon[:, :, :-3], unnormalized_gt[:, :, :-3], mask
                         ).item()
+
                     print(
-                        f"Batch {i + 1}/{len(dataloader)}, "
-                        f"Total:{total_loss.item():.4f} | VAE:{loss.item():.4f} "
-                        f"| Kin:{kinematic_loss.item():.4f} | Unnorm_Kin:{unnormalized_loss:.4f} | Unnorm_Obj:{unnormalized_loss_obj:.4f} "
-                        f"| Dyn:{dynamic_loss.item():.4f} | KL:{kl_loss.item():.4f} "
-                        f"| Sim:{sim_loss.item():.4f}"
-                        f"| Beta:{beta:.3f} | TF:{tf_ratio:.2f}"
+                        f"Batch {i + 1}/{len(dataloader)} "
+                        f"| Total:{total_loss.item():.4f}  VAE:{loss.item():.4f} "
+                        f"| PreMAE:{pre_pose_mae.item():.4f}  AMP_G:{post_amp_G.item():.4f} "
+                        f"| Unnorm_Kin:{unnorm_kino:.4f}  Unnorm_Obj:{unnorm_obj:.4f} "
+                        f"| ActReg:{action_reg.item():.4f}  KL:{kl_loss.item():.4f} "
+                        f"| Sim:{sim_loss.item():.4f}  Beta:{beta:.3f}"
                     )
+                    '''
                     if (global_step % grad_log_every == 0) or (i == len(dataloader) - 1):
                         print(self.w_q * q_loss.item(),
                               self.w_dq * dq_loss.item(),
@@ -410,6 +368,10 @@ class Trainer:
                               self.w_dw * dw_loss.item(),
                               self.w_u * u_loss.item(),
                               self.w_du * du_loss.item())
+                              
+                    '''
+
+                global_step += 1
 
             os.makedirs(self.save_path, exist_ok=True)
             save_path = os.path.join(self.save_path, f"vae_checkpoint_epoch_{epoch + 1}.pth")

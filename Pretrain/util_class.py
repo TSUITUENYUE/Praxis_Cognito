@@ -1,5 +1,17 @@
 import torch
+import torch.nn as nn
+class TrajDiscriminator(nn.Module):
+    """Small MLP that scores post-contact *trajectory descriptors* (pooled features)."""
+    def __init__(self, in_dim, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden, hidden), nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden, 1)  # logits
+        )
 
+    def forward(self, desc):  # desc: [B, D]
+        return self.net(desc).squeeze(-1)  # [B]
 
 class RunningMeanStd:
     def __init__(self, shape, epsilon=1e-4, device='cuda'):
