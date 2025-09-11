@@ -39,7 +39,9 @@ class SurrogateDynamics(nn.Module):
         # FK returns link positions in BASE frame; we rotate+translate to WORLD inside forward().
         self.fk = agent.fk_model
         link_r = getattr(agent, "link_bsphere_radius", None)
-        self.register_buffer("link_bsphere_radius", link_r.clone())
+        if link_r is None:
+            raise ValueError("agent.link_bsphere_radius is required.")
+        self.register_buffer("link_bsphere_radius", link_r.detach().clone().float())  # NEW: safer clone/dtype
 
         self.ball_radius = float(ball_radius)
         self.sdf_tau     = float(sdf_tau)
@@ -97,6 +99,11 @@ class SurrogateDynamics(nn.Module):
         nn.init.zeros_(self.impulse_ball_head.weight);   nn.init.zeros_(self.impulse_ball_head.bias)
         nn.init.zeros_(self.impulse_ground_head.weight); nn.init.zeros_(self.impulse_ground_head.bias)
         nn.init.zeros_(self.impulse_bg_head.weight);     nn.init.zeros_(self.impulse_bg_head.bias)
+
+        # ---------- NEW: learnable reaction/torque scales (positive via exp) ----------
+        self.log_alpha_m2r_ball   = nn.Parameter(torch.zeros(3))  # base Δv from link–ball impulse
+        self.log_alpha_tau_ball   = nn.Parameter(torch.zeros(3))  # base Δω from (r×J) at link–ball
+        self.log_beta_tau_ground  = nn.Parameter(torch.zeros(3))  # base Δω from (r×J) at base–ground
 
     # ---------------- quaternion utils ----------------
     @staticmethod
@@ -170,6 +177,7 @@ class SurrogateDynamics(nn.Module):
         assert d == self.d, "joint_dim mismatch"
         assert w_t.shape[-1] == 4, "w_t must be quaternion [w,x,y,z]"
         assert u_t.shape[-1] == self.o and du_t.shape[-1] == self.o, "obj_dim mismatch"
+        assert self.o == 3, "This implementation assumes a 3D object (o=3)."
 
         # shared features (WORLD-frame states)
         x = torch.cat([q_t, dq_t, a_t, p_t, dp_t, w_t, dw_t, u_t, du_t], dim=-1)
@@ -184,29 +192,25 @@ class SurrogateDynamics(nn.Module):
         dp_res  = torch.tanh(self.dp_res_head(h)) * torch.exp(self.log_dp_res_scale)
         dp_next = dp_t + dp_res
         p_res   = torch.tanh(self.p_res_head(h))  * torch.exp(self.log_p_res_scale)
-        p_next  = p_t + self.dt * dp_next + p_res
 
-        # ----- base angular (WORLD ω): q_next = dQ(ω_world) ⊗ q_t -----
-        dw_res      = torch.tanh(self.dw_res_head(h)) * torch.exp(self.log_dw_res_scale)
-        dw_next     = dw_t + dw_res
-        dquat_world = self._delta_quat_from_omega(dw_next)
-        w_next      = self._quat_normalize(self._quat_mul(dquat_world, w_t))
+        # ----- base angular (WORLD ω) -----
+        dw_res  = torch.tanh(self.dw_res_head(h)) * torch.exp(self.log_dw_res_scale)
+        dw_next = dw_t + dw_res
 
         # ----- object linear (WORLD) -----
         du_res  = torch.tanh(self.du_res_head(h)) * torch.exp(self.log_du_res_scale)
         du_next = du_t + du_res
         u_res   = torch.tanh(self.u_res_head(h))  * torch.exp(self.log_u_res_scale)
-        u_next  = u_t + self.dt * du_next + u_res
 
         # ---------- contact-aware impulses ----------
         # ball–ground gate (plane z=0 via ball center SDF)
         sdf_bg  = u_t[..., 2] - self.ball_radius                          # [B]
         gate_bg = torch.sigmoid(-sdf_bg / self.sdf_tau).unsqueeze(-1)     # [B,1]
-        dv_bg   = torch.tanh(self.impulse_bg_head(h)) * torch.exp(self.log_imp_bg_scale)  # [B,o]
+        dv_bg   = torch.tanh(self.impulse_bg_head(h)) * torch.exp(self.log_imp_bg_scale)  # [B,3]
         du_next = du_next + gate_bg * dv_bg
 
         # link positions: FK in BASE → rotate by w_t and translate by p_t to WORLD
-        link_pos_base  = self.fk(q_t).view(B, -1, 3)                       # [B,L,3] base
+        link_pos_base  = self.fk(q_t).reshape(B, -1, 3)                   # NEW: reshape safer than view
         link_pos_world = self._rotate_vec_by_quat(link_pos_base, w_t) + p_t.view(B,1,3)
 
         # SDFs for link–ball and base–ground
@@ -226,11 +230,43 @@ class SurrogateDynamics(nn.Module):
         ball_gate = ball_gate_geom * contact_conf[:, 0:1]        # link–ball
         base_gate = base_gate_geom * contact_conf[:, 1:2]        # base–ground
 
-        # impulses (consistent scaling; NO cap)
+        # impulses (heads)
         imp_ball   = torch.tanh(self.impulse_ball_head(h))   * torch.exp(self.log_imp_ball_scale)     # [B,3]
         imp_ground = torch.tanh(self.impulse_ground_head(h)) * torch.exp(self.log_imp_ground_scale)   # [B,3]
 
-        du_next = du_next + ball_gate * imp_ball   # kick to ball
-        dp_next = dp_next + base_gate * imp_ground # kick to base
+        # --- apply impulses to primary bodies ---
+        du_next = du_next + ball_gate * imp_ball          # kick to ball (link–ball)
+        dp_next = dp_next + base_gate * imp_ground        # kick to base (base–ground)
+
+        # ---------- NEW: equal-and-opposite + torques ----------
+        # Learnable positive scales
+        alpha_m2r = torch.exp(self.log_alpha_m2r_ball).view(1,3)
+        alpha_tau = torch.exp(self.log_alpha_tau_ball).view(1,3)
+        beta_tau_g = torch.exp(self.log_beta_tau_ground).view(1,3)
+
+        # Soft contact point for base–ground (softmin over link SDF)
+        link_sdf_g = link_pos_world[..., 2] - self.link_bsphere_radius.view(1, -1)   # [B,L]
+        w_g = torch.softmax(-link_sdf_g / self.sdf_tau, dim=1).unsqueeze(-1)         # [B,L,1]
+        c_g_world = (w_g * link_pos_world).sum(dim=1)                                 # [B,3]
+        r_g = c_g_world - p_t                                                         # [B,3]
+        torque_g = torch.cross(r_g, imp_ground, dim=-1)                               # τ = r × J
+        dw_next = dw_next + base_gate * (beta_tau_g * torque_g)
+
+        # Soft contact point for link–ball (softmin on link–ball SDF)
+        d_links_ball = torch.linalg.norm(link_pos_world - u_t.view(B,1,3), dim=-1) - \
+                       (self.link_bsphere_radius.view(1, -1) + self.ball_radius)      # [B,L]
+        w_lb = torch.softmax(-d_links_ball / self.sdf_tau, dim=1).unsqueeze(-1)       # [B,L,1]
+        c_lb_world = (w_lb * link_pos_world).sum(dim=1)                                # [B,3]
+        r_lb = c_lb_world - p_t                                                        # [B,3]
+        # Equal-and-opposite reaction on base (linear) and corresponding torque
+        dp_next = dp_next - ball_gate * (alpha_m2r * imp_ball)
+        torque_lb = torch.cross(r_lb, -imp_ball, dim=-1)                               # τ = r × (-J)
+        dw_next  = dw_next  + ball_gate * (alpha_tau * torque_lb)
+
+        # ---------- integrate AFTER impulses (positions & orientation use updated v/ω) ----------
+        dquat_world_post = self._delta_quat_from_omega(dw_next)
+        w_next = self._quat_normalize(self._quat_mul(dquat_world_post, w_t))
+        p_next = p_t + self.dt * dp_next + p_res
+        u_next = u_t + self.dt * du_next + u_res
 
         return q_next, dq_next, p_next, dp_next, w_next, dw_next, u_next, du_next

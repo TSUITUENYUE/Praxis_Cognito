@@ -53,10 +53,10 @@ class AnalyticPointer(nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor, mask: torch.Tensor):
         """
-        x:    [B, T, N, F] (positions expected in x[..., pos_slice])
+        x:    [B, T, N, 3] (positions expected in x[..., pos_slice])
         mask: [B, T, 1] (float {0,1})
         """
-        B, T, N, F = x.shape
+        B, T, N, _ = x.shape
         valid = mask.squeeze(-1)  # [B,T]
 
         # positions (denorm if needed)
