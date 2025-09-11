@@ -60,28 +60,32 @@ rl:
     base_height_target: 0.3
     feet_height_target: 0.075
     reward_scales:
-      tracking_hop: 20.0
+      object_locomotion: 1.0
 
+      tracking_body_pose: 0.5
+
+      lin_vel_z: -1.0
+      base_height: -50.0
       action_rate: -0.005
       similar_to_default: -0.1
-
 
   command:
     num_commands: 16
     # locomote
-    lin_vel_x_range: [-0.0, 0.0]
-    lin_vel_y_range: [-0.0, 0.0]
-    ang_vel_range:   [-0.0, 0.0]
+    standoff_r_range: [0.35, 1.20]
+    approach_psi_range: [-3.1416, 3.1416]
+    nom_speed_range: [0.0, 1.2]
+
 
     # body pose
-    dz_range: [ -0.0, 0.0 ]
-    pitch_range: [ -0.0, 0.0 ]  # rad
-    roll_range: [ -0.0, 0.0 ]  # rad
+    dz_range: [ -0.06, 0.10 ]
+    pitch_range: [ -0.26, 0.52 ]  # rad
+    roll_range: [ -0.17, 0.17 ]  # rad
 
     # limbvel
     ee_vx_range: [ -0.0, 0.0 ]
     ee_vy_range: [ -0.0, 0.0 ]
-    ee_vz_range: [ -0.0, 0.0 ]
+    ee_vz_range: [ -0.0, 0.0]
     imp_s_range: [ 0.0, 0.0 ]
 
     # contact hold
@@ -90,9 +94,9 @@ rl:
     phi_range: [ -0.0, 0.0 ]
 
     # hop
-    apex_h_range: [ 0.05, 0.4 ]
-    psi_range: [ -3.1416, 3.1416 ]
-    pitch_imp_range: [ -1.0, 1.0 ]
+    apex_h_range: [ 0.0, 0.0 ]
+    psi_range: [ -0.0, 0.0 ]
+    pitch_imp_range: [ -0.0, 0.0 ]
 
   train:
     algorithm:
@@ -121,7 +125,7 @@ rl:
       experiment_name: go2-walking
       load_run: -1
       log_interval: 1
-      max_iterations: 201
+      max_iterations: 401
       record_interval: -1
       resume: false
       resume_path: null

@@ -48,7 +48,7 @@ rl:
     dt: 0.02
 
   obs:
-    num_obs: 72
+    num_obs: 64
     obs_scales:
       lin_vel: 2.0
       ang_vel: 0.25

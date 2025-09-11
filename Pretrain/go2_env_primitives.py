@@ -135,9 +135,16 @@ class Go2Env:
         # 13-15 hop:        [apex_h, ψ, pitch_imp]
 
         # locomote
-        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), gs.device)
-        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), gs.device)
-        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), gs.device)
+        # ----- OBJECT-CENTRIC LOCOMOTION (0..2) -----
+
+        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["standoff_r_range"], (len(envs_idx),), gs.device)  # r
+        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["approach_psi_range"], (len(envs_idx),), gs.device)  # ψ
+        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["nom_speed_range"], (len(envs_idx),), gs.device)  # v_nom
+
+        # ----- BODY POSE (3..5) UNCHANGED -----
+        self.commands[envs_idx, 3] = gs_rand_float(*self.command_cfg["dz_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["pitch_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 5] = gs_rand_float(*self.command_cfg["roll_range"], (len(envs_idx),), gs.device)
 
         # body pose
         self.commands[envs_idx, 3] = gs_rand_float(*self.command_cfg["dz_range"], (len(envs_idx),), gs.device)
@@ -212,33 +219,15 @@ class Go2Env:
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
-        #print(self.robot.get_link)
-        links_F = self.robot.get_links_net_contact_force()
-
-        # pick feet: (N, 4, 3) → norm: (N, 4)
-        #print(links_F.shape)
-        F_foot = links_F[:,self.ee_idx]
-        F_norm = torch.linalg.norm(F_foot, dim=-1)
-
-        # hysteresis: turn on when > ON, turn off when < OFF, otherwise hold previous
-        on = (F_norm > self.contact_on_force_N)
-        off = (F_norm < self.contact_off_force_N)
-        # keep dtype consistent with obs_buf
-        self.contact_flags = torch.where(on, 1.0, torch.where(off, 0.0, self.contact_flags))
         # compute observations
-        base_height = self.base_pos[:, 2:3]
-
         self.obs_buf = torch.cat(
             [
-                self.commands * self.commands_scale,  # 14
-                self.base_lin_vel * self.obs_scales["lin_vel"],  # 3
+                self.commands * self.commands_scale,  # 16
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
                 self.projected_gravity,  # 3
-                base_height,  # 1   <-- NEW
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # A
                 self.dof_vel * self.obs_scales["dof_vel"],  # A
                 exec_actions,  # A
-                self.contact_flags,  # 4   <-- NEW
                 self.relative_ball_pos,  # 3
                 self.relative_ball_vel  # 3
             ],
@@ -352,15 +341,62 @@ class Go2Env:
         F_norm = torch.linalg.norm(F_foot_w, dim=-1)  # (N, L)
         return F_foot_w, F_norm
 
-    def _reward_tracking_lin_vel(self):
-        # Tracking of linear velocity commands (xy axes)
-        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+    def _reward_object_locomotion(self):
+        """
+        Drive the base so the ball sits at (radius=r, angle=ψ) in BODY frame, with
+        a shaping on nominal speed v_nom toward the target anchor.
 
-    def _reward_tracking_ang_vel(self):
-        # Tracking of angular velocity commands (yaw)
-        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+        commands: [0]=r [m], [1]=ψ [rad], [2]=v_nom [m/s]
+        Uses: self.relative_ball_pos (BODY), self.base_lin_vel (BODY), self.base_ang_vel (BODY)
+        """
+        r_cmd = self.commands[:, 0].clamp(0.0, 5.0)  # safety clamp
+        psi = self.commands[:, 1]
+        v_nom = self.commands[:, 2].clamp(0.0, 3.0)
+
+        # target ball position in BODY frame so that at goal the ball is at (r*cosψ, r*sinψ)
+        b_xy = self.relative_ball_pos[:, :2]  # (N,2) ball in BODY
+        cpsi, spsi = torch.cos(psi), torch.sin(psi)
+        target_b = torch.stack([r_cmd * cpsi, r_cmd * spsi], dim=1)  # (N,2)
+
+        # position error toward target anchor
+        e = (target_b - b_xy)
+        d = torch.linalg.norm(e, dim=1) + 1e-6
+        u_dir = e / d.unsqueeze(-1)  # unit to target
+
+        # base velocity alignment + speed shaping
+        v_xy = self.base_lin_vel[:, :2]
+        v_mag = torch.linalg.norm(v_xy, dim=1) + 1e-6
+        cos_al = (v_xy * u_dir).sum(dim=1) / v_mag  # ∈[-1,1]
+        cos_score = 0.5 * (1.0 + cos_al)  # ∈[0,1]
+
+        d0 = self.reward_cfg.get("obj_loco_d0", 0.6)  # distance scale to fade speed
+        v_tgt = v_nom * torch.clamp(d / d0, 0.0, 1.0)
+        sigma_v = self.reward_cfg.get("obj_loco_sigma_v", 0.4)
+        r_speed = torch.exp(- (v_mag - v_tgt) ** 2 / (2 * sigma_v ** 2))
+
+        sigma_r = self.reward_cfg.get("obj_loco_sigma_r", 0.25)
+        r_pos = torch.exp(- (d ** 2) / (2 * sigma_r ** 2))
+
+        # yaw shaping from angular error between current ball bearing and ψ
+        ang_b = torch.atan2(b_xy[:, 1], b_xy[:, 0])  # where the ball is now, in BODY
+        ang_t = psi  # where we want it
+        ang_err = torch.atan2(torch.sin(ang_t - ang_b), torch.cos(ang_t - ang_b))  # wrap to [-π,π]
+        k_w = self.reward_cfg.get("obj_loco_k_w", 1.5)
+        sigma_w = self.reward_cfg.get("obj_loco_sigma_w", 1.0)
+        r_yaw = torch.exp(- (self.base_ang_vel[:, 2] - k_w * ang_err) ** 2 / (2 * sigma_w ** 2))
+
+        # posture/height gate (same spirit as your limb-vel reward)
+        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5
+        z = self.base_pos[:, 2]
+        z0, z1 = 0.24, 0.30
+        gate_h = ((z - z0) / (z1 - z0)).clamp(0.0, 1.0)
+        gate = (upr ** 2) * gate_h
+
+        w_pos = self.reward_cfg.get("obj_loco_w_pos", 0.5)
+        w_spd = self.reward_cfg.get("obj_loco_w_spd", 0.35)
+        w_yaw = self.reward_cfg.get("obj_loco_w_yaw", 0.15)
+
+        return gate * (w_pos * r_pos + w_spd * (cos_score * r_speed) + w_yaw * r_yaw)
 
     def _reward_tracking_body_pose(self):
         """

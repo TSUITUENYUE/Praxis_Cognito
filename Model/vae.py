@@ -14,7 +14,7 @@ import genesis as gs
 from .encoder import GMMEncoder, VanillaEncoder
 from .decoder import Decoder, DecoderMoE
 from .sd import SurrogateDynamics
-from Pretrain.utils import build_soft_masks_from_sigma, infer_contact_pointer_from_inputs
+from Pretrain.utils import build_soft_masks_from_sigma
 from Pretrain.util_class import TrajDiscriminator
 import os
 import sys
@@ -619,9 +619,6 @@ class IntentionVAE(nn.Module):
             *args,  # latent tuples per prior (unchanged)
             beta: float,
             lambda_kinematic: float = 1.0,  # weight for pre-contact MAE
-            lambda_dynamic: float = 0.0,  # action magnitude regularization
-            wa1: float = 1e-3,  # L1 coeff on actions
-            wa2: float = 1e-3,  # L2 coeff on actions
             lambda_amp: float = 0.00,  # post-contact AMP generator weight
             post_window_frames: int = 12,  # *** new: only use a short post window for AMP ***
     ):
@@ -634,12 +631,7 @@ class IntentionVAE(nn.Module):
         eps = 1e-8
 
         orig_traj = orig_traj.view(B, T, -1)
-        # Unpack pointer
-        if isinstance(ptr, dict):
-            mu_hat = ptr["mu_hat"]  # [B] in (0,1)
-            sigma_hat = ptr["sigma"]  # [B] > 0
-        else:
-            _, mu_hat, sigma_hat = ptr  # (alpha_time, mu, sigma)
+        alpha_time, mu_hat, sigma_hat = ptr  # (alpha_time, mu, sigma)
 
         # ----- build soft masks -----
         valid_mask = mask.squeeze(-1).float()  # [B,T]
@@ -648,18 +640,14 @@ class IntentionVAE(nn.Module):
             mu_hat, sigma_hat, lengths, T, valid_mask
         )
 
+        t0 = (mu_hat * (lengths - 1).clamp_min(1).to(mu_hat.dtype)).round().long()  # [B]
+
         # ---------- PRE: pose MAE over pre segment ----------
         # Exclude object xyz from pre MAE (as in your prior code)
         pre_err_t = (recon_traj[:, :, :-3] - orig_traj[:, :, :-3]).abs().mean(dim=-1)  # [B,T]
         pre_pose_mae = lambda_kinematic * (pre_err_t * w_pre).sum(dim=1).mean()
-
-        # ---------- ACTION regularization (same as before) ----------
-        l1 = action_seq.abs().mean(dim=-1)  # [B,T]
-        l2 = (action_seq ** 2).mean(dim=-1)  # [B,T]
-        act_reg_step = wa1 * l1 + wa2 * l2  # [B,T]
-        denom_valid = valid_mask.sum().clamp_min(1.0)
-        action_reg = lambda_dynamic * (act_reg_step * valid_mask).sum() / denom_valid
-
+        #pre_err_t = (recon_traj[:, :t0, :-3] - orig_traj[:, :t0, :-3]).abs().mean(dim=-1)  # [B,T]
+        #pre_pose_mae = lambda_kinematic * pre_err_t.sum(dim=1).mean()
         # ---------- POST: AMP on a *short window* after μ only ----------
         # Build a hard window mask per sequence: t in [t0, t0 + post_window_frames)
         t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)  # [B,T]
@@ -732,5 +720,5 @@ class IntentionVAE(nn.Module):
             kl_loss = kl_per.mean()
 
         # ---------- Total ----------
-        vae_total = pre_pose_mae + action_reg + post_amp_G + beta * kl_loss
-        return vae_total, pre_pose_mae, post_amp_G, action_reg, kl_loss, amp_D_loss
+        vae_total = pre_pose_mae + post_amp_G + beta * kl_loss
+        return vae_total, pre_pose_mae, post_amp_G, kl_loss, amp_D_loss

@@ -13,7 +13,7 @@ from rsl_rl.modules import EmpiricalNormalization
 
 from .go2_env_icm import Go2Env
 from .dataset import TrajectoryDataset
-from .utils import build_edge_index, infer_contact_pointer_from_inputs, get_beta, masked_quat_geodesic
+from .utils import build_edge_index, get_beta, masked_quat_geodesic
 
 class Trainer:
     def __init__(self, model, rl_config, config):
@@ -222,14 +222,13 @@ class Trainer:
                 # 2) Compute D loss with gradients only for D
                 self.opt_D.zero_grad(set_to_none=True)
                 with autocast(enabled=True, dtype=amp_dtype):
-                    _, _, _, _, _, amp_D_loss = self.vae.loss(
+                    _, _, _, _, amp_D_loss = self.vae.loss(
                         x_recon_D, log_sigma_D, x,
                         act_gt, act_seq_D,
                         mu_seq_D, log_std_D,
                         ptr_D, mask, *aux_D,
                         beta=beta,
                         lambda_kinematic=self.lambda_kinematic,
-                        lambda_dynamic=self.lambda_dynamic
                     )
 
                 if amp_D_loss.requires_grad:
@@ -245,16 +244,6 @@ class Trainer:
                 # ============================================================
                 self.opt_G.zero_grad(set_to_none=True)
                 with autocast(enabled=True, dtype=amp_dtype):
-
-                    # q,p,w,u,valid from your dataset batch (WORLD frames, same as trainer)
-                    mu_star, sigma_star, contact_p, first_idx = infer_contact_pointer_from_inputs(
-                        q=q_gt, p=p_gt, w=w_gt, u=u_gt, valid_mask=mask.squeeze(-1),
-                        fk_model=self.agent.fk_model,
-                        link_bsphere_radius=self.agent.link_bsphere_radius,
-                        ball_radius=0.05, sdf_tau=0.02, smooth_kernel=5
-                    )
-
-                    # Store mu_star/sigma_star in the batch dict to be used later in your encoder reg.
 
                     out = self.vae(
                         x, self.edge_index, mask,
@@ -295,7 +284,7 @@ class Trainer:
 
 
                     # VAE loss (pre-MAE + action-reg + post-AMP(G) + KL)
-                    loss, pre_pose_mae, post_amp_G, action_reg, kl_loss, _ = self.vae.loss(
+                    loss, pre_pose_mae, post_amp_G,  kl_loss, _ = self.vae.loss(
                         x_recon, log_sigma, x,
                         act_gt, act_seq,
                         mu_seq, log_std_seq,
@@ -303,7 +292,6 @@ class Trainer:
                         ptr, mask, *aux,
                         beta=beta,
                         lambda_kinematic=self.lambda_kinematic,
-                        lambda_dynamic=self.lambda_dynamic
                     )
 
                     # State-space losses
@@ -356,7 +344,7 @@ class Trainer:
                         f"| Total:{total_loss.item():.4f}  VAE:{loss.item():.4f} "
                         f"| PreMAE:{pre_pose_mae.item():.4f}  AMP_G:{post_amp_G.item():.4f} "
                         f"| Unnorm_Kin:{unnorm_kino:.4f}  Unnorm_Obj:{unnorm_obj:.4f} "
-                        f"| ActReg:{action_reg.item():.4f}  KL:{kl_loss.item():.4f} "
+                        f"| KL:{kl_loss.item():.4f} "
                         f"| Sim:{sim_loss.item():.4f}  Beta:{beta:.3f}"
                     )
                     '''

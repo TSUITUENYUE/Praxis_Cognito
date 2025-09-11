@@ -249,8 +249,8 @@ class Go2Env:
             return
 
         ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_pos[:, 0] = gs_rand_float(-0.25, 0.25, (len(envs_idx),), gs.device)
-        ball_pos[:, 1] = gs_rand_float(-0.25, 0.25, (len(envs_idx),), gs.device)
+        ball_pos[:, 0] = gs_rand_float(0.5, 1.5, (len(envs_idx),), gs.device)
+        ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
         ball_pos[:, 2] = gs_rand_float(0.0, 0.5, (len(envs_idx),), gs.device)
         self.ball.set_pos(ball_pos, envs_idx=envs_idx)
 
