@@ -72,9 +72,9 @@ rl:
   command:
     num_commands: 16
     # locomote
-    standoff_r_range: [0.35, 1.20]
+    standoff_r_range: [0.25, 0.5]
     approach_psi_range: [-3.1416, 3.1416]
-    nom_speed_range: [0.0, 1.2]
+    nom_speed_range: [0.25, 1.5]
 
 
     # body pose

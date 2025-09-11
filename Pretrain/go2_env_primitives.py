@@ -259,13 +259,13 @@ class Go2Env:
             return
 
         ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_pos[:, 0] = gs_rand_float(0.5, 3, (len(envs_idx),), gs.device)
-        ball_pos[:, 1] = gs_rand_float(-1.0, 1.0, (len(envs_idx),), gs.device)
-        ball_pos[:, 2] = gs_rand_float(0.0, 1.0, (len(envs_idx),), gs.device)
+        ball_pos[:, 0] = gs_rand_float(1.5, 2.0, (len(envs_idx),), gs.device)
+        ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
+        ball_pos[:, 2] = gs_rand_float(0.0, 0.5, (len(envs_idx),), gs.device)
         self.ball.set_pos(ball_pos, envs_idx=envs_idx)
 
         ball_vel = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_vel[:, 0] = gs_rand_float(-1.0, -0.5, (len(envs_idx),), gs.device)  # Flying towards robot
+        ball_vel[:, 0] = gs_rand_float(-1.5, -0.5, (len(envs_idx),), gs.device)  # Flying towards robot
         ball_vel[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
         ball_vel[:, 2] = gs_rand_float(1.0, 2.0, (len(envs_idx),), gs.device)  # Flying upwards a bit
         self.ball.set_dofs_velocity(ball_vel, dofs_idx_local=[0, 1, 2], envs_idx=envs_idx)
@@ -343,60 +343,98 @@ class Go2Env:
 
     def _reward_object_locomotion(self):
         """
-        Drive the base so the ball sits at (radius=r, angle=ψ) in BODY frame, with
-        a shaping on nominal speed v_nom toward the target anchor.
-
-        commands: [0]=r [m], [1]=ψ [rad], [2]=v_nom [m/s]
-        Uses: self.relative_ball_pos (BODY), self.base_lin_vel (BODY), self.base_ang_vel (BODY)
+        Object-centric locomotion:
+          commands: [0]=r [m], [1]=psi [rad], [2]=v_nom [m/s]
+        Goal: put the ball at (r, psi) in BODY frame and move toward that anchor.
+        Uses only IMU + relative-ball + base vel (real-robot friendly).
         """
-        r_cmd = self.commands[:, 0].clamp(0.0, 5.0)  # safety clamp
+        eps = 1e-6
+        r_cmd = self.commands[:, 0].clamp(0.0, 5.0)
         psi = self.commands[:, 1]
         v_nom = self.commands[:, 2].clamp(0.0, 3.0)
 
-        # target ball position in BODY frame so that at goal the ball is at (r*cosψ, r*sinψ)
-        b_xy = self.relative_ball_pos[:, :2]  # (N,2) ball in BODY
+        # Target anchor for the ball in BODY frame: (r*cos psi, r*sin psi)
+        b_xy = self.relative_ball_pos[:, :2]  # (N,2)
         cpsi, spsi = torch.cos(psi), torch.sin(psi)
         target_b = torch.stack([r_cmd * cpsi, r_cmd * spsi], dim=1)  # (N,2)
 
-        # position error toward target anchor
-        e = (target_b - b_xy)
-        d = torch.linalg.norm(e, dim=1) + 1e-6
-        u_dir = e / d.unsqueeze(-1)  # unit to target
+        # Error & unit direction from current to target (in BODY frame)
+        e = target_b - b_xy  # (N,2)
+        d = torch.linalg.norm(e, dim=1).clamp_min(eps)  # (N,)
+        udir = e / d.unsqueeze(-1)  # (N,2)
 
-        # base velocity alignment + speed shaping
+        # Base planar velocity
         v_xy = self.base_lin_vel[:, :2]
-        v_mag = torch.linalg.norm(v_xy, dim=1) + 1e-6
-        cos_al = (v_xy * u_dir).sum(dim=1) / v_mag  # ∈[-1,1]
-        cos_score = 0.5 * (1.0 + cos_al)  # ∈[0,1]
+        vmag = torch.linalg.norm(v_xy, dim=1).clamp_min(eps)
 
-        d0 = self.reward_cfg.get("obj_loco_d0", 0.6)  # distance scale to fade speed
+        # (A) PROGRESS toward the anchor (zero if not moving closer)
+        prog = (v_xy * udir).sum(dim=1)  # (N,)
+        sigma_p = self.reward_cfg.get("obj_loco_sigma_p", 0.6)
+        r_prog = torch.clamp(prog / sigma_p, 0.0, 1.0)  # [0,1]
+
+        # (B) DISTANCE shaping with long-range gradient (Cauchy kernel)
+        sigma_r = self.reward_cfg.get("obj_loco_sigma_r", 0.6)
+        r_pos = 1.0 / (1.0 + (d / sigma_r) ** 2)  # (N,) in (0,1]
+
+        # (C) SPEED shaping to escape standstill (independent of direction)
+        d0 = self.reward_cfg.get("obj_loco_d0", 0.8)
         v_tgt = v_nom * torch.clamp(d / d0, 0.0, 1.0)
-        sigma_v = self.reward_cfg.get("obj_loco_sigma_v", 0.4)
-        r_speed = torch.exp(- (v_mag - v_tgt) ** 2 / (2 * sigma_v ** 2))
+        sigma_v = self.reward_cfg.get("obj_loco_sigma_v", 0.5)
+        r_speed = torch.exp(- (vmag - v_tgt) ** 2 / (2 * sigma_v ** 2))
 
-        sigma_r = self.reward_cfg.get("obj_loco_sigma_r", 0.25)
-        r_pos = torch.exp(- (d ** 2) / (2 * sigma_r ** 2))
-
-        # yaw shaping from angular error between current ball bearing and ψ
-        ang_b = torch.atan2(b_xy[:, 1], b_xy[:, 0])  # where the ball is now, in BODY
-        ang_t = psi  # where we want it
-        ang_err = torch.atan2(torch.sin(ang_t - ang_b), torch.cos(ang_t - ang_b))  # wrap to [-π,π]
+        # (D) BEARING + YAW shaping (keep heading sane) -- FADED NEAR GOAL
+        ang_b = torch.atan2(b_xy[:, 1], b_xy[:, 0])  # current bearing of ball in BODY
+        ang_err = torch.atan2(torch.sin(psi - ang_b), torch.cos(psi - ang_b))
+        sigma_b = self.reward_cfg.get("obj_loco_sigma_bearing", 0.6)
+        r_bear = torch.exp(- (ang_err ** 2) / (2 * sigma_b ** 2))
         k_w = self.reward_cfg.get("obj_loco_k_w", 1.5)
         sigma_w = self.reward_cfg.get("obj_loco_sigma_w", 1.0)
         r_yaw = torch.exp(- (self.base_ang_vel[:, 2] - k_w * ang_err) ** 2 / (2 * sigma_w ** 2))
 
-        # posture/height gate (same spirit as your limb-vel reward)
-        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5
-        z = self.base_pos[:, 2]
-        z0, z1 = 0.24, 0.30
-        gate_h = ((z - z0) / (z1 - z0)).clamp(0.0, 1.0)
-        gate = (upr ** 2) * gate_h
+        # Fade yaw/bearing when close so they don't incentivize tangential "orbiting"
+        d_yaw = self.reward_cfg.get("obj_loco_d_yaw", 1.0)
+        g_yaw = torch.clamp(d / max(d_yaw, eps), 0.0, 1.0)  # 0 near, 1 far
+        r_bear = r_bear * g_yaw
+        r_yaw = r_yaw * g_yaw
 
-        w_pos = self.reward_cfg.get("obj_loco_w_pos", 0.5)
-        w_spd = self.reward_cfg.get("obj_loco_w_spd", 0.35)
-        w_yaw = self.reward_cfg.get("obj_loco_w_yaw", 0.15)
+        # Soft posture gate (IMU only; avoid hard-multiplying to zero)
+        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5  # ∈[0,1]
+        gate = 0.3 + 0.7 * upr  # floor keeps gradients alive
 
-        return gate * (w_pos * r_pos + w_spd * (cos_score * r_speed) + w_yaw * r_yaw)
+        # Penalties
+        # (i) moving directly away from the anchor
+        pen_away = self.reward_cfg.get("obj_loco_pen_away", 0.05) * torch.tanh((-prog).clamp_min(0.0))
+
+        # (ii) tangential motion near the target (orbiting)
+        v_r = prog  # radial component
+        v_t = torch.sqrt((vmag ** 2 - v_r ** 2).clamp_min(0.0))  # tangential speed
+        d_tan = self.reward_cfg.get("obj_loco_d_tan", 0.8)
+        # near-goal gate: 1 near, 0 far (linear; keep it simple & smooth)
+        g_tan = 1.0 - torch.clamp(d / max(d_tan, eps), 0.0, 1.0)
+        w_tan = self.reward_cfg.get("obj_loco_w_tan", 0.05)
+        pen_tan = w_tan * g_tan * v_t
+
+        # Terminal settle bonus (encourage stopping when well positioned)
+        tau_d = self.reward_cfg.get("obj_loco_tau_d", 0.15)
+        tau_v = self.reward_cfg.get("obj_loco_tau_v", 0.15)
+        w_done = self.reward_cfg.get("obj_loco_w_done", 0.05)
+        bonus = w_done * (d < tau_d).float() * (vmag < tau_v).float()
+
+        # Weights
+        w_pos = self.reward_cfg.get("obj_loco_w_pos", 0.35)
+        w_prog = self.reward_cfg.get("obj_loco_w_prog", 0.35)
+        w_spd = self.reward_cfg.get("obj_loco_w_spd", 0.20)
+        w_bear = self.reward_cfg.get("obj_loco_w_bear", 0.05)
+        w_yaw = self.reward_cfg.get("obj_loco_w_yaw", 0.05)
+
+        r = (w_pos * r_pos +
+             w_prog * r_prog +
+             w_spd * r_speed +
+             w_bear * r_bear +
+             w_yaw * r_yaw)
+
+        # Final: discourage orbiting/retreat, add settle bonus
+        return gate * (r - pen_away - pen_tan) + bonus
 
     def _reward_tracking_body_pose(self):
         """
