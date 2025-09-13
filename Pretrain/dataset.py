@@ -60,7 +60,8 @@ class TrajectoryDataset(Dataset):
 
         p = torch.from_numpy(self.h5_file['base_pos'][idx]).float()     # [T, 3]  (raw)
         dp = torch.from_numpy(self.h5_file['base_vel'][idx]).float()    # [T, 3]  (raw)
-        w = torch.from_numpy(self.h5_file['base_ang'][idx]).float()     # [T, 3]  (raw)
+        w = torch.from_numpy(self.h5_file['base_quat'][idx]).float()
+        dw = torch.from_numpy(self.h5_file['base_ang'][idx]).float()     # [T, 3]  (raw)
 
         u = torch.from_numpy(self.h5_file['ball_pos'][idx]).float()     # [T, 3]  (raw)
         du = torch.from_numpy(self.h5_file['ball_vel'][idx]).float()    # [T, 3]  (raw)
@@ -118,6 +119,7 @@ class TrajectoryDataset(Dataset):
             dof_vel = f_in['dof_vel']  # [N,T,D]
             base_pos_ds = f_in['base_pos']  # [N,T,3]
             base_vel_ds = f_in['base_vel']  # [N,T,3]
+            base_quat_ds = f_in['base_quat'] # [N,T,4]
             base_ang_ds = f_in['base_ang']  # [N,T,3]
             ball_pos_ds = f_in['ball_pos']  # [N,T,3]
             ball_vel_ds = f_in['ball_vel']  # [N,T,3]
@@ -145,6 +147,7 @@ class TrajectoryDataset(Dataset):
 
             f_out.create_dataset('base_pos', (N, T, 3), dtype='f4')
             f_out.create_dataset('base_vel', (N, T, 3), dtype='f4')
+            f_out.create_dataset('base_quat', (N, T, 4), dtype='f4')
             f_out.create_dataset('base_ang', (N, T, 3), dtype='f4')
 
             f_out.create_dataset('ball_pos', (N, T, 3), dtype='f4')
@@ -187,6 +190,7 @@ class TrajectoryDataset(Dataset):
 
                 f_out['base_pos'][i:j] = base_pos_ds[i:j].astype('f4')
                 f_out['base_vel'][i:j] = base_vel_ds[i:j].astype('f4')
+                f_out['base_quat'][i:j] = base_quat_ds[i:j].astype('f4')
                 f_out['base_ang'][i:j] = base_ang_ds[i:j].astype('f4')
                 f_out['ball_pos'][i:j] = ball_pos_ds[i:j].astype('f4')
                 f_out['ball_vel'][i:j] = ball_vel_ds[i:j].astype('f4')

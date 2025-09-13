@@ -15,10 +15,10 @@ from Model.agent import Agent
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="1go2base")
+    parser.add_argument("-e", "--exp_name", type=str, default="4go2hop")
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
     parser.add_argument("--max_iterations", type=int, default=401)
-    parser.add_argument("--config", type=str, default="../conf/go2base.yaml")
+    parser.add_argument("--config", type=str, default="../conf/go2hop.yaml")
     args = parser.parse_args()
 
     gs.init(logging_level="warning")

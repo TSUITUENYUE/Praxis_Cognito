@@ -48,7 +48,7 @@ rl:
     dt: 0.02
 
   obs:
-    num_obs: 51
+    num_obs: 64
     obs_scales:
       lin_vel: 2.0
       ang_vel: 0.25
@@ -60,19 +60,47 @@ rl:
     base_height_target: 0.3
     feet_height_target: 0.075
     reward_scales:
-      tracking_lin_vel: 1.0
-      tracking_ang_vel: 0.2
-      lin_vel_z: -1.0
-      base_height: -50.0
-      action_rate: -0.005
+      tracking_lin_vel: 0.0
+      tracking_ang_vel: 0.0
+      tracking_body_pose: 0.0
+      tracking_limb_vel: 0.0
+      tracking_contact_hold: 0.0
+      tracking_hop: 0.0
+
+      lin_vel_z: 0.0
+      base_height: 0.0
+      action_rate: 0.0
       similar_to_default: -0.1
+      upright: 0.0
 
   command:
-    num_commands: 3
-    # walk
-    lin_vel_x_range: [0.5, 0.5]
-    lin_vel_y_range: [0.0, 0.0]
-    ang_vel_range: [0.0, 0.0]
+    num_commands: 16
+    # locomote
+    standoff_r_range: [0.0, 0.2]
+    approach_psi_range: [-1.5, 1.5]
+    nom_speed_range: [0.25, 1.5]
+
+
+    # body pose
+    dz_range: [ -0.06, 0.10 ]
+    pitch_range: [ -0.26, 0.52 ]  # rad
+    roll_range: [ -0.17, 0.17 ]  # rad
+
+    # limbvel
+    ee_vx_range: [-0.8, 0.8]
+    ee_vy_range: [-0.8, 0.8]
+    ee_vz_range: [-0.5, 0.5]
+    imp_s_range: [0.5, 1.0]
+
+    # contact hold
+    Fn_range: [ 20.0, 120.0 ]
+    vt_range: [ -0.2, 0.2 ]
+    phi_range: [ -3.1416, 3.1416 ]
+
+    # hop
+    apex_h_range: [ 0.05, 0.4 ]
+    psi_range: [ -3.1416, 3.1416 ]
+    pitch_imp_range: [ -1.0, 1.0 ]
 
   train:
     algorithm:
@@ -98,10 +126,10 @@ rl:
       class_name: ActorCritic
     runner:
       checkpoint: -1
-      experiment_name: go2-walking
+      experiment_name: go2
       load_run: -1
       log_interval: 1
-      max_iterations: 201
+      max_iterations: 401
       record_interval: -1
       resume: false
       resume_path: null
@@ -111,29 +139,30 @@ rl:
     save_interval: 100
     empirical_normalization: null
     seed: 1
+    log_dir: "Pretrain/primitives"
 
 
 
 
 dataset:
-  num_envs: 25000
+  num_envs: 20000
   #num_envs: 32768
   episodes: 150000
   max_episode_seconds: 3
   frame_rate: 25
-
+  preview: true
   log_dir: "Pretrain/primitives"
-  curiosity_beta: 0.1
+  curiosity_beta: 0.5
   policy_hidden_dim: 256
-  similarity_threshold: 0.6
+  similarity_threshold: 0.7
   downsample_factor: 5
   write_buffer_size: 5000
   loss_beta: 0.2
 
 
   agent_pos: [ 0.0, 0.0, 0.42]
-  obj_pos_low: [ -0.5, -0.5, 0.0 ]
-  obj_pos_high: [ 0.5, 0.5, 1.0 ]
+  obj_pos_low: [ -0.1, -0.1, 0.0 ]
+  obj_pos_high: [ 0.1, 0.1, 0.2 ]
   obj_vel_low: [ -1.5, -1.5, -1.5 ]
   obj_vel_high: [ 1.5, 1.5, 1.5 ]
 
@@ -144,7 +173,7 @@ model:
     hidden_features: 128
     num_layers: 2
     rnn_hidden: 128
-    latent_dim: 64
+    latent_dim: 8
     seq_len: ${mul:${dataset.max_episode_seconds},${dataset.frame_rate}}
     hidden_dim: 128
   res_rl: {}
@@ -161,7 +190,7 @@ trainer:
     lr: 0.001
   beta_anneal:
     strategy: "warmup"
-    warm_up: 0
+    warm_up: 600
     max_beta: 0.1
     #max_beta: 0.00001
   save_path: "./Pretrain/output/${agent.name} ${model.vae.prior}/"

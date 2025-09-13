@@ -21,8 +21,8 @@ from rsl_rl.runners import OnPolicyRunner
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="../conf/go2base.yaml", help="unified YAML config, e.g. ./conf/go2base.yaml")
-    parser.add_argument("-e", "--exp_name", default="1go2base",type=str,help="experiment name under Pretrain/primitives/")
+    parser.add_argument("--config", type=str, default="../conf/go2hop.yaml", help="unified YAML config, e.g. ./conf/go2.yaml")
+    parser.add_argument("-e", "--exp_name", default="4go2hop",type=str,help="experiment name under Pretrain/primitives/")
     parser.add_argument("--ckpt", type=int, default=400, help="checkpoint index to load")
     parser.add_argument("--episodes", type=int, default=1, help="number of episodes to record")
     parser.add_argument("--viewer", action="store_true", help="show viewer while recording")

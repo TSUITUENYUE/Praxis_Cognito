@@ -60,7 +60,7 @@ rl:
     base_height_target: 0.3
     feet_height_target: 0.075
     reward_scales:
-      tracking_hop: 20.0
+      tracking_hop: 5.0
 
       action_rate: -0.005
       similar_to_default: -0.1
@@ -69,9 +69,10 @@ rl:
   command:
     num_commands: 16
     # locomote
-    lin_vel_x_range: [-0.0, 0.0]
-    lin_vel_y_range: [-0.0, 0.0]
-    ang_vel_range:   [-0.0, 0.0]
+    standoff_r_range: [0.0, 0.0]
+    approach_psi_range: [0.0, 0.0]
+    nom_speed_range: [0.0, 0.0]
+
 
     # body pose
     dz_range: [ -0.0, 0.0 ]

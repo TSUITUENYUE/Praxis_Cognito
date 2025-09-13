@@ -13,7 +13,7 @@ class Go2Env:
         self.num_envs = num_envs
         # derive observation dimension if not provided (keeps pipeline consistent)
         self.num_actions = env_cfg.get("num_actions", 12)
-        self.num_commands = command_cfg.get("num_commands", 14)
+        self.num_commands = command_cfg.get("num_commands", 16)
         # base_ang_vel(3) + gravity(3) + commands(C) + dof_pos(A) + dof_vel(A) + actions(A) + rel_ball_pos(3) + rel_ball_vel(3)
         derived_num_obs = 3 + 3 + self.num_commands + (3 * self.num_actions) + 3 + 3
         self.num_obs = int(obs_cfg.get("num_obs") or derived_num_obs)
@@ -258,19 +258,38 @@ class Go2Env:
         if len(envs_idx) == 0:
             return
 
-        ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_pos[:, 0] = gs_rand_float(1.5, 2.0, (len(envs_idx),), gs.device)
-        ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
-        ball_pos[:, 2] = gs_rand_float(0.0, 0.5, (len(envs_idx),), gs.device)
-        self.ball.set_pos(ball_pos, envs_idx=envs_idx)
+        N = len(envs_idx)
 
-        ball_vel = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_vel[:, 0] = gs_rand_float(-1.5, -0.5, (len(envs_idx),), gs.device)  # Flying towards robot
-        ball_vel[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
-        ball_vel[:, 2] = gs_rand_float(1.0, 2.0, (len(envs_idx),), gs.device)  # Flying upwards a bit
-        self.ball.set_dofs_velocity(ball_vel, dofs_idx_local=[0, 1, 2], envs_idx=envs_idx)
+        # ---- Ball placement: close & in the front arc (BODY frame), then map to WORLD ----
+        r_min = float(self.env_cfg.get("ball_r_min", 0.35))
+        r_max = float(self.env_cfg.get("ball_r_max", 1.50))
+        theta_max = math.radians(float(self.env_cfg.get("ball_theta_max_deg", 70.0)))
+        z_min = float(self.env_cfg.get("ball_z_min", 0.05))
+        z_max = float(self.env_cfg.get("ball_z_max", 0.50))
 
-        # reset dofs
+        r = gs_rand_float(r_min, r_max, (N,), gs.device)
+        theta = gs_rand_float(-theta_max, theta_max, (N,), gs.device)
+
+        u_rel = torch.zeros(N, 3, device=gs.device, dtype=gs.tc_float)
+        u_rel[:, 0] = r * torch.cos(theta)  # forward
+        u_rel[:, 1] = r * torch.sin(theta)  # lateral
+        u_rel[:, 2] = gs_rand_float(z_min, z_max, (N,), gs.device)
+
+        u_w = transform_by_quat(u_rel, self.base_init_quat) + self.base_init_pos
+        self.ball.set_pos(u_w, envs_idx=envs_idx)
+
+        # Small inward + upward velocity to keep it in play
+        v_speed = gs_rand_float(0.0, 0.40, (N,), gs.device)
+        dir_xy = -u_rel[:, :2]
+        dir_xy = dir_xy / (torch.norm(dir_xy, dim=1, keepdim=True) + 1e-6)
+        v_rel = torch.zeros(N, 3, device=gs.device, dtype=gs.tc_float)
+        v_rel[:, :2] = dir_xy * v_speed.unsqueeze(-1)
+        v_rel[:, 2] = gs_rand_float(0.0, 0.20, (N,), gs.device)
+
+        v_w = transform_by_quat(v_rel, self.base_init_quat)
+        self.ball.set_dofs_velocity(v_w, dofs_idx_local=[0, 1, 2], envs_idx=envs_idx)
+
+        # ---- Robot reset (as before) ----
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
@@ -280,7 +299,6 @@ class Go2Env:
             envs_idx=envs_idx,
         )
 
-        # reset base
         self.base_pos[envs_idx] = self.base_init_pos
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
         self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
@@ -289,13 +307,11 @@ class Go2Env:
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
 
-        # reset buffers
         self.last_actions[envs_idx] = 0.0
         self.last_dof_vel[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
 
-        # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
@@ -343,97 +359,116 @@ class Go2Env:
 
     def _reward_object_locomotion(self):
         """
-        Object-centric locomotion:
-          commands: [0]=r [m], [1]=psi [rad], [2]=v_nom [m/s]
-        Goal: put the ball at (r, psi) in BODY frame and move toward that anchor.
-        Uses only IMU + relative-ball + base vel (real-robot friendly).
+        Unified base primitive (6 cmds):
+          [0]=r [m], [1]=psi [rad], [2]=v_nom [m/s], [3]=dz [m], [4]=pitch [rad], [5]=roll [rad]
+
+        Objectives:
+          • Object-centric locomotion to the anchor (r, psi) in BODY frame
+          • Face the ball on the plane (heading)
+          • Track body pose: (dz via base height, pitch & roll via IMU gravity)
+
+        Real-robot friendly signals in obs: IMU (gravity, yaw rate), base vel, relative-ball.
         """
         eps = 1e-6
         r_cmd = self.commands[:, 0].clamp(0.0, 5.0)
         psi = self.commands[:, 1]
         v_nom = self.commands[:, 2].clamp(0.0, 3.0)
 
-        # Target anchor for the ball in BODY frame: (r*cos psi, r*sin psi)
+        dz_t = self.commands[:, 3]
+        pitch_t = self.commands[:, 4]
+        roll_t = self.commands[:, 5]
+
+        # ---- Object-centric anchor tracking ----
         b_xy = self.relative_ball_pos[:, :2]  # (N,2)
         cpsi, spsi = torch.cos(psi), torch.sin(psi)
         target_b = torch.stack([r_cmd * cpsi, r_cmd * spsi], dim=1)  # (N,2)
 
-        # Error & unit direction from current to target (in BODY frame)
-        e = target_b - b_xy  # (N,2)
-        d = torch.linalg.norm(e, dim=1).clamp_min(eps)  # (N,)
-        udir = e / d.unsqueeze(-1)  # (N,2)
+        e = target_b - b_xy
+        d = torch.linalg.norm(e, dim=1).clamp_min(eps)
+        udir = e / d.unsqueeze(-1)
 
-        # Base planar velocity
         v_xy = self.base_lin_vel[:, :2]
         vmag = torch.linalg.norm(v_xy, dim=1).clamp_min(eps)
+        prog = (v_xy * udir).sum(dim=1)  # toward target
 
-        # (A) PROGRESS toward the anchor (zero if not moving closer)
-        prog = (v_xy * udir).sum(dim=1)  # (N,)
         sigma_p = self.reward_cfg.get("obj_loco_sigma_p", 0.6)
-        r_prog = torch.clamp(prog / sigma_p, 0.0, 1.0)  # [0,1]
+        r_prog = torch.clamp(prog / sigma_p, 0.0, 1.0)
 
-        # (B) DISTANCE shaping with long-range gradient (Cauchy kernel)
         sigma_r = self.reward_cfg.get("obj_loco_sigma_r", 0.6)
-        r_pos = 1.0 / (1.0 + (d / sigma_r) ** 2)  # (N,) in (0,1]
+        r_pos = 1.0 / (1.0 + (d / sigma_r) ** 2)
 
-        # (C) SPEED shaping to escape standstill (independent of direction)
         d0 = self.reward_cfg.get("obj_loco_d0", 0.8)
         v_tgt = v_nom * torch.clamp(d / d0, 0.0, 1.0)
         sigma_v = self.reward_cfg.get("obj_loco_sigma_v", 0.5)
         r_speed = torch.exp(- (vmag - v_tgt) ** 2 / (2 * sigma_v ** 2))
 
-        # (D) BEARING + YAW shaping (keep heading sane) -- FADED NEAR GOAL
-        ang_b = torch.atan2(b_xy[:, 1], b_xy[:, 0])  # current bearing of ball in BODY
-        ang_err = torch.atan2(torch.sin(psi - ang_b), torch.cos(psi - ang_b))
-        sigma_b = self.reward_cfg.get("obj_loco_sigma_bearing", 0.6)
-        r_bear = torch.exp(- (ang_err ** 2) / (2 * sigma_b ** 2))
-        k_w = self.reward_cfg.get("obj_loco_k_w", 1.5)
+        # Heading: BODY X-axis → ball (planar)
+        ang_b = torch.atan2(b_xy[:, 1], b_xy[:, 0])
+        sigma_head = self.reward_cfg.get("obj_loco_sigma_head", 0.5)
+        r_head = torch.exp(- (ang_b ** 2) / (2 * sigma_head ** 2))
+
+        k_turn = self.reward_cfg.get("obj_loco_k_turn", 1.6)
         sigma_w = self.reward_cfg.get("obj_loco_sigma_w", 1.0)
-        r_yaw = torch.exp(- (self.base_ang_vel[:, 2] - k_w * ang_err) ** 2 / (2 * sigma_w ** 2))
+        r_turn = torch.exp(- (self.base_ang_vel[:, 2] + k_turn * ang_b) ** 2 / (2 * sigma_w ** 2))
 
-        # Fade yaw/bearing when close so they don't incentivize tangential "orbiting"
-        d_yaw = self.reward_cfg.get("obj_loco_d_yaw", 1.0)
-        g_yaw = torch.clamp(d / max(d_yaw, eps), 0.0, 1.0)  # 0 near, 1 far
-        r_bear = r_bear * g_yaw
-        r_yaw = r_yaw * g_yaw
+        # ---- Pose tracking (dz, pitch, roll) ----
+        # IMU gravity → pitch/roll (yaw-free); base height for dz
+        g = self.projected_gravity  # (N,3)
+        pitch = torch.atan2(g[:, 0], -g[:, 2])
+        roll = torch.atan2(-g[:, 1], -g[:, 2])
 
-        # Soft posture gate (IMU only; avoid hard-multiplying to zero)
-        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5  # ∈[0,1]
-        gate = 0.3 + 0.7 * upr  # floor keeps gradients alive
+        e_pitch = torch.atan2(torch.sin(pitch - pitch_t), torch.cos(pitch - pitch_t))
+        e_roll = torch.atan2(torch.sin(roll - roll_t), torch.cos(roll - roll_t))
 
-        # Penalties
-        # (i) moving directly away from the anchor
+        sigma_pitch = self.reward_cfg.get("sigma_pitch", 0.25)
+        sigma_roll = self.reward_cfg.get("sigma_roll", 0.25)
+        r_orient = torch.exp(- (e_pitch ** 2) / (2 * sigma_pitch ** 2)
+                             - (e_roll ** 2) / (2 * sigma_roll ** 2))
+
+        h_nominal = self.reward_cfg.get("base_height_nominal", 0.32)
+        h_tgt = h_nominal + dz_t
+        sigma_h = self.reward_cfg.get("sigma_h", 0.02)
+        r_height = torch.exp(- torch.square(self.base_pos[:, 2] - h_tgt) / (2 * sigma_h ** 2))
+
+        # ---- Penalties & bonuses ----
         pen_away = self.reward_cfg.get("obj_loco_pen_away", 0.05) * torch.tanh((-prog).clamp_min(0.0))
-
-        # (ii) tangential motion near the target (orbiting)
-        v_r = prog  # radial component
-        v_t = torch.sqrt((vmag ** 2 - v_r ** 2).clamp_min(0.0))  # tangential speed
+        v_r = prog
+        v_t = torch.sqrt((vmag ** 2 - v_r ** 2).clamp_min(0.0))
         d_tan = self.reward_cfg.get("obj_loco_d_tan", 0.8)
-        # near-goal gate: 1 near, 0 far (linear; keep it simple & smooth)
-        g_tan = 1.0 - torch.clamp(d / max(d_tan, eps), 0.0, 1.0)
+        g_tan = 1.0 - torch.clamp(d / max(d_tan, eps), 0.0, 1.0)  # only near goal
         w_tan = self.reward_cfg.get("obj_loco_w_tan", 0.05)
         pen_tan = w_tan * g_tan * v_t
 
-        # Terminal settle bonus (encourage stopping when well positioned)
-        tau_d = self.reward_cfg.get("obj_loco_tau_d", 0.15)
+        tau_d = self.reward_cfg.get("obj_loco_tau_d", 0.18)
+        tau_ang = self.reward_cfg.get("obj_loco_tau_ang", 0.35)  # ~20°
         tau_v = self.reward_cfg.get("obj_loco_tau_v", 0.15)
-        w_done = self.reward_cfg.get("obj_loco_w_done", 0.05)
-        bonus = w_done * (d < tau_d).float() * (vmag < tau_v).float()
+        sharp = self.reward_cfg.get("obj_loco_tau_k", 6.0)
+        w_done = self.reward_cfg.get("obj_loco_w_done", 0.08)
+        bonus = w_done * torch.sigmoid(sharp * (tau_d - d)) \
+                * torch.sigmoid(sharp * (tau_ang - ang_b.abs())) \
+                * torch.sigmoid(sharp * (tau_v - vmag))
 
-        # Weights
-        w_pos = self.reward_cfg.get("obj_loco_w_pos", 0.35)
-        w_prog = self.reward_cfg.get("obj_loco_w_prog", 0.35)
-        w_spd = self.reward_cfg.get("obj_loco_w_spd", 0.20)
-        w_bear = self.reward_cfg.get("obj_loco_w_bear", 0.05)
-        w_yaw = self.reward_cfg.get("obj_loco_w_yaw", 0.05)
+        # ---- Soft posture gate (keep gradients alive) ----
+        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5
+        gate = 0.3 + 0.7 * upr
+
+        # ---- Weights ----
+        w_pos = self.reward_cfg.get("obj_loco_w_pos", 0.22)
+        w_prog = self.reward_cfg.get("obj_loco_w_prog", 0.28)
+        w_spd = self.reward_cfg.get("obj_loco_w_spd", 0.16)
+        w_head = self.reward_cfg.get("obj_loco_w_head", 0.10)
+        w_turn = self.reward_cfg.get("obj_loco_w_turn", 0.06)
+        w_orient = self.reward_cfg.get("w_pose_orient", 0.10)
+        w_h = self.reward_cfg.get("w_pose_height", 0.08)
 
         r = (w_pos * r_pos +
              w_prog * r_prog +
              w_spd * r_speed +
-             w_bear * r_bear +
-             w_yaw * r_yaw)
+             w_head * r_head +
+             w_turn * r_turn +
+             w_orient * r_orient +
+             w_h * r_height)
 
-        # Final: discourage orbiting/retreat, add settle bonus
         return gate * (r - pen_away - pen_tan) + bonus
 
     def _reward_tracking_body_pose(self):
@@ -620,7 +655,7 @@ class Go2Env:
         r_pitch = torch.exp(- (pitch_rate - k_rate * imp) ** 2 / (2 * sigma_pitch ** 2))
 
         # (5) apex-height shaping only while in flight
-        h0 = self.reward_cfg.get("base_height_target", 0.30)
+        h0 = self.reward_cfg.get("base_height_target", 0.6)
         h_gain = (self.base_pos[:, 2] - h0).clamp(min=0.0)
         sigma_h = 0.06
         r_apex = torch.exp(- (h_gain - h_cmd) ** 2 / (2 * sigma_h ** 2)) * in_flight

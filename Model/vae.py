@@ -326,38 +326,14 @@ class IntentionVAE(nn.Module):
         relative_ball_pos = transform_by_quat(u_next - p_next, inv_q_next)
         relative_ball_vel = transform_by_quat(du_next - dp_next, inv_q_next)
 
-        # --- Base height (world z) ---
-        base_height = p_next[:, 2:3]
-
-        # --- Contact flags via surrogate dynamics (per end-effector) ---
-        # Approximate contact using signed distance of EE link-spheres to ground (z - radius).
-        # Gate with a sigmoid and threshold to obtain binary flags, matching env format.
-        with torch.no_grad():
-            link_pos_base = self.surrogate.fk(q_next).view(B, -1, 3)  # [B,L,3] in BASE frame
-            # rotate to WORLD and translate by base position
-            L = link_pos_base.shape[1]
-            link_flat = link_pos_base.reshape(B * L, 3)
-            quat_rep = w_next.repeat_interleave(L, dim=0)
-            link_world_flat = transform_by_quat(link_flat, quat_rep)
-            link_pos_world = link_world_flat.view(B, L, 3) + p_next.view(B, 1, 3)
-
-            ee_idx = self.ee_idx
-            z_world_ee = link_pos_world[:, ee_idx, 2]  # [B, E]
-            radii_ee = self.surrogate.link_bsphere_radius[ee_idx].view(1, -1).to(z_world_ee.device)
-            sdf_ee = z_world_ee - radii_ee  # >0 above ground, <0 penetrating
-            prob_ee = torch.sigmoid(-sdf_ee / max(1e-6, float(self.surrogate.sdf_tau)))
-            contact_flags = (prob_ee > 0.5).to(z_world_ee.dtype)  # [B, E] as float
 
         obs_pred = torch.cat([
             cmd * self.command_scale,  # commands
-            base_lin_vel * self.cfg.obs.obs_scales["lin_vel"],  # 3
             base_ang_vel * self.cfg.obs.obs_scales["ang_vel"],  # 3
             proj_g,  # 3
-            base_height,  # 1 (inserted to match env format)
             (q_next - self.default_dof_pos) * self.cfg.obs.obs_scales["dof_pos"],  # d
             dq_next * self.cfg.obs.obs_scales["dof_vel"],  # d
             exec_actions_last,  # d
-            contact_flags,  # E contact flags to mirror env (e.g., 4 feet)
             relative_ball_pos,  # 3
             relative_ball_vel  # 3
         ], dim=-1)

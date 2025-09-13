@@ -13,7 +13,7 @@ class Go2Env:
         self.num_envs = num_envs
         # derive observation dimension if not provided (keeps pipeline consistent)
         self.num_actions = env_cfg.get("num_actions", 12)
-        self.num_commands = command_cfg.get("num_commands", 14)
+        self.num_commands = command_cfg.get("num_commands", 16)
         # base_ang_vel(3) + gravity(3) + commands(C) + dof_pos(A) + dof_vel(A) + actions(A) + rel_ball_pos(3) + rel_ball_vel(3)
         derived_num_obs = 3 + 3 + self.num_commands + (3 * self.num_actions) + 3 + 3
         self.num_obs = int(obs_cfg.get("num_obs") or derived_num_obs)
@@ -124,23 +124,48 @@ class Go2Env:
         self.extras = dict()  # extra information for logging
         self.extras["observations"] = dict()
 
-    def set_commands(self, commands):
-        cfg = self.command_cfg
-        lows = torch.tensor([
-            cfg["lin_vel_x_range"][0], cfg["lin_vel_y_range"][0], cfg["ang_vel_range"][0],
-            cfg["dz_range"][0], cfg["pitch_range"][0], cfg["roll_range"][0],
-            cfg["ee_vx_range"][0], cfg["ee_vy_range"][0], cfg["ee_vz_range"][0], cfg["imp_s_range"][0],
-            cfg["Fn_range"][0], cfg["vt_range"][0], cfg["phi_range"][0],
-            cfg["apex_h_range"][0], cfg["psi_range"][0], cfg["pitch_imp_range"][0],
-        ], device=self.commands.device, dtype=self.commands.dtype)
-        highs = torch.tensor([
-            cfg["lin_vel_x_range"][1], cfg["lin_vel_y_range"][1], cfg["ang_vel_range"][1],
-            cfg["dz_range"][1], cfg["pitch_range"][1], cfg["roll_range"][1],
-            cfg["ee_vx_range"][1], cfg["ee_vy_range"][1], cfg["ee_vz_range"][1], cfg["imp_s_range"][1],
-            cfg["Fn_range"][1], cfg["vt_range"][1], cfg["phi_range"][1],
-            cfg["apex_h_range"][1], cfg["psi_range"][1], cfg["pitch_imp_range"][1],
-        ], device=self.commands.device, dtype=self.commands.dtype)
-        self.commands = lows + commands * (highs - lows)
+    def _resample_commands(self, envs_idx):
+        if len(envs_idx) == 0:
+            return
+        # ---- indices (union layout) ----
+        # 0-2   locomote:   [vx, vy, wz]
+        # 3-5   body pose:  [Δz, Δpitch, Δroll]
+        # 6-9   limbvel:    [ee_vx, ee_vy, ee_vz, imp_s]
+        # 10-12 contact:    [Fn, vt, φ]
+        # 13-15 hop:        [apex_h, ψ, pitch_imp]
+
+        # locomote
+        # ----- OBJECT-CENTRIC LOCOMOTION (0..2) -----
+
+        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["standoff_r_range"], (len(envs_idx),), gs.device)  # r
+        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["approach_psi_range"], (len(envs_idx),), gs.device)  # ψ
+        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["nom_speed_range"], (len(envs_idx),), gs.device)  # v_nom
+
+        # ----- BODY POSE (3..5) UNCHANGED -----
+        self.commands[envs_idx, 3] = gs_rand_float(*self.command_cfg["dz_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["pitch_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 5] = gs_rand_float(*self.command_cfg["roll_range"], (len(envs_idx),), gs.device)
+
+        # body pose
+        self.commands[envs_idx, 3] = gs_rand_float(*self.command_cfg["dz_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["pitch_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 5] = gs_rand_float(*self.command_cfg["roll_range"], (len(envs_idx),), gs.device)
+
+        # limbvel
+        self.commands[envs_idx, 6] = gs_rand_float(*self.command_cfg["ee_vx_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 7] = gs_rand_float(*self.command_cfg["ee_vy_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 8] = gs_rand_float(*self.command_cfg["ee_vz_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 9] = gs_rand_float(*self.command_cfg["imp_s_range"], (len(envs_idx),), gs.device)
+
+        # contact hold
+        self.commands[envs_idx, 10] = gs_rand_float(*self.command_cfg["Fn_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 11] = gs_rand_float(*self.command_cfg["vt_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 12] = gs_rand_float(*self.command_cfg["phi_range"], (len(envs_idx),), gs.device)
+
+        # hop
+        self.commands[envs_idx, 13] = gs_rand_float(*self.command_cfg["apex_h_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 14] = gs_rand_float(*self.command_cfg["psi_range"], (len(envs_idx),), gs.device)
+        self.commands[envs_idx, 15] = gs_rand_float(*self.command_cfg["pitch_imp_range"], (len(envs_idx),), gs.device)
 
     def step(self, actions):
         # actions = torch.tanh(actions)
@@ -169,10 +194,13 @@ class Go2Env:
         # express in base frame
         self.relative_ball_pos = transform_by_quat(ball_pos - self.base_pos, inv_base_quat)
         self.relative_ball_vel = transform_by_quat(ball_vel - self.robot.get_vel(), inv_base_quat)
-
-
-        #self._resample_commands(envs_idx)
-
+        # resample commands
+        envs_idx = (
+            (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
+            .nonzero(as_tuple=False)
+            .reshape((-1,))
+        )
+        self._resample_commands(envs_idx)
         # check termination and reset
         self.reset_buf = self.episode_length_buf > self.max_episode_length
         #self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
@@ -191,33 +219,15 @@ class Go2Env:
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
-        #print(self.robot.get_link)
-        links_F = self.robot.get_links_net_contact_force()
-
-        # pick feet: (N, 4, 3) → norm: (N, 4)
-        #print(links_F.shape)
-        F_foot = links_F[:,self.ee_idx]
-        F_norm = torch.linalg.norm(F_foot, dim=-1)
-
-        # hysteresis: turn on when > ON, turn off when < OFF, otherwise hold previous
-        on = (F_norm > self.contact_on_force_N)
-        off = (F_norm < self.contact_off_force_N)
-        # keep dtype consistent with obs_buf
-        self.contact_flags = torch.where(on, 1.0, torch.where(off, 0.0, self.contact_flags))
         # compute observations
-        base_height = self.base_pos[:, 2:3]
-
         self.obs_buf = torch.cat(
             [
-                self.commands * self.commands_scale,  # 14
-                self.base_lin_vel * self.obs_scales["lin_vel"],  # 3
+                self.commands * self.commands_scale,  # 16
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
                 self.projected_gravity,  # 3
-                base_height,  # 1   <-- NEW
                 (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # A
                 self.dof_vel * self.obs_scales["dof_vel"],  # A
                 exec_actions,  # A
-                self.contact_flags,  # 4   <-- NEW
                 self.relative_ball_pos,  # 3
                 self.relative_ball_vel  # 3
             ],
@@ -248,19 +258,38 @@ class Go2Env:
         if len(envs_idx) == 0:
             return
 
-        ball_pos = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_pos[:, 0] = gs_rand_float(0.5, 1.5, (len(envs_idx),), gs.device)
-        ball_pos[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
-        ball_pos[:, 2] = gs_rand_float(0.0, 0.5, (len(envs_idx),), gs.device)
-        self.ball.set_pos(ball_pos, envs_idx=envs_idx)
+        N = len(envs_idx)
 
-        ball_vel = torch.zeros(len(envs_idx), 3, device=gs.device)
-        ball_vel[:, 0] = gs_rand_float(-1.0, -0.5, (len(envs_idx),), gs.device)  # Flying towards robot
-        ball_vel[:, 1] = gs_rand_float(-0.5, 0.5, (len(envs_idx),), gs.device)
-        ball_vel[:, 2] = gs_rand_float(1.0, 2.0, (len(envs_idx),), gs.device)  # Flying upwards a bit
-        self.ball.set_dofs_velocity(ball_vel, dofs_idx_local=[0, 1, 2], envs_idx=envs_idx)
+        # ---- Ball placement: close & in the front arc (BODY frame), then map to WORLD ----
+        r_min = float(self.env_cfg.get("ball_r_min", 0.35))
+        r_max = float(self.env_cfg.get("ball_r_max", 1.50))
+        theta_max = math.radians(float(self.env_cfg.get("ball_theta_max_deg", 70.0)))
+        z_min = float(self.env_cfg.get("ball_z_min", 0.05))
+        z_max = float(self.env_cfg.get("ball_z_max", 0.50))
 
-        # reset dofs
+        r = gs_rand_float(r_min, r_max, (N,), gs.device)
+        theta = gs_rand_float(-theta_max, theta_max, (N,), gs.device)
+
+        u_rel = torch.zeros(N, 3, device=gs.device, dtype=gs.tc_float)
+        u_rel[:, 0] = r * torch.cos(theta)  # forward
+        u_rel[:, 1] = r * torch.sin(theta)  # lateral
+        u_rel[:, 2] = gs_rand_float(z_min, z_max, (N,), gs.device)
+
+        u_w = transform_by_quat(u_rel, self.base_init_quat) + self.base_init_pos
+        self.ball.set_pos(u_w, envs_idx=envs_idx)
+
+        # Small inward + upward velocity to keep it in play
+        v_speed = gs_rand_float(0.0, 0.40, (N,), gs.device)
+        dir_xy = -u_rel[:, :2]
+        dir_xy = dir_xy / (torch.norm(dir_xy, dim=1, keepdim=True) + 1e-6)
+        v_rel = torch.zeros(N, 3, device=gs.device, dtype=gs.tc_float)
+        v_rel[:, :2] = dir_xy * v_speed.unsqueeze(-1)
+        v_rel[:, 2] = gs_rand_float(0.0, 0.20, (N,), gs.device)
+
+        v_w = transform_by_quat(v_rel, self.base_init_quat)
+        self.ball.set_dofs_velocity(v_w, dofs_idx_local=[0, 1, 2], envs_idx=envs_idx)
+
+        # ---- Robot reset (as before) ----
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
@@ -270,7 +299,6 @@ class Go2Env:
             envs_idx=envs_idx,
         )
 
-        # reset base
         self.base_pos[envs_idx] = self.base_init_pos
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
         self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
@@ -279,13 +307,11 @@ class Go2Env:
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
 
-        # reset buffers
         self.last_actions[envs_idx] = 0.0
         self.last_dof_vel[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
 
-        # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
@@ -293,6 +319,7 @@ class Go2Env:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
+        self._resample_commands(envs_idx)
 
     def reset(self):
         self.reset_buf[:] = True
@@ -330,15 +357,119 @@ class Go2Env:
         F_norm = torch.linalg.norm(F_foot_w, dim=-1)  # (N, L)
         return F_foot_w, F_norm
 
-    def _reward_tracking_lin_vel(self):
-        # Tracking of linear velocity commands (xy axes)
-        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+    def _reward_object_locomotion(self):
+        """
+        Unified base primitive (6 cmds):
+          [0]=r [m], [1]=psi [rad], [2]=v_nom [m/s], [3]=dz [m], [4]=pitch [rad], [5]=roll [rad]
 
-    def _reward_tracking_ang_vel(self):
-        # Tracking of angular velocity commands (yaw)
-        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-        return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+        Objectives:
+          • Object-centric locomotion to the anchor (r, psi) in BODY frame
+          • Face the ball on the plane (heading)
+          • Track body pose: (dz via base height, pitch & roll via IMU gravity)
+
+        Real-robot friendly signals in obs: IMU (gravity, yaw rate), base vel, relative-ball.
+        """
+        eps = 1e-6
+        r_cmd = self.commands[:, 0].clamp(0.0, 5.0)
+        psi = self.commands[:, 1]
+        v_nom = self.commands[:, 2].clamp(0.0, 3.0)
+
+        dz_t = self.commands[:, 3]
+        pitch_t = self.commands[:, 4]
+        roll_t = self.commands[:, 5]
+
+        # ---- Object-centric anchor tracking ----
+        b_xy = self.relative_ball_pos[:, :2]  # (N,2)
+        cpsi, spsi = torch.cos(psi), torch.sin(psi)
+        target_b = torch.stack([r_cmd * cpsi, r_cmd * spsi], dim=1)  # (N,2)
+
+        e = target_b - b_xy
+        d = torch.linalg.norm(e, dim=1).clamp_min(eps)
+        udir = e / d.unsqueeze(-1)
+
+        v_xy = self.base_lin_vel[:, :2]
+        vmag = torch.linalg.norm(v_xy, dim=1).clamp_min(eps)
+        prog = (v_xy * udir).sum(dim=1)  # toward target
+
+        sigma_p = self.reward_cfg.get("obj_loco_sigma_p", 0.6)
+        r_prog = torch.clamp(prog / sigma_p, 0.0, 1.0)
+
+        sigma_r = self.reward_cfg.get("obj_loco_sigma_r", 0.6)
+        r_pos = 1.0 / (1.0 + (d / sigma_r) ** 2)
+
+        d0 = self.reward_cfg.get("obj_loco_d0", 0.8)
+        v_tgt = v_nom * torch.clamp(d / d0, 0.0, 1.0)
+        sigma_v = self.reward_cfg.get("obj_loco_sigma_v", 0.5)
+        r_speed = torch.exp(- (vmag - v_tgt) ** 2 / (2 * sigma_v ** 2))
+
+        # Heading: BODY X-axis → ball (planar)
+        ang_b = torch.atan2(b_xy[:, 1], b_xy[:, 0])
+        sigma_head = self.reward_cfg.get("obj_loco_sigma_head", 0.5)
+        r_head = torch.exp(- (ang_b ** 2) / (2 * sigma_head ** 2))
+
+        k_turn = self.reward_cfg.get("obj_loco_k_turn", 1.6)
+        sigma_w = self.reward_cfg.get("obj_loco_sigma_w", 1.0)
+        r_turn = torch.exp(- (self.base_ang_vel[:, 2] + k_turn * ang_b) ** 2 / (2 * sigma_w ** 2))
+
+        # ---- Pose tracking (dz, pitch, roll) ----
+        # IMU gravity → pitch/roll (yaw-free); base height for dz
+        g = self.projected_gravity  # (N,3)
+        pitch = torch.atan2(g[:, 0], -g[:, 2])
+        roll = torch.atan2(-g[:, 1], -g[:, 2])
+
+        e_pitch = torch.atan2(torch.sin(pitch - pitch_t), torch.cos(pitch - pitch_t))
+        e_roll = torch.atan2(torch.sin(roll - roll_t), torch.cos(roll - roll_t))
+
+        sigma_pitch = self.reward_cfg.get("sigma_pitch", 0.25)
+        sigma_roll = self.reward_cfg.get("sigma_roll", 0.25)
+        r_orient = torch.exp(- (e_pitch ** 2) / (2 * sigma_pitch ** 2)
+                             - (e_roll ** 2) / (2 * sigma_roll ** 2))
+
+        h_nominal = self.reward_cfg.get("base_height_nominal", 0.32)
+        h_tgt = h_nominal + dz_t
+        sigma_h = self.reward_cfg.get("sigma_h", 0.02)
+        r_height = torch.exp(- torch.square(self.base_pos[:, 2] - h_tgt) / (2 * sigma_h ** 2))
+
+        # ---- Penalties & bonuses ----
+        pen_away = self.reward_cfg.get("obj_loco_pen_away", 0.05) * torch.tanh((-prog).clamp_min(0.0))
+        v_r = prog
+        v_t = torch.sqrt((vmag ** 2 - v_r ** 2).clamp_min(0.0))
+        d_tan = self.reward_cfg.get("obj_loco_d_tan", 0.8)
+        g_tan = 1.0 - torch.clamp(d / max(d_tan, eps), 0.0, 1.0)  # only near goal
+        w_tan = self.reward_cfg.get("obj_loco_w_tan", 0.05)
+        pen_tan = w_tan * g_tan * v_t
+
+        tau_d = self.reward_cfg.get("obj_loco_tau_d", 0.18)
+        tau_ang = self.reward_cfg.get("obj_loco_tau_ang", 0.35)  # ~20°
+        tau_v = self.reward_cfg.get("obj_loco_tau_v", 0.15)
+        sharp = self.reward_cfg.get("obj_loco_tau_k", 6.0)
+        w_done = self.reward_cfg.get("obj_loco_w_done", 0.08)
+        bonus = w_done * torch.sigmoid(sharp * (tau_d - d)) \
+                * torch.sigmoid(sharp * (tau_ang - ang_b.abs())) \
+                * torch.sigmoid(sharp * (tau_v - vmag))
+
+        # ---- Soft posture gate (keep gradients alive) ----
+        upr = (1.0 - self.projected_gravity[:, 2]).clamp(0.0, 2.0) * 0.5
+        gate = 0.3 + 0.7 * upr
+
+        # ---- Weights ----
+        w_pos = self.reward_cfg.get("obj_loco_w_pos", 0.22)
+        w_prog = self.reward_cfg.get("obj_loco_w_prog", 0.28)
+        w_spd = self.reward_cfg.get("obj_loco_w_spd", 0.16)
+        w_head = self.reward_cfg.get("obj_loco_w_head", 0.10)
+        w_turn = self.reward_cfg.get("obj_loco_w_turn", 0.06)
+        w_orient = self.reward_cfg.get("w_pose_orient", 0.10)
+        w_h = self.reward_cfg.get("w_pose_height", 0.08)
+
+        r = (w_pos * r_pos +
+             w_prog * r_prog +
+             w_spd * r_speed +
+             w_head * r_head +
+             w_turn * r_turn +
+             w_orient * r_orient +
+             w_h * r_height)
+
+        return gate * (r - pen_away - pen_tan) + bonus
 
     def _reward_tracking_body_pose(self):
         """
@@ -524,7 +655,7 @@ class Go2Env:
         r_pitch = torch.exp(- (pitch_rate - k_rate * imp) ** 2 / (2 * sigma_pitch ** 2))
 
         # (5) apex-height shaping only while in flight
-        h0 = self.reward_cfg.get("base_height_target", 0.30)
+        h0 = self.reward_cfg.get("base_height_target", 0.6)
         h_gain = (self.base_pos[:, 2] - h0).clamp(min=0.0)
         sigma_h = 0.06
         r_apex = torch.exp(- (h_gain - h_cmd) ** 2 / (2 * sigma_h ** 2)) * in_flight
@@ -577,12 +708,3 @@ class Go2Env:
         # We penalize terminations that are NOT timeouts.
         failures = torch.logical_and(self.reset_buf, ~self.extras["time_outs"].bool())
         return -failures.float()
-
-    def _reward_ball_motion_mag(self):
-        """
-        Affordance-neutral outcome term: magnitude of ball velocity (WORLD frame).
-        Encourages interactions that actually move the ball, without prescribing how.
-        """
-        v_ball_w = self.ball.get_vel()  # (N,3)
-        speed = torch.linalg.norm(v_ball_w, dim=1)  # (N,)
-        return speed

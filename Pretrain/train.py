@@ -13,7 +13,7 @@ from rsl_rl.modules import EmpiricalNormalization
 
 from .go2_env_icm import Go2Env
 from .dataset import TrajectoryDataset
-from .utils import build_edge_index, get_beta, masked_quat_geodesic
+from .utils import build_edge_index, get_beta, masked_quat_geodesic, masked_mae
 
 class Trainer:
     def __init__(self, model, rl_config, config):
@@ -45,18 +45,6 @@ class Trainer:
         self.agent = self.vae.agent
         self.fk_model = self.agent.fk_model.to(self.device)
 
-        '''
-        gs.init(logging_level="warning")
-        self.env = Go2Env(
-            num_envs=self.batch_size,
-            env_cfg=rl_config.env,
-            obs_cfg=rl_config.obs,
-            reward_cfg=rl_config.reward,
-            command_cfg=rl_config.command,
-            show_viewer=False,
-            agent=self.agent,
-        )
-        '''
         self.end_effector_indices = self.agent.end_effector
         self.edge_index = build_edge_index(self.fk_model, self.end_effector_indices, self.device)
 
@@ -139,22 +127,13 @@ class Trainer:
         self.w_du = config.sim.w_du
         self.w_obs= config.sim.w_obs
 
-    # ---------- helpers ----------
-    @staticmethod
-    def masked_mse(pred, target, mask):
-        # pred/target: [B,T,D], mask: [B,T,1]
-        per_t = (torch.abs(pred - target)).mean(dim=-1)  # [B,T]
-        #per_t = ((pred - target)**2).mean(dim=-1)  # [B,T]
-        denom = mask.sum().clamp_min(1.0)
-        return (per_t * mask.squeeze(-1)).sum() / denom
-
     def _norm_seq(self, x):
         """x: [B,T,obs_dim] -> normalized with EmpiricalNormalization (no stat updates)."""
         B, T, D = x.shape
-        x_flat = x.reshape(B*T, D)
+        x_flat = x.reshape(B * T, D)
         x_n = self.obs_normalizer(x_flat)  # module in eval mode => uses stored stats
         return x_n.view(B, T, D)
-
+    
     # ---------- training ----------
     def train(self):
         self.vae.train()
@@ -182,12 +161,13 @@ class Trainer:
         global_step = 0
 
         for epoch in range(self.num_epochs):
-            for i, (x, q, dq, p, dp, dw, u, du, dv, obs, act, mask) in enumerate(dataloader):
+            for i, (x, q, dq, p, dp, w, dw, u, du, dv, obs, act, mask) in enumerate(dataloader):
                 x = x.to(self.device, non_blocking=True)
                 q_gt = q.to(self.device, non_blocking=True)
                 dq_gt = dq.to(self.device, non_blocking=True)
                 p_gt = p.to(self.device, non_blocking=True)
                 dp_gt = dp.to(self.device, non_blocking=True)
+                w_gt = w.to(self.device, non_blocking=True)
                 dw_gt = dw.to(self.device, non_blocking=True)
                 u_gt = u.to(self.device, non_blocking=True)
                 du_gt = du.to(self.device, non_blocking=True)
@@ -295,19 +275,21 @@ class Trainer:
                     )
 
                     # State-space losses
-                    q_loss = self.masked_mse(q_seq, q_gt, mask)
-                    dq_loss = self.masked_mse(dq_seq, dq_gt, mask)
-                    p_loss = self.masked_mse(p_seq, p_gt, mask)
-                    dp_loss = self.masked_mse(dp_seq, dp_gt, mask)
-                    dw_loss = self.masked_mse(dw_seq, dw_gt, mask)
-                    u_loss = self.masked_mse(u_seq, u_gt, mask)
-                    du_loss = self.masked_mse(du_seq, du_gt, mask)
+                    q_loss = masked_mae(q_seq, q_gt, mask)
+                    dq_loss = masked_mae(dq_seq, dq_gt, mask)
+                    p_loss = masked_mae(p_seq, p_gt, mask)
+                    dp_loss = masked_mae(dp_seq, dp_gt, mask)
+                    w_loss = masked_quat_geodesic(w_seq, w_gt, mask)
+                    dw_loss = masked_mae(dw_seq, dw_gt, mask)
+                    u_loss = masked_mae(u_seq, u_gt, mask)
+                    du_loss = masked_mae(du_seq, du_gt, mask)
 
                     state_loss = (
                             self.w_q * q_loss +
                             self.w_dq * dq_loss +
                             self.w_p * p_loss +
                             self.w_dp * dp_loss +
+                            self.w_w * w_loss +
                             self.w_dw * dw_loss +
                             self.w_u * u_loss +
                             self.w_du * du_loss
@@ -332,10 +314,10 @@ class Trainer:
                         unnormalized_recon = _denorm_positions(x_recon.detach(), self.pos_mean_d, self.pos_std_d)
                         unnormalized_gt = _denorm_positions(x.reshape(x_recon.shape).detach(), self.pos_mean_d,
                                                             self.pos_std_d)
-                        unnorm_obj = self.masked_mse(
+                        unnorm_obj = masked_mae(
                             unnormalized_recon[:, :, -3:], unnormalized_gt[:, :, -3:], mask
                         ).item()
-                        unnorm_kino = self.masked_mse(
+                        unnorm_kino = masked_mae(
                             unnormalized_recon[:, :, :-3], unnormalized_gt[:, :, :-3], mask
                         ).item()
 
@@ -353,6 +335,7 @@ class Trainer:
                               self.w_dq * dq_loss.item(),
                               self.w_p * p_loss.item(),
                               self.w_dp * dp_loss.item(),
+                              self.w_w * w_loss.item(),
                               self.w_dw * dw_loss.item(),
                               self.w_u * u_loss.item(),
                               self.w_du * du_loss.item())

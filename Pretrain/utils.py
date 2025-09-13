@@ -82,6 +82,8 @@ def get_beta(epoch, total_epochs, strategy='cyclical', num_cycles=4, max_beta=1.
     else:
         return max_beta
 
+
+# loss
 def masked_quat_geodesic(pred_w, tgt_w, mask, eps=1e-8):
     # pred_w, tgt_w: [B,T,4] (wxyz, normalized)
     # mask: [B,T,1] or [B,T]
@@ -96,3 +98,9 @@ def masked_quat_geodesic(pred_w, tgt_w, mask, eps=1e-8):
     denom = mask.sum().clamp_min(1.0)
     return (loss * mask).sum() / denom
 
+def masked_mae(pred, target, mask):
+    # pred/target: [B,T,D], mask: [B,T,1]
+    per_t = (torch.abs(pred - target)).mean(dim=-1)  # [B,T]
+    #per_t = ((pred - target)**2).mean(dim=-1)  # [B,T]
+    denom = mask.sum().clamp_min(1.0)
+    return (per_t * mask.squeeze(-1)).sum() / denom

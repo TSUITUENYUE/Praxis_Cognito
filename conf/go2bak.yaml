@@ -76,9 +76,10 @@ rl:
   command:
     num_commands: 16
     # locomote
-    lin_vel_x_range: [-0.8, 0.8]
-    lin_vel_y_range: [-0.5, 0.5]
-    ang_vel_range:   [-1.2, 1.2]
+    standoff_r_range: [0.0, 0.2]
+    approach_psi_range: [-1.5, 1.5]
+    nom_speed_range: [0.25, 1.5]
+
 
     # body pose
     dz_range: [ -0.06, 0.10 ]

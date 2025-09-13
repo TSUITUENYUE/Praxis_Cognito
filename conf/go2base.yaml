@@ -62,18 +62,16 @@ rl:
     reward_scales:
       object_locomotion: 1.0
 
-      tracking_body_pose: 0.5
-
-      lin_vel_z: -1.0
-      base_height: -50.0
+      lin_vel_z: -0.1
+      base_height: -1.0
       action_rate: -0.005
       similar_to_default: -0.1
 
   command:
     num_commands: 16
     # locomote
-    standoff_r_range: [0.25, 0.5]
-    approach_psi_range: [-3.1416, 3.1416]
+    standoff_r_range: [0.0, 0.2]
+    approach_psi_range: [-1.5, 1.5]
     nom_speed_range: [0.25, 1.5]
 
 
@@ -143,7 +141,7 @@ dataset:
   num_envs: 2048
   #num_envs: 32768
   episodes: 10000
-  max_episode_seconds: 3
+  max_episode_seconds: 5
   frame_rate: 25
 
   log_dir: "Pretrain/primitives/go2-walking"
